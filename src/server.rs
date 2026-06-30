@@ -599,6 +599,391 @@ mod tests {
     }
 
     #[test]
+    fn unregister_maps_to_close() {
+        let act = dispatch(
+            &registered_session(),
+            RelayMessage::Unregister {
+                peer_id: "me".into(),
+            },
+        );
+        assert!(matches!(act, Action::Close));
+    }
+
+    #[test]
+    fn pong_we_receive_is_ignored() {
+        let act = dispatch(&registered_session(), RelayMessage::Pong { timestamp: 1 });
+        assert!(matches!(act, Action::Nothing));
+    }
+
+    #[test]
+    fn hole_punch_result_is_forwarded_to_the_named_peer() {
+        let act = dispatch(
+            &registered_session(),
+            RelayMessage::HolePunchResult {
+                peer_id: "b".into(),
+                success: true,
+            },
+        );
+        match act {
+            Action::ForwardTo { to, msg } => {
+                assert_eq!(to, "b");
+                assert!(matches!(
+                    msg,
+                    RelayMessage::HolePunchResult { success: true, .. }
+                ));
+            }
+            other => panic!("expected ForwardTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_peers_dispatch_returns_a_peers_sentinel() {
+        // In the async path GetPeers is intercepted before dispatch (needs a registry read); the
+        // pure dispatcher returns a placeholder Peers list so the routing logic stays uniform.
+        let act = dispatch(
+            &registered_session(),
+            RelayMessage::GetPeers {
+                network_id: Some("net1".into()),
+            },
+        );
+        match act {
+            Action::ReplyToSelf(msgs) => {
+                assert!(matches!(msgs.as_slice(), [RelayMessage::Peers { .. }]));
+            }
+            other => panic!("expected ReplyToSelf(Peers), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_to_client_only_messages_are_ignored_when_received() {
+        let s = registered_session();
+        // A well-behaved client never sends these to us; we must not act on them.
+        let info = RelayPeerInfo::new("x".into(), "net1".into(), 1);
+        for msg in [
+            RelayMessage::RegisterAck {
+                success: true,
+                message: "x".into(),
+                connected_peers: 0,
+            },
+            RelayMessage::Peers { peers: vec![] },
+            RelayMessage::PeerConnected { peer: info.clone() },
+            RelayMessage::PeerDisconnected {
+                peer_id: "x".into(),
+            },
+            RelayMessage::HolePunchCoordinate {
+                peer_id: "x".into(),
+                external_addr: "127.0.0.1:1".parse().unwrap(),
+            },
+            RelayMessage::Error {
+                code: 9,
+                message: "x".into(),
+            },
+        ] {
+            assert!(
+                matches!(dispatch(&s, msg), Action::Nothing),
+                "server→client message must be ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn unregistered_rejects_every_non_register_kind() {
+        let s = Session::default();
+        for msg in [
+            RelayMessage::Unregister {
+                peer_id: "a".into(),
+            },
+            RelayMessage::RelayGossipMessage {
+                from: "a".into(),
+                to: "b".into(),
+                payload: vec![1],
+                seq: 1,
+            },
+            RelayMessage::Broadcast {
+                from: "a".into(),
+                payload: vec![1],
+                exclude: vec![],
+            },
+            RelayMessage::GetPeers { network_id: None },
+            RelayMessage::HolePunchRequest {
+                peer_id: "a".into(),
+                target_peer_id: "b".into(),
+                external_addr: "127.0.0.1:1".parse().unwrap(),
+            },
+        ] {
+            match dispatch(&s, msg) {
+                Action::Error { code, .. } => assert_eq!(code, errcode::NOT_REGISTERED),
+                other => panic!("expected NOT_REGISTERED, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn relay_state_new_starts_empty_with_zero_uptime() {
+        let st = RelayState::new(RelayServerConfig::default());
+        assert_eq!(st.connected.load(Ordering::Relaxed), 0);
+        assert!(st.registry.try_lock().unwrap().is_empty());
+        // uptime is monotonic and small right after construction.
+        assert!(st.uptime_secs() < 5);
+    }
+
+    // ---- Direct tests of the connection-state functions (no socket; an mpsc channel stands in for
+    // the per-connection outbound writer). These reach `register_peer`/`forward_to`/`broadcast`/
+    // `deregister` branches the WebSocket integration tests can't isolate (e.g. the register-time
+    // capacity ack and the duplicate-id replacement, which the pre-handshake cap guard masks). ----
+
+    /// Drain everything currently queued on an unbounded receiver into a Vec (non-blocking).
+    fn drain(rx: &mut mpsc::UnboundedReceiver<RelayMessage>) -> Vec<RelayMessage> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(m);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn register_peer_acks_success_and_bumps_connected() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+
+        let ok = register_peer(&state, &mut session, "p".into(), "net".into(), 1, &tx).await;
+        assert!(ok);
+        assert_eq!(state.connected.load(Ordering::Relaxed), 1);
+        assert_eq!(session.peer_id.as_deref(), Some("p"));
+        assert_eq!(session.network_id.as_deref(), Some("net"));
+        match drain(&mut rx).as_slice() {
+            [RelayMessage::RegisterAck {
+                success,
+                connected_peers,
+                ..
+            }] => {
+                assert!(success);
+                assert_eq!(*connected_peers, 1);
+            }
+            other => panic!("expected one success RegisterAck, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_peer_at_capacity_acks_failure_and_keeps_session_unregistered() {
+        // Cap of 1, one peer already in the registry → a second register hits the register-time cap
+        // guard: a failed ack + a CAPACITY error, no session mutation, no counter bump.
+        let state = RelayState::new(RelayServerConfig {
+            max_connections: 1,
+            ..Default::default()
+        });
+        {
+            let (tx0, _rx0) = mpsc::unbounded_channel();
+            let info = RelayPeerInfo::new("first".into(), "net".into(), 1);
+            state
+                .registry
+                .lock()
+                .await
+                .register("first".into(), "net".into(), info, tx0);
+            state.connected.store(1, Ordering::Relaxed);
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let ok = register_peer(&state, &mut session, "second".into(), "net".into(), 1, &tx).await;
+        assert!(!ok, "register must fail at capacity");
+        assert!(session.peer_id.is_none(), "session stays unregistered");
+        assert_eq!(state.connected.load(Ordering::Relaxed), 1, "no extra bump");
+
+        let msgs = drain(&mut rx);
+        assert!(matches!(
+            msgs[0],
+            RelayMessage::RegisterAck { success: false, .. }
+        ));
+        assert!(matches!(
+            msgs[1],
+            RelayMessage::Error {
+                code: errcode::CAPACITY,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn register_peer_replacing_same_id_does_not_double_count() {
+        // A reconnect under an existing id replaces the prior record WITHOUT incrementing the count.
+        let state = RelayState::new(RelayServerConfig::default());
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let mut s1 = Session::default();
+        assert!(register_peer(&state, &mut s1, "p".into(), "net".into(), 1, &tx1).await);
+        assert_eq!(state.connected.load(Ordering::Relaxed), 1);
+
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let mut s2 = Session::default();
+        assert!(register_peer(&state, &mut s2, "p".into(), "net".into(), 1, &tx2).await);
+        assert_eq!(
+            state.connected.load(Ordering::Relaxed),
+            1,
+            "replacing the same id must not double-count"
+        );
+        assert_eq!(state.registry.lock().await.len(), 1);
+        // The new connection still gets a success ack.
+        assert!(matches!(
+            drain(&mut rx2)[0],
+            RelayMessage::RegisterAck { success: true, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_to_delivers_to_a_same_network_peer() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (btx, mut brx) = mpsc::unbounded_channel();
+        state.registry.lock().await.register(
+            "b".into(),
+            "net".into(),
+            RelayPeerInfo::new("b".into(), "net".into(), 1),
+            btx,
+        );
+
+        let (atx, mut arx) = mpsc::unbounded_channel();
+        let session = Session {
+            peer_id: Some("me".into()),
+            network_id: Some("net".into()),
+        };
+        forward_to(
+            &state,
+            &session,
+            "b",
+            RelayMessage::Ping { timestamp: 7 },
+            &atx,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                drain(&mut brx).as_slice(),
+                [RelayMessage::Ping { timestamp: 7 }]
+            ),
+            "the target receives the forwarded message"
+        );
+        assert!(drain(&mut arx).is_empty(), "sender gets nothing on success");
+    }
+
+    #[tokio::test]
+    async fn forward_to_unknown_peer_errors_back_to_sender() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (atx, mut arx) = mpsc::unbounded_channel();
+        let session = Session {
+            peer_id: Some("me".into()),
+            network_id: Some("net".into()),
+        };
+        forward_to(
+            &state,
+            &session,
+            "ghost",
+            RelayMessage::Ping { timestamp: 1 },
+            &atx,
+        )
+        .await;
+        assert!(matches!(
+            drain(&mut arx)[0],
+            RelayMessage::Error {
+                code: errcode::PEER_NOT_FOUND,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_to_without_a_network_is_a_noop() {
+        // A session that never registered a network can't route; forward_to returns silently.
+        let state = RelayState::new(RelayServerConfig::default());
+        let (atx, mut arx) = mpsc::unbounded_channel();
+        let session = Session::default();
+        forward_to(
+            &state,
+            &session,
+            "b",
+            RelayMessage::Ping { timestamp: 1 },
+            &atx,
+        )
+        .await;
+        assert!(drain(&mut arx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn broadcast_reaches_only_same_network_non_excluded_peers() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let mut rxs = std::collections::HashMap::new();
+        for (id, net) in [("a", "net"), ("b", "net"), ("c", "net"), ("z", "other")] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            state.registry.lock().await.register(
+                id.into(),
+                net.into(),
+                RelayPeerInfo::new(id.into(), net.into(), 1),
+                tx,
+            );
+            rxs.insert(id, rx);
+        }
+        let session = Session {
+            peer_id: Some("a".into()),
+            network_id: Some("net".into()),
+        };
+        broadcast(
+            &state,
+            &session,
+            "a",
+            &["c".to_string()],
+            RelayMessage::Ping { timestamp: 5 },
+        )
+        .await;
+
+        // b (net, not excluded) gets it; a (sender) does not; c (excluded) does not; z (other net)
+        // does not.
+        assert_eq!(drain(rxs.get_mut("b").unwrap()).len(), 1);
+        assert!(drain(rxs.get_mut("a").unwrap()).is_empty());
+        assert!(drain(rxs.get_mut("c").unwrap()).is_empty());
+        assert!(drain(rxs.get_mut("z").unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn deregister_removes_the_peer_and_notifies_others() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (atx, mut arx) = mpsc::unbounded_channel();
+        let (btx, _brx) = mpsc::unbounded_channel();
+        state.registry.lock().await.register(
+            "a".into(),
+            "net".into(),
+            RelayPeerInfo::new("a".into(), "net".into(), 1),
+            atx,
+        );
+        state.registry.lock().await.register(
+            "b".into(),
+            "net".into(),
+            RelayPeerInfo::new("b".into(), "net".into(), 1),
+            btx,
+        );
+        state.connected.store(2, Ordering::Relaxed);
+
+        // Deregister B: A must be told B disconnected, and the counter drops.
+        let b_session = Session {
+            peer_id: Some("b".into()),
+            network_id: Some("net".into()),
+        };
+        deregister(&state, &b_session).await;
+        assert_eq!(state.connected.load(Ordering::Relaxed), 1);
+        assert_eq!(state.registry.lock().await.len(), 1);
+        match drain(&mut arx).as_slice() {
+            [RelayMessage::PeerDisconnected { peer_id }] => assert_eq!(peer_id, "b"),
+            other => panic!("A should get PeerDisconnected for b, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deregister_of_an_unregistered_session_is_a_noop() {
+        let state = RelayState::new(RelayServerConfig::default());
+        // Never-registered session: deregister returns early, touches nothing.
+        deregister(&state, &Session::default()).await;
+        assert_eq!(state.connected.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn broadcast_clears_exclude_on_the_wire_but_keeps_it_for_routing() {
         let act = dispatch(
             &registered_session(),
