@@ -35,6 +35,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Run-your-own-relay as an OS service: register/start/stop on Windows (SCM), Linux (systemd),
+# macOS (launchd). Mirrors dig-node's service-manager approach so the DIG installer delegates to
+# `dig-relay install`/`start` identically.
+service-manager = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+# Windows Service Control Protocol dispatcher: a service-manager-registered service must itself
+# call StartServiceCtrlDispatcher + report Running within ~30s or the SCM kills it (error 1053).
+windows-service = "0.7"
 
 [dev-dependencies]
 # End-to-end integration test: drive two simulated peers (WebSocket clients) whose direct

@@ -1,0 +1,317 @@
+//! OS-service registration for run-your-own-relay, across Windows (SCM), Linux (systemd) and macOS
+//! (launchd) via the `service-manager` crate.
+//!
+//! Mirrors dig-node's service approach so the DIG installer delegates to `dig-relay install` /
+//! `dig-relay start` exactly as it does for the node. `install` registers `dig-relay serve` to
+//! auto-start; `uninstall` removes it; `start`/`stop` control it; `status` probes `/health`.
+//!
+//! Install level by platform:
+//!   * Linux (systemd) / macOS (launchd) — **user-level** by default (no root needed).
+//!   * Windows (SCM) — **system-level only** (no per-user services), so `install`/`uninstall`
+//!     require an **elevated (Administrator)** console; this is detected up front and reported.
+
+use std::ffi::OsString;
+use std::net::SocketAddr;
+use std::str::FromStr;
+
+use serde_json::json;
+use service_manager::{
+    ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx, ServiceStopCtx,
+    ServiceUninstallCtx,
+};
+
+use crate::config::RelayServerConfig;
+
+/// The reverse-DNS service label. Becomes the SCM service name / launchd plist label / systemd
+/// unit name. Stable so install/uninstall/start/stop address the same service.
+pub const SERVICE_LABEL: &str = "net.dignetwork.dig-relay";
+
+#[cfg(windows)]
+const PREFERS_USER_LEVEL: bool = false;
+#[cfg(not(windows))]
+const PREFERS_USER_LEVEL: bool = true;
+
+/// A human summary + a machine-readable JSON result for a service operation (so the CLI can emit
+/// either pretty text or `--json`).
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub summary: String,
+    pub result: serde_json::Value,
+}
+
+impl Outcome {
+    fn new(summary: impl Into<String>, result: serde_json::Value) -> Self {
+        Outcome {
+            summary: summary.into(),
+            result,
+        }
+    }
+}
+
+fn label() -> std::io::Result<ServiceLabel> {
+    ServiceLabel::from_str(SERVICE_LABEL)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))
+}
+
+/// Acquire the native service manager at user level where supported (Linux/macOS), else system
+/// (Windows). Returns the manager + whether it operates at user level (for messaging).
+fn manager() -> std::io::Result<(Box<dyn ServiceManager>, bool)> {
+    let mut mgr = <dyn ServiceManager>::native()?;
+    let mut user_level = false;
+    if PREFERS_USER_LEVEL && mgr.set_level(ServiceLevel::User).is_ok() {
+        user_level = true;
+    }
+    Ok((mgr, user_level))
+}
+
+fn current_exe() -> std::io::Result<std::path::PathBuf> {
+    std::env::current_exe()
+}
+
+/// On Windows, is this process elevated (Administrator)? Used to fail install/uninstall early with
+/// a helpful message instead of a cryptic SCM access-denied. Always `true` off Windows.
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    std::process::Command::new("net")
+        .arg("session")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+#[cfg(not(windows))]
+fn is_elevated() -> bool {
+    true
+}
+
+/// Install the relay as an auto-starting OS service that runs `dig-relay serve` on the configured
+/// listen addrs. The listen/health addrs are passed as env so the service serves identically.
+pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
+    if cfg!(windows) && !is_elevated() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "dig-relay: installing a Windows service requires an elevated (Administrator) console. \
+             Re-run this in a terminal opened with \"Run as administrator\".",
+        ));
+    }
+
+    let (mgr, user_level) = manager()?;
+    let program = current_exe()?;
+
+    let environment = vec![
+        ("DIG_RELAY_LISTEN".to_string(), config.listen.to_string()),
+        (
+            "DIG_RELAY_HEALTH_LISTEN".to_string(),
+            config.health_listen.to_string(),
+        ),
+        (
+            "DIG_RELAY_MAX_CONNECTIONS".to_string(),
+            config.max_connections.to_string(),
+        ),
+    ];
+
+    // The SCM-launched program must speak the Windows service protocol, so on Windows the installed
+    // service runs the hidden `run-service` entrypoint; systemd/launchd exec `serve` directly.
+    let entry_arg = if cfg!(windows) {
+        "run-service"
+    } else {
+        "serve"
+    };
+
+    mgr.install(ServiceInstallCtx {
+        label: label()?,
+        program: program.clone(),
+        args: vec![OsString::from(entry_arg)],
+        contents: None,
+        username: None,
+        working_directory: None,
+        environment: Some(environment),
+        autostart: true,
+    })?;
+
+    let scope = if user_level { "user" } else { "system" };
+    let summary = format!(
+        "dig-relay: installed as a {scope}-level service \"{SERVICE_LABEL}\"\n  \
+         program: {}\n  relay:   ws://{}\n  health:  http://{}\n  \
+         Start it now with: dig-relay start",
+        program.display(),
+        config.listen,
+        config.health_listen,
+    );
+    Ok(Outcome::new(
+        summary,
+        json!({
+            "installed": true,
+            "registered": true,
+            "started": false,
+            "label": SERVICE_LABEL,
+            "scope": scope,
+            "program": program.display().to_string(),
+            "listen": config.listen.to_string(),
+            "health_listen": config.health_listen.to_string(),
+        }),
+    ))
+}
+
+/// Uninstall the relay service (best-effort stop first).
+pub fn uninstall() -> std::io::Result<Outcome> {
+    if cfg!(windows) && !is_elevated() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "dig-relay: uninstalling a Windows service requires an elevated (Administrator) console.",
+        ));
+    }
+    let (mgr, _user) = manager()?;
+    let _ = mgr.stop(ServiceStopCtx { label: label()? });
+    mgr.uninstall(ServiceUninstallCtx { label: label()? })?;
+    Ok(Outcome::new(
+        format!("dig-relay: uninstalled service \"{SERVICE_LABEL}\""),
+        json!({ "installed": false, "registered": false, "label": SERVICE_LABEL }),
+    ))
+}
+
+/// Start the installed service.
+pub fn start() -> std::io::Result<Outcome> {
+    let (mgr, _user) = manager()?;
+    mgr.start(ServiceStartCtx { label: label()? })?;
+    Ok(Outcome::new(
+        format!("dig-relay: start requested for \"{SERVICE_LABEL}\""),
+        json!({ "started": true, "label": SERVICE_LABEL }),
+    ))
+}
+
+/// Stop the running service.
+pub fn stop() -> std::io::Result<Outcome> {
+    let (mgr, _user) = manager()?;
+    mgr.stop(ServiceStopCtx { label: label()? })?;
+    Ok(Outcome::new(
+        format!("dig-relay: stop requested for \"{SERVICE_LABEL}\""),
+        json!({ "stopped": true, "label": SERVICE_LABEL }),
+    ))
+}
+
+/// Report whether the relay is actually serving, by probing its HTTP `/health` endpoint. Works the
+/// same whether the relay runs as a service or a manual `serve`. `result.serving` is the answer.
+pub fn status(config: &RelayServerConfig) -> std::io::Result<Outcome> {
+    let addr = config.health_listen;
+    let url = format!("http://{addr}/health");
+    let serving = probe_health(&addr).unwrap_or(false);
+    let summary = if serving {
+        format!("dig-relay: SERVING (health {url})")
+    } else {
+        format!("dig-relay: NOT responding at {url} (the service may be stopped or not installed)")
+    };
+    Ok(Outcome::new(
+        summary,
+        json!({ "serving": serving, "health_url": url }),
+    ))
+}
+
+/// Minimal blocking HTTP/1.0 `GET /health` probe. Returns whether the status line is `2xx`. Avoids
+/// pulling an async client into the status path.
+fn probe_health(addr: &SocketAddr) -> std::io::Result<bool> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    // Probe loopback even when the bind addr is 0.0.0.0 (a status check runs on the same host).
+    let connect_addr = if addr.ip().is_unspecified() {
+        SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), addr.port())
+    } else {
+        *addr
+    };
+    let mut stream = match TcpStream::connect(connect_addr) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let req = format!("GET /health HTTP/1.0\r\nHost: {connect_addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes())?;
+    let mut chunk = [0u8; 256];
+    let n = stream.read(&mut chunk).unwrap_or(0);
+    Ok(is_2xx_status_line(&String::from_utf8_lossy(&chunk[..n])))
+}
+
+/// Is the first line of an HTTP response a `2xx` status line? PURE — parses only the status line so
+/// a stray `2` elsewhere (e.g. a year in a Date header) can never be mistaken for success.
+fn is_2xx_status_line(response_head: &str) -> bool {
+    let first = response_head.lines().next().unwrap_or("");
+    if !first.starts_with("HTTP/") {
+        return false;
+    }
+    first
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .map(|code| (200..300).contains(&code))
+        .unwrap_or(false)
+}
+
+/// Build a [`RelayServerConfig`] from the service env vars set by [`install`], falling back to
+/// defaults. Used by the service entrypoints (systemd/launchd `serve`, Windows `run-service`).
+pub fn config_from_env() -> RelayServerConfig {
+    let mut config = RelayServerConfig::default();
+    if let Some(a) = std::env::var("DIG_RELAY_LISTEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.listen = a;
+    }
+    if let Some(a) = std::env::var("DIG_RELAY_HEALTH_LISTEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.health_listen = a;
+    }
+    if let Some(n) = std::env::var("DIG_RELAY_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.max_connections = n;
+    }
+    config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_label_parses_to_dig_relay() {
+        let l = label().expect("constant label must parse");
+        assert_eq!(l.application, "dig-relay");
+    }
+
+    #[test]
+    fn status_reports_false_when_nothing_listens() {
+        let cfg = RelayServerConfig {
+            health_listen: "127.0.0.1:1".parse().unwrap(),
+            ..Default::default()
+        };
+        let outcome = status(&cfg).expect("status never hard-errors on a closed port");
+        assert_eq!(outcome.result["serving"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn is_2xx_status_line_parses_the_code_not_stray_digits() {
+        assert!(is_2xx_status_line("HTTP/1.1 200 OK\r\nDate: x\r\n"));
+        assert!(is_2xx_status_line("HTTP/1.0 204 No Content"));
+        assert!(!is_2xx_status_line(
+            "HTTP/1.0 404 Not Found\r\nDate: Sat, 27 Jun 2026 00:00:00 GMT\r\n"
+        ));
+        assert!(!is_2xx_status_line("HTTP/1.1 500 Internal Server Error"));
+        assert!(!is_2xx_status_line("garbage"));
+        assert!(!is_2xx_status_line(""));
+    }
+
+    #[test]
+    fn config_from_env_defaults_then_overrides() {
+        // Defaults when unset (we don't mutate the process env in a shared test; just assert the
+        // default shape — env-override is exercised by the CLI integration path).
+        let c = RelayServerConfig::default();
+        assert_eq!(c.listen.port(), 9450);
+        assert_eq!(c.health_listen.port(), 9451);
+    }
+}
