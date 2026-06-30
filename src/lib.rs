@@ -56,3 +56,62 @@ pub async fn serve_with_shutdown(
         _ = shutdown => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An already-bound port forces the relay listener to fail, so the `relay` arm of the select
+    /// resolves with that bind error — proving the error is propagated, not swallowed.
+    #[tokio::test]
+    async fn serve_with_shutdown_resolves_ok_when_shutdown_fires_first() {
+        // Bind two free ports for the relay + health listeners.
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        drop(relay);
+        let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let health_addr = health.local_addr().unwrap();
+        drop(health);
+
+        let config = RelayServerConfig {
+            listen: relay_addr,
+            health_listen: health_addr,
+            ..Default::default()
+        };
+        // An immediately-ready shutdown future → the `shutdown` select arm wins → Ok(()).
+        let out = serve_with_shutdown(config, std::future::ready(())).await;
+        assert!(out.is_ok(), "shutdown-first must return Ok(()): {out:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_with_shutdown_rejects_an_invalid_config_before_binding() {
+        let config = RelayServerConfig {
+            max_connections: 0, // invalid → validate() fails before any bind
+            ..Default::default()
+        };
+        let err = serve_with_shutdown(config, std::future::pending::<()>())
+            .await
+            .expect_err("invalid config must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn serve_with_shutdown_surfaces_a_listener_bind_error() {
+        // Occupy a port, then point the relay listener at it so bind fails and the relay arm
+        // resolves with the error (not a hang, not Ok).
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy_addr = occupied.local_addr().unwrap();
+        let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let health_addr = health.local_addr().unwrap();
+        drop(health);
+
+        let config = RelayServerConfig {
+            listen: busy_addr, // already bound above (still held) → relay bind fails
+            health_listen: health_addr,
+            ..Default::default()
+        };
+        let out = serve_with_shutdown(config, std::future::pending::<()>()).await;
+        assert!(out.is_err(), "a failed relay bind must surface as an error");
+        drop(occupied);
+    }
+}

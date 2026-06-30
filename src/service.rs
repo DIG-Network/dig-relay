@@ -277,11 +277,62 @@ pub fn config_from_env() -> RelayServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    /// Serializes the env-mutating tests: `config_from_env` reads process-global env, and cargo runs
+    /// tests in parallel, so two env tests must never interleave.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The env vars `config_from_env` reads, cleared so a test starts from a known state.
+    const RELAY_ENV: [&str; 3] = [
+        "DIG_RELAY_LISTEN",
+        "DIG_RELAY_HEALTH_LISTEN",
+        "DIG_RELAY_MAX_CONNECTIONS",
+    ];
+    fn clear_relay_env() {
+        for k in RELAY_ENV {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// Spawn a one-shot blocking HTTP server on 127.0.0.1 that replies with `response` to the first
+    /// connection, then returns the bound address. Lets `probe_health` hit a real socket.
+    fn one_shot_http(response: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = sock.read(&mut buf); // consume the request line
+                let _ = sock.write_all(response.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        addr
+    }
 
     #[test]
     fn service_label_parses_to_dig_relay() {
         let l = label().expect("constant label must parse");
         assert_eq!(l.application, "dig-relay");
+    }
+
+    #[test]
+    fn outcome_new_carries_summary_and_result() {
+        let o = Outcome::new("hi", json!({ "k": 1 }));
+        assert_eq!(o.summary, "hi");
+        assert_eq!(o.result["k"], 1);
+    }
+
+    #[test]
+    fn is_elevated_is_true_off_windows() {
+        // The cross-platform contract: off Windows there is no elevation gate, so it is always true.
+        // (On Windows this depends on the console; we only assert the non-Windows guarantee here.)
+        if !cfg!(windows) {
+            assert!(is_elevated());
+        }
     }
 
     #[test]
@@ -292,26 +343,122 @@ mod tests {
         };
         let outcome = status(&cfg).expect("status never hard-errors on a closed port");
         assert_eq!(outcome.result["serving"], serde_json::json!(false));
+        assert!(outcome.summary.contains("NOT responding"));
+        assert!(outcome.result["health_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/health"));
+    }
+
+    #[test]
+    fn status_reports_true_against_a_live_2xx_health_endpoint() {
+        let addr = one_shot_http("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let cfg = RelayServerConfig {
+            health_listen: addr,
+            ..Default::default()
+        };
+        let outcome = status(&cfg).expect("status never hard-errors");
+        assert_eq!(
+            outcome.result["serving"],
+            serde_json::json!(true),
+            "a 2xx /health means serving"
+        );
+        assert!(outcome.summary.contains("SERVING"));
+    }
+
+    #[test]
+    fn status_reports_false_against_a_live_non_2xx_endpoint() {
+        let addr = one_shot_http("HTTP/1.0 503 Service Unavailable\r\n\r\n");
+        let cfg = RelayServerConfig {
+            health_listen: addr,
+            ..Default::default()
+        };
+        let outcome = status(&cfg).expect("status never hard-errors");
+        assert_eq!(
+            outcome.result["serving"],
+            serde_json::json!(false),
+            "a 5xx /health is not serving"
+        );
+    }
+
+    #[test]
+    fn probe_health_true_for_2xx_false_for_4xx_and_closed() {
+        // 2xx live server → true.
+        let ok = one_shot_http("HTTP/1.1 204 No Content\r\n\r\n");
+        assert!(probe_health(&ok).unwrap());
+        // 4xx live server → false (connected, but not serving).
+        let bad = one_shot_http("HTTP/1.1 404 Not Found\r\n\r\n");
+        assert!(!probe_health(&bad).unwrap());
+        // Nothing listening → Ok(false) (connect refused is not a hard error).
+        let closed: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(!probe_health(&closed).unwrap());
+    }
+
+    #[test]
+    fn probe_health_maps_unspecified_bind_to_loopback() {
+        // A relay bound to 0.0.0.0 is probed on 127.0.0.1 (status runs on the same host). We can't
+        // bind 0.0.0.0:<known-port> race-free, so assert the port is preserved against a loopback
+        // server (the unspecified→loopback rewrite keeps the port).
+        let addr = one_shot_http("HTTP/1.1 200 OK\r\n\r\n");
+        let unspecified = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), addr.port());
+        // The rewrite targets 127.0.0.1:<port>, which is exactly where our server listens.
+        assert!(probe_health(&unspecified).unwrap());
     }
 
     #[test]
     fn is_2xx_status_line_parses_the_code_not_stray_digits() {
         assert!(is_2xx_status_line("HTTP/1.1 200 OK\r\nDate: x\r\n"));
         assert!(is_2xx_status_line("HTTP/1.0 204 No Content"));
+        assert!(is_2xx_status_line("HTTP/1.1 299 Custom"));
         assert!(!is_2xx_status_line(
             "HTTP/1.0 404 Not Found\r\nDate: Sat, 27 Jun 2026 00:00:00 GMT\r\n"
         ));
         assert!(!is_2xx_status_line("HTTP/1.1 500 Internal Server Error"));
+        assert!(!is_2xx_status_line("HTTP/1.1 199 Early"));
+        assert!(!is_2xx_status_line("HTTP/1.1 300 Multiple Choices"));
+        assert!(!is_2xx_status_line("HTTP/1.1 notanumber x"));
+        assert!(!is_2xx_status_line("200 OK")); // missing HTTP/ prefix
         assert!(!is_2xx_status_line("garbage"));
         assert!(!is_2xx_status_line(""));
     }
 
     #[test]
-    fn config_from_env_defaults_then_overrides() {
-        // Defaults when unset (we don't mutate the process env in a shared test; just assert the
-        // default shape — env-override is exercised by the CLI integration path).
-        let c = RelayServerConfig::default();
-        assert_eq!(c.listen.port(), 9450);
-        assert_eq!(c.health_listen.port(), 9451);
+    fn config_from_env_uses_defaults_when_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_relay_env();
+        let c = config_from_env();
+        assert_eq!(c, RelayServerConfig::default(), "no env → defaults");
+    }
+
+    #[test]
+    fn config_from_env_applies_each_env_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_relay_env();
+        std::env::set_var("DIG_RELAY_LISTEN", "127.0.0.1:7000");
+        std::env::set_var("DIG_RELAY_HEALTH_LISTEN", "127.0.0.1:7001");
+        std::env::set_var("DIG_RELAY_MAX_CONNECTIONS", "12");
+        let c = config_from_env();
+        clear_relay_env();
+        assert_eq!(c.listen, "127.0.0.1:7000".parse().unwrap());
+        assert_eq!(c.health_listen, "127.0.0.1:7001".parse().unwrap());
+        assert_eq!(c.max_connections, 12);
+        // idle_timeout is not env-driven → stays default.
+        assert_eq!(c.idle_timeout, RelayServerConfig::default().idle_timeout);
+    }
+
+    #[test]
+    fn config_from_env_ignores_unparseable_values() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_relay_env();
+        std::env::set_var("DIG_RELAY_LISTEN", "not-an-addr");
+        std::env::set_var("DIG_RELAY_MAX_CONNECTIONS", "heaps");
+        let c = config_from_env();
+        clear_relay_env();
+        // Garbage parses to None → the default is kept (never panics).
+        assert_eq!(c.listen, RelayServerConfig::default().listen);
+        assert_eq!(
+            c.max_connections,
+            RelayServerConfig::default().max_connections
+        );
     }
 }
