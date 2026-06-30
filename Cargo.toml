@@ -1,0 +1,15 @@
+[package]
+name = "dig-relay"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "DIG Relay — NAT-traversal rendezvous + circuit relay so DIG Nodes establish peer connections across NAT."
+repository = "https://github.com/DIG-Network/dig-relay"
+
+[dependencies]
+# Implementation deps are added by the relay build (libp2p circuit-relay-v2 + identify + autonat,
+# or the chosen rendezvous/relay stack). Kept minimal in the scaffold so the repo + submodule wire
+# cleanly first; the real server design lands on top.
+
+[profile.release]
+overflow-checks = true
