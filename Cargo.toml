@@ -6,10 +6,40 @@ license = "GPL-2.0-only"
 description = "DIG Relay — NAT-traversal rendezvous + circuit relay so DIG Nodes establish peer connections across NAT."
 repository = "https://github.com/DIG-Network/dig-relay"
 
+[lib]
+name = "dig_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dig-relay"
+path = "src/main.rs"
+
 [dependencies]
-# Implementation deps are added by the relay build (libp2p circuit-relay-v2 + identify + autonat,
-# or the chosen rendezvous/relay stack). Kept minimal in the scaffold so the repo + submodule wire
-# cleanly first; the real server design lands on top.
+# The canonical relay WIRE TYPES (RelayMessage / RelayPeerInfo, RLY-001..RLY-007) are defined by
+# the dig-gossip L2 gossip layer, which holds the matching relay CLIENT. dig-relay implements the
+# SERVER side of that exact wire. We VENDOR a byte-identical copy of those types into
+# `src/wire.rs` (see its provenance note) rather than depending on the dig-gossip crate, because
+# the dig-gossip crate pulls the entire L2 gossip/consensus/TLS stack (chia-sdk-client, tungstenite
+# with native-tls, etc.) just to expose two `serde` structs — and its published tag does not build
+# against the current dig-protocol it resolves. The wire types themselves depend on nothing but
+# serde + std, so vendoring them is small, robust, and kept locked by a serde-shape conformance
+# test (`tests/wire_conformance.rs`). SYSTEM.md records the change-impact edge so the two stay synced.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+# Plain ws:// WebSocket framing (TLS is terminated at the AWS load balancer; see DESIGN.md).
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Tiny HTTP /health endpoint for the load balancer target-group check.
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# End-to-end integration test: drive two simulated peers (WebSocket clients) whose direct
+# path is blocked and assert they exchange a message THROUGH the running relay.
+tokio-tungstenite = "0.24"
 
 [profile.release]
 overflow-checks = true

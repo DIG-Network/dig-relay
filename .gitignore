@@ -1,5 +1,6 @@
 /target
-Cargo.lock
+# Cargo.lock IS committed: dig-relay is a binary/app crate and CI + the release workflow build with
+# `--locked`, so the lockfile must be tracked for reproducible, locked builds.
 **/*.rs.bk
 *.pdb
 .env
