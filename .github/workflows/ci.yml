@@ -29,3 +29,28 @@ jobs:
         run: cargo test --all
       - name: build (release)
         run: cargo build --release
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # Unit + integration coverage, CI-gated at >=80% lines.
+      #
+      # `win_service.rs` is the Windows SCM dispatcher (`#[cfg(windows)]`); it never compiles on
+      # ubuntu-latest, so it is absent from the Linux report. The explicit --ignore-filename-regex
+      # keeps the gate identical no matter the runner (it would never count platform code that the
+      # runner can neither build nor execute). The remaining uncovered surface is the OS-service
+      # install/start/stop syscall wrappers in service.rs (would mutate the host's systemd/SCM) and
+      # the binary's runtime/IO entrypoints in main.rs (build a tokio runtime, parse real argv,
+      # write stdout) — both intentionally exercised via the binary in tests/cli.rs rather than
+      # unit-tested. All pure/own logic is covered.
+      - name: coverage (>=80% lines)
+        run: >-
+          cargo llvm-cov --all
+          --ignore-filename-regex 'win_service\.rs'
+          --fail-under-lines 80
