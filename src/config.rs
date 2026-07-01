@@ -1,9 +1,11 @@
 //! Relay server configuration — pure, validated, unit-tested.
 //!
 //! The relay listens for DIG-node WebSocket connections on [`RelayServerConfig::listen`]
-//! (default `0.0.0.0:9450`, matching `dig_gossip`'s `DEFAULT_RELAY_PORT`) and exposes a tiny
+//! (default `0.0.0.0:9450`, matching `dig_gossip`'s `DEFAULT_RELAY_PORT`), exposes a tiny
 //! HTTP `/health` endpoint on [`RelayServerConfig::health_listen`] (default `0.0.0.0:9451`) for
-//! the AWS load balancer's target-group health check.
+//! the AWS load balancer's target-group health check, and answers STUN Binding Requests on
+//! [`RelayServerConfig::stun_listen`] (default `0.0.0.0:3478`, the IANA STUN port, UDP) so a NAT'd
+//! node can learn its public reflexive address (RFC 5389).
 //!
 //! Limits ([`max_connections`](RelayServerConfig::max_connections)) and the keepalive
 //! [`idle_timeout`](RelayServerConfig::idle_timeout) let a single relay be sized to its instance:
@@ -20,6 +22,13 @@ pub const DEFAULT_RELAY_PORT: u16 = 9450;
 /// the load balancer's HTTP health check never collides with relay traffic on an NLB.
 pub const DEFAULT_HEALTH_PORT: u16 = 9451;
 
+/// The default STUN (RFC 5389) UDP port: **3478**, the IANA-assigned STUN port, matching the DIG
+/// node peer-network protocol (STUN served at `relay.dig.net:3478`). A NAT'd DIG Node sends a
+/// Binding Request here to learn its public reflexive `IP:port` before advertising a
+/// hole-punch/introducer candidate. UDP, so it never collides with the TCP WebSocket (9450) or
+/// health (9451) listeners — on the NLB it is a distinct UDP target group.
+pub const DEFAULT_STUN_PORT: u16 = 3478;
+
 /// Default cap on concurrent relay connections. A connection is cheap (a `RelayPeerInfo` + a
 /// WebSocket), so the smallest always-on instance handles many; horizontal scale adds instances.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 4096;
@@ -35,6 +44,8 @@ pub struct RelayServerConfig {
     pub listen: SocketAddr,
     /// Address the HTTP `/health` listener binds (default `0.0.0.0:9451`).
     pub health_listen: SocketAddr,
+    /// Address the STUN (RFC 5389) UDP listener binds (default `0.0.0.0:3478`, the IANA STUN port).
+    pub stun_listen: SocketAddr,
     /// Maximum concurrent relay connections; new connections past this are refused.
     pub max_connections: usize,
     /// Idle timeout after which a silent connection is reaped.
@@ -46,6 +57,7 @@ impl Default for RelayServerConfig {
         RelayServerConfig {
             listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_RELAY_PORT)),
             health_listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_HEALTH_PORT)),
+            stun_listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_STUN_PORT)),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         }
@@ -81,9 +93,14 @@ mod tests {
             "must match dig_gossip DEFAULT_RELAY_PORT"
         );
         assert_eq!(c.health_listen.port(), 9451);
+        assert_eq!(c.stun_listen.port(), 3478, "STUN = IANA STUN port 3478");
         assert!(
             c.listen.ip().is_unspecified(),
             "binds all interfaces by default"
+        );
+        assert!(
+            c.stun_listen.ip().is_unspecified(),
+            "STUN binds all interfaces by default"
         );
     }
 

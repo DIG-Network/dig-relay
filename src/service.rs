@@ -106,6 +106,10 @@ pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
             config.health_listen.to_string(),
         ),
         (
+            "DIG_RELAY_STUN_LISTEN".to_string(),
+            config.stun_listen.to_string(),
+        ),
+        (
             "DIG_RELAY_MAX_CONNECTIONS".to_string(),
             config.max_connections.to_string(),
         ),
@@ -265,6 +269,12 @@ pub fn config_from_env() -> RelayServerConfig {
     {
         config.health_listen = a;
     }
+    if let Some(a) = std::env::var("DIG_RELAY_STUN_LISTEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.stun_listen = a;
+    }
     if let Some(n) = std::env::var("DIG_RELAY_MAX_CONNECTIONS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -286,9 +296,10 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// The env vars `config_from_env` reads, cleared so a test starts from a known state.
-    const RELAY_ENV: [&str; 3] = [
+    const RELAY_ENV: [&str; 4] = [
         "DIG_RELAY_LISTEN",
         "DIG_RELAY_HEALTH_LISTEN",
+        "DIG_RELAY_STUN_LISTEN",
         "DIG_RELAY_MAX_CONNECTIONS",
     ];
     fn clear_relay_env() {
@@ -436,11 +447,13 @@ mod tests {
         clear_relay_env();
         std::env::set_var("DIG_RELAY_LISTEN", "127.0.0.1:7000");
         std::env::set_var("DIG_RELAY_HEALTH_LISTEN", "127.0.0.1:7001");
+        std::env::set_var("DIG_RELAY_STUN_LISTEN", "127.0.0.1:7002");
         std::env::set_var("DIG_RELAY_MAX_CONNECTIONS", "12");
         let c = config_from_env();
         clear_relay_env();
         assert_eq!(c.listen, "127.0.0.1:7000".parse().unwrap());
         assert_eq!(c.health_listen, "127.0.0.1:7001".parse().unwrap());
+        assert_eq!(c.stun_listen, "127.0.0.1:7002".parse().unwrap());
         assert_eq!(c.max_connections, 12);
         // idle_timeout is not env-driven → stays default.
         assert_eq!(c.idle_timeout, RelayServerConfig::default().idle_timeout);

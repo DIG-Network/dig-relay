@@ -42,6 +42,9 @@ struct Cli {
     /// Address the HTTP /health listener binds (default 0.0.0.0:9451).
     #[arg(long, value_name = "ADDR", global = true)]
     health_listen: Option<SocketAddr>,
+    /// Address the STUN (RFC 5389) UDP listener binds (default 0.0.0.0:3478).
+    #[arg(long, value_name = "ADDR", global = true)]
+    stun_listen: Option<SocketAddr>,
     /// Maximum concurrent relay connections (default 4096).
     #[arg(long, value_name = "N", global = true)]
     max_connections: Option<usize>,
@@ -74,15 +77,19 @@ fn config_from(cli: &Cli) -> RelayServerConfig {
     apply_overrides(service::config_from_env(), cli)
 }
 
-/// Apply a parsed [`Cli`]'s `--listen`/`--health-listen`/`--max-connections`/`--idle-timeout-secs`
-/// overrides onto a base config. PURE (takes the base explicitly, no env read) so the precedence —
-/// CLI flag beats the base value, an unset flag leaves the base untouched — is unit-testable.
+/// Apply a parsed [`Cli`]'s `--listen`/`--health-listen`/`--stun-listen`/`--max-connections`/
+/// `--idle-timeout-secs` overrides onto a base config. PURE (takes the base explicitly, no env read)
+/// so the precedence — CLI flag beats the base value, an unset flag leaves the base untouched — is
+/// unit-testable.
 fn apply_overrides(mut config: RelayServerConfig, cli: &Cli) -> RelayServerConfig {
     if let Some(a) = cli.listen {
         config.listen = a;
     }
     if let Some(a) = cli.health_listen {
         config.health_listen = a;
+    }
+    if let Some(a) = cli.stun_listen {
+        config.stun_listen = a;
     }
     if let Some(n) = cli.max_connections {
         config.max_connections = n;
@@ -281,6 +288,7 @@ mod tests {
         let base = RelayServerConfig {
             listen: "10.0.0.1:1111".parse().unwrap(),
             health_listen: "10.0.0.1:2222".parse().unwrap(),
+            stun_listen: "10.0.0.1:3333".parse().unwrap(),
             max_connections: 7,
             idle_timeout: Duration::from_secs(33),
         };
@@ -298,6 +306,8 @@ mod tests {
             "127.0.0.1:8000",
             "--health-listen",
             "127.0.0.1:8001",
+            "--stun-listen",
+            "127.0.0.1:8002",
             "--max-connections",
             "10",
             "--idle-timeout-secs",
@@ -306,16 +316,18 @@ mod tests {
         let out = apply_overrides(base, &cli);
         assert_eq!(out.listen, "127.0.0.1:8000".parse().unwrap());
         assert_eq!(out.health_listen, "127.0.0.1:8001".parse().unwrap());
+        assert_eq!(out.stun_listen, "127.0.0.1:8002".parse().unwrap());
         assert_eq!(out.max_connections, 10);
         assert_eq!(out.idle_timeout, Duration::from_secs(5));
     }
 
     #[test]
     fn apply_overrides_applies_only_the_flags_given() {
-        // Only --max-connections set; the other three fields keep the base values.
+        // Only --max-connections set; the other fields keep the base values.
         let base = RelayServerConfig {
             listen: "10.0.0.1:1111".parse().unwrap(),
             health_listen: "10.0.0.1:2222".parse().unwrap(),
+            stun_listen: "10.0.0.1:3333".parse().unwrap(),
             max_connections: 7,
             idle_timeout: Duration::from_secs(33),
         };
@@ -324,6 +336,10 @@ mod tests {
         assert_eq!(out.max_connections, 99, "the one flag wins");
         assert_eq!(out.listen, base.listen, "unset flag leaves listen alone");
         assert_eq!(out.health_listen, base.health_listen);
+        assert_eq!(
+            out.stun_listen, base.stun_listen,
+            "unset flag leaves stun alone"
+        );
         assert_eq!(out.idle_timeout, base.idle_timeout);
     }
 

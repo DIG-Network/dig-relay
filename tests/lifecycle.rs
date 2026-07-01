@@ -24,13 +24,25 @@ async fn free_addr() -> std::net::SocketAddr {
     a
 }
 
+/// A free UDP port for the STUN listener (bound as UDP so the discovered port is actually free for
+/// UDP). Every relay in the parallel test suite needs its own STUN port — the shared default
+/// (3478) would collide across concurrently-running test relays and tear the server down.
+async fn free_udp_addr() -> std::net::SocketAddr {
+    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let a = s.local_addr().unwrap();
+    drop(s);
+    a
+}
+
 /// Start a relay with the given config tweaks and return `(relay_ws_url, health_addr)`.
 async fn start_relay(max_connections: usize) -> (String, std::net::SocketAddr) {
     let relay_addr = free_addr().await;
     let health_addr = free_addr().await;
+    let stun_addr = free_udp_addr().await;
     let config = RelayServerConfig {
         listen: relay_addr,
         health_listen: health_addr,
+        stun_listen: stun_addr,
         max_connections,
         ..Default::default()
     };

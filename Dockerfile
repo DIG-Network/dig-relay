@@ -6,8 +6,9 @@
 # load balancer (see DESIGN.md). Anyone may run this image to operate their own relay.
 #
 # Build:  docker build -t dig-relay .
-# Run:    docker run -p 9450:9450 -p 9451:9451 dig-relay
-#         (9450 = relay WebSocket, 9451 = HTTP /health for the load balancer)
+# Run:    docker run -p 9450:9450 -p 9451:9451 -p 3478:3478/udp dig-relay
+#         (9450 = relay WebSocket, 9451 = HTTP /health for the load balancer,
+#          3478/udp = STUN RFC 5389 Binding responder for reflexive-address discovery)
 
 # ---- build stage ----
 FROM rust:1-bookworm AS build
@@ -26,5 +27,6 @@ RUN useradd --system --no-create-home --uid 10001 digrelay
 COPY --from=build /src/target/release/dig-relay /usr/local/bin/dig-relay
 USER digrelay
 EXPOSE 9450 9451
+EXPOSE 3478/udp
 # Bind all interfaces inside the container; the orchestrator maps/fronts the ports.
 ENTRYPOINT ["/usr/local/bin/dig-relay"]
