@@ -30,10 +30,18 @@ What the server does:
   registered peers when a direct dial isn't possible. The relay is an untrusted forwarder; payloads
   are authenticated end-to-end by the gossip layer.
 - **Peer discovery** (RLY-005 `GetPeers`/`Peers`, `PeerConnected`/`PeerDisconnected`).
+- **Introducer / peer discovery with dialable addresses** (RLY-010 `AnnouncePeer`, RLY-011
+  `GetKnownPeers` → RLY-012 `KnownPeers`) — a node announces its candidate addresses and requests a
+  sampled list of other peers WITH their candidate addresses, so it can bootstrap the mesh by dialing
+  / hole-punching directly (the address-carrying counterpart to `GetPeers`).
 - **Keepalive** (RLY-006 `Ping`/`Pong`) with idle reaping.
-- **NAT-traversal coordination** (RLY-007 `HolePunchRequest` → `HolePunchCoordinate`) — exchanges
-  each side's external address so two NAT'd nodes can attempt a simultaneous open and migrate to a
-  direct connection.
+- **NAT-traversal coordination — two tiers.** *Signaling (preferred, low bandwidth):* the relay only
+  brokers candidate exchange (announce/known-peers) + a coordinated hole punch (RLY-007
+  `HolePunchRequest` → `HolePunchCoordinate`), then peers connect **directly** and the relay carries
+  none of their data. *Relayed transport (last resort, high bandwidth):* the relay proxies all data
+  (RLY-002 `RelayGossipMessage` / RLY-003 `Broadcast`) only after a hole punch fails.
+- **STUN (RFC 5389)** — a UDP Binding responder (default port `3478`, the IANA STUN port) so a NAT'd
+  node learns its public reflexive `IP:port` (XOR-MAPPED-ADDRESS) to advertise as a candidate.
 
 ## Build
 
@@ -45,20 +53,22 @@ cargo test
 ## Run
 
 ```bash
-dig-relay                          # serve on 0.0.0.0:9450 (relay) + 0.0.0.0:9451 (/health)
-dig-relay --listen 0.0.0.0:9450 --health-listen 0.0.0.0:9451 \
+dig-relay                          # serve on 0.0.0.0:9450 (relay) + :9451 (/health) + :3478/udp (STUN)
+dig-relay --listen 0.0.0.0:9450 --health-listen 0.0.0.0:9451 --stun-listen 0.0.0.0:3478 \
           --max-connections 4096 --idle-timeout-secs 120
 ```
 
 - `GET /health` (on the health port) returns `200` + `{status, connected_peers, uptime_secs,
   version}` for a load balancer's target-group check.
+- **STUN** (UDP `3478` by default): send an RFC 5389 Binding Request to learn your reflexive
+  `IP:port`.
 - `RUST_LOG=debug dig-relay` for verbose tracing.
 
 ## Docker
 
 ```bash
 docker build -t dig-relay .
-docker run -p 9450:9450 -p 9451:9451 dig-relay
+docker run -p 9450:9450 -p 9451:9451 -p 3478:3478/udp dig-relay
 ```
 
 TLS is terminated at the load balancer in the canonical deployment, so the container speaks plain

@@ -71,10 +71,15 @@ async fn two_nat_blocked_peers_exchange_through_the_relay() {
         .unwrap();
     let health_addr = health_listener.local_addr().unwrap();
     drop(health_listener);
+    // A free UDP port for STUN — parallel test relays must not share the default (3478).
+    let stun_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stun_addr = stun_socket.local_addr().unwrap();
+    drop(stun_socket);
 
     let config = RelayServerConfig {
         listen: relay_addr,
         health_listen: health_addr,
+        stun_listen: stun_addr,
         ..Default::default()
     };
     tokio::spawn(async move {
@@ -162,10 +167,14 @@ async fn forward_to_unknown_peer_returns_peer_not_found() {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let health_addr = l.local_addr().unwrap();
     drop(l);
+    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stun_addr = s.local_addr().unwrap();
+    drop(s);
 
     let config = RelayServerConfig {
         listen: relay_addr,
         health_listen: health_addr,
+        stun_listen: stun_addr,
         ..Default::default()
     };
     tokio::spawn(async move {

@@ -11,16 +11,18 @@
 //! NOT libp2p).
 //!
 //! Layering: [`wire`] is the vendored relay wire types; [`config`] is pure validated configuration;
-//! [`registry`] is the in-memory peer registry + pure routing decisions; [`server`] is the
-//! WebSocket accept loop + per-connection task + the pure `RelayMessage` dispatcher; [`health`] is
-//! the load-balancer HTTP probe; [`service`] installs/controls the relay as an OS service
-//! (run-your-own-relay) and [`win_service`] is the Windows SCM dispatcher.
+//! [`registry`] is the in-memory peer registry + pure routing decisions + the introducer peer store;
+//! [`server`] is the WebSocket accept loop + per-connection task + the pure `RelayMessage`
+//! dispatcher; [`stun`] is the RFC 5389 STUN Binding responder (UDP) that tells a node its reflexive
+//! address; [`health`] is the load-balancer HTTP probe; [`service`] installs/controls the relay as
+//! an OS service (run-your-own-relay) and [`win_service`] is the Windows SCM dispatcher.
 
 pub mod config;
 pub mod health;
 pub mod registry;
 pub mod server;
 pub mod service;
+pub mod stun;
 pub mod wire;
 
 #[cfg(windows)]
@@ -48,11 +50,13 @@ pub async fn serve_with_shutdown(
 
     let relay = server::run(state.clone());
     let health = health::run(state.clone());
+    let stun = stun::run(state.clone());
 
     // Whichever listener exits first (or the shutdown signal) ends serving.
     tokio::select! {
         r = relay => r,
         h = health => h,
+        s = stun => s,
         _ = shutdown => Ok(()),
     }
 }
@@ -65,17 +69,22 @@ mod tests {
     /// resolves with that bind error — proving the error is propagated, not swallowed.
     #[tokio::test]
     async fn serve_with_shutdown_resolves_ok_when_shutdown_fires_first() {
-        // Bind two free ports for the relay + health listeners.
+        // Bind free ports for the relay + health listeners (and a free UDP port for STUN) so the
+        // test never collides with the default ports on a busy CI runner.
         let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay.local_addr().unwrap();
         drop(relay);
         let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let health_addr = health.local_addr().unwrap();
         drop(health);
+        let stun = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun_addr = stun.local_addr().unwrap();
+        drop(stun);
 
         let config = RelayServerConfig {
             listen: relay_addr,
             health_listen: health_addr,
+            stun_listen: stun_addr,
             ..Default::default()
         };
         // An immediately-ready shutdown future → the `shutdown` select arm wins → Ok(()).
@@ -104,10 +113,14 @@ mod tests {
         let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let health_addr = health.local_addr().unwrap();
         drop(health);
+        let stun = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun_addr = stun.local_addr().unwrap();
+        drop(stun);
 
         let config = RelayServerConfig {
             listen: busy_addr, // already bound above (still held) → relay bind fails
             health_listen: health_addr,
+            stun_listen: stun_addr, // free → only the relay bind is the intended failure
             ..Default::default()
         };
         let out = serve_with_shutdown(config, std::future::pending::<()>()).await;
