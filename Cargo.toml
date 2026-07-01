@@ -39,6 +39,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # macOS (launchd). Mirrors dig-node's service-manager approach so the DIG installer delegates to
 # `dig-relay install`/`start` identically.
 service-manager = "0.7"
+# The DIG Peer Exchange (PEX) protocol. The relay embeds its transport-agnostic, sans-IO `PexEngine`
+# to speak PEX in its INTRODUCER role toward registered nodes — riding the existing RelayMessage
+# WebSocket as RLY-008 (see `src/pex.rs` + DESIGN.md "RLY-008"). dig-pex is standalone with a minimal
+# dependency surface (serde + serde_json + tokio + rand), so unlike dig-gossip it drops in cleanly.
+# Git-pinned in the bare form (tracks the crate's default branch) like the ecosystem's other DIG deps.
+dig-pex = { git = "https://github.com/DIG-Network/dig-pex" }
 
 [target.'cfg(windows)'.dependencies]
 # Windows Service Control Protocol dispatcher: a service-manager-registered service must itself
