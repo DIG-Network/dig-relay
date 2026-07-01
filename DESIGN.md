@@ -80,47 +80,46 @@ so an accidental rename fails CI loudly. The superproject `SYSTEM.md` records th
 a change to the relay wire in `dig-gossip` must be mirrored in `dig-relay/src/wire.rs` in the same
 unit of work.
 
-## What the server does (RLY-001..RLY-007, RLY-010..RLY-012)
+## What the server does (RLY-001..RLY-007)
 
-`dig-relay` is a stateful WebSocket connection broker. Per the `RelayMessage` contract:
+`dig-relay` is a stateful WebSocket connection broker. Per the `RelayMessage` contract (the wire is
+strictly RLY-001..RLY-007, as pinned by the DIG node peer-network protocol):
 
 | Concern | Messages | Server behaviour |
 |---|---|---|
 | **Reservation / registration** (RLY-001) | `Register` → `RegisterAck` | A node connects over WebSocket and registers its `peer_id` + `network_id` + `protocol_version`. The relay records it in the in-memory registry and replies with `RegisterAck { success, message, connected_peers }`. A `network_id` mismatch is rejected. This *reservation* keeps the NAT'd node reachable: it holds a constant connection so the relay can push traffic to it. |
 | **Targeted relayed transport** (RLY-002) | `RelayGossipMessage { from, to, payload, seq }` | Forward the payload to the single registered peer `to` (same `network_id`). The fallback path when a direct dial to `to` failed. |
 | **Broadcast** (RLY-003) | `Broadcast { from, payload, exclude }` | Fan-out the payload to every registered peer in the sender's `network_id` except `from` and any in `exclude`. |
-| **Peer discovery / rendezvous** (RLY-005) | `GetPeers { network_id }` → `Peers { peers }` | Return the relay's current registered-peer list (optionally filtered by `network_id`) so a node can discover candidates to dial directly or hole-punch toward. Also push `PeerConnected` / `PeerDisconnected` notifications. `Peers` entries are address-less; use the introducer (RLY-011) to get dialable candidates. |
+| **Introducer / peer discovery** (RLY-005) | `GetPeers { network_id }` → `Peers { peers }` | The relay's **introducer** role: return the relay's current registered-peer list (optionally filtered by `network_id`) so a node can discover peers to hole-punch toward. Registration (RLY-001) *is* the introducer advertisement; while registered, a node also receives `PeerConnected` / `PeerDisconnected` for same-network peers so its view stays fresh without polling. |
 | **Keepalive** (RLY-006) | `Ping`/`Pong` | Bidirectional liveness. The relay reaps connections idle past a timeout so the registry stays accurate. |
-| **NAT traversal coordination** (RLY-007) | `HolePunchRequest { peer_id, target_peer_id, external_addr }` → `HolePunchCoordinate { peer_id, external_addr }` (to the target) → `HolePunchResult` | The relay is the rendezvous point that exchanges each side's externally-observed address so both nodes can attempt a **simultaneous open** (UDP/TCP hole punch). On success the nodes migrate to a direct connection and stop relaying; the relay is fallback, not the steady state. |
-| **Introducer announce** (RLY-010) | `AnnouncePeer { addrs }` | The registered peer advertises its externally-reachable **candidate addresses** (its reflexive address from STUN, plus any configured/mapped ports). Stored against the connection's registered id (re-stamped server-side, so a peer cannot announce for another id). |
-| **Introducer request / peer discovery** (RLY-011 → RLY-012) | `GetKnownPeers { network_id, max }` → `KnownPeers { peers }` | Return a **sampled** list of OTHER known peers WITH their dialable candidate addresses (`KnownPeerInfo { peer_id, network_id, addrs, connected_at, last_seen }`), so the requester can bootstrap the mesh by dialing/hole-punching directly. Never includes the requester; `max` is clamped to a hard server cap (`MAX_KNOWN_PEERS`). This is the address-carrying counterpart to RLY-005. |
-| **Errors** | `Error { code, message }` | Stable error envelope for protocol violations. |
+| **NAT traversal coordination** (RLY-007) | `HolePunchRequest { peer_id, target_peer_id, external_addr }` → `HolePunchCoordinate { peer_id, external_addr }` (to the target) → `HolePunchResult` | The relay is the rendezvous point that exchanges each side's externally-observed (STUN-derived) reflexive address so both nodes can attempt a **simultaneous open** (UDP/TCP hole punch). On success the nodes migrate to a direct connection and stop relaying; the relay is fallback, not the steady state. |
+| **Errors** | `Error { code, message }` | Stable error envelope for protocol violations (codes 1–4: `NOT_REGISTERED`, `BAD_MESSAGE`, `PEER_NOT_FOUND`, `CAPACITY`). |
 
 The hole-punch *state machine* (waiting → connecting → succeeded/failed, 300 s retry) and the
 **reconnect/backoff** + **transport selection** (direct-first, relay-fallback, `prefer_relay`
 override) all live on the **client** in `dig-gossip` (`relay_service.rs`); the relay's job is purely
 to be the always-on public coordinator.
 
-## Two NAT-traversal tiers: signaling (preferred) vs. relayed transport (fallback)
+## Two NAT-traversal tiers: signalling (preferred) vs. relayed transport (fallback)
 
 The relay offers two **clearly separated** NAT-traversal capabilities, and a client tries the
-low-bandwidth one first:
+low-bandwidth one first (matching the peer-network protocol's "four relay roles" — STUN + introducer
++ hole-punch signalling are low-bandwidth control; only relayed transport carries data):
 
-1. **Hole-punch SIGNALING (preferred, low bandwidth).** Two NAT'd peers use the relay ONLY to
-   discover each other's dialable candidate addresses (RLY-010 `AnnouncePeer` + RLY-011
-   `GetKnownPeers` → RLY-012 `KnownPeers`) and to coordinate a simultaneous open (RLY-007
-   `HolePunchRequest` → `HolePunchCoordinate`). The relay brokers the introduction + the "punch now"
+1. **Hole-punch SIGNALLING (preferred, low bandwidth).** Two NAT'd peers use the relay ONLY to
+   discover each other via the introducer (RLY-005 `GetPeers` → `Peers`) and to coordinate a
+   simultaneous open (RLY-007 `HolePunchRequest` → `HolePunchCoordinate`), each side supplying its
+   STUN-derived reflexive `external_addr`. The relay brokers the candidate exchange + the "punch now"
    rendezvous, then the peers connect **directly** — the relay carries **none** of their subsequent
-   application data. Only the small coordination messages pass through it. This is the code path in
-   `announce_peer` / `get_known_peers` / the `HolePunch*` dispatch, and it never touches the
-   data-forwarding path.
+   application data. Only the small coordination messages pass through it (the `HolePunch*` dispatch),
+   and it never touches the data-forwarding path.
 2. **Full relayed transport (TURN-like, last resort, high bandwidth).** The relay proxies ALL data
    for the peer pair (RLY-002 `RelayGossipMessage` / RLY-003 `Broadcast`). This is a **distinct**
    message set + code path (`forward_to` / `broadcast`), used only AFTER a hole punch fails. Because
    it consumes relay bandwidth, it is the fallback, not the steady state.
 
-`tests/holepunch_signaling.rs` pins this separation: two mock peers exchange candidates + get a
-coordinated punch trigger via the signaling path while asserting the relay proxies no data, and a
+`tests/holepunch_signaling.rs` pins this separation: two mock peers discover each other + get a
+coordinated punch trigger via the signalling path while asserting the relay proxies no data, and a
 separate test exercises the data-relay path as the distinct fallback.
 
 ## STUN (RFC 5389) — learning the reflexive address
@@ -135,29 +134,25 @@ observed. The implementation (`src/stun.rs`) is a minimal, correct RFC 5389 resp
 Binding Request and silently ignores anything that is not a well-formed one (a STUN server must never
 reply to a non-STUN packet). STUN is stateless, so it needs none of the relay's connection state.
 
-> **Alignment + reconciliation note.** The DIG-node peer-network protocol page
-> (`docs.dig.net/docs/protocol/peer-network.md`) is the authoritative spec. This server conforms to
-> it on the concrete points:
-> - **STUN** is served on the IANA port **3478** (matching the docs' `relay.dig.net:3478`), RFC 5389
->   Binding, XOR-MAPPED-ADDRESS — exactly the docs' STUN role. (dig-gossip itself has no STUN client
->   yet; any conformant STUN client works.)
+> **Alignment note.** The DIG node peer-network protocol page
+> (`docs.dig.net/docs/protocol/peer-network.md`, the normative spec) is the authoritative contract,
+> and this server conforms to it exactly:
+> - **STUN** is served on the IANA port **3478** (matching `relay.dig.net:3478`), RFC 5389 Binding,
+>   XOR-MAPPED-ADDRESS — the spec's STUN role. (dig-gossip itself has no STUN client yet; any
+>   conformant STUN client — including the one `dig-nat` is built to — works.)
+> - **The relay wire is strictly RLY-001..RLY-007** — no additional message types. The relay's
+>   **introducer** role is exactly RLY-005 (`GetPeers` → `Peers` of address-less `RelayPeerInfo`) plus
+>   the RLY-001 registration-as-advertisement; the address-carrying candidate `PeerRecord`
+>   (`{ peer_id, addresses:[{host,port,kind}], network_id, last_seen, via }`) belongs to the node
+>   **RPC** layer (`dig.getPeers` / `dig.announce`), which is a node-side surface, not the relay wire.
 > - **Hole-punch signalling vs. relayed transport** are two distinct roles/code paths, with signalling
->   preferred — matching the docs' "four relay roles" and the ladder's strategy (e) before (f).
-> - **`peer_id`** is the hex SHA-256 of the TLS SPKI DER, and candidate addresses are `host:port` —
->   matching the docs + dig-gossip `types/peer.rs`.
+>   preferred — matching the spec's "four relay roles" and the NAT-traversal ladder's strategy (e)
+>   before (f). Candidate reflexive addresses travel as the `external_addr` of the `HolePunch*` trio.
+> - **`peer_id`** is the hex SHA-256 of the TLS SPKI DER — matching the spec + dig-gossip
+>   `types/peer.rs`.
 >
-> One point to reconcile: the docs page currently pins the relay `RelayMessage` wire at
-> **RLY-001..RLY-007** and routes candidate-address discovery through the node **RPC** layer
-> (`dig.getPeers` / `dig.announce`, returning peers with `addresses[]`), while this server ALSO
-> offers candidate-address discovery **over the relay wire** as purely-additive messages
-> (RLY-010 `announce_peer`, RLY-011 `get_known_peers` → RLY-012 `known_peers`, each `KnownPeerInfo`
-> carrying `addrs`). These are 100% backward-compatible with RLY-001..007 (a client that speaks only
-> those is unaffected) and deliver the "return peers WITH dialable candidate addresses over the
-> relay" capability. The reconciliation is a documentation choice: either add RLY-010..012 to the
-> peer-network page's relay-wire table, or map the relay introducer to the `dig.getPeers`/`dig.announce`
-> RPC shapes. Until then, both surfaces exist and agree on the peer/candidate shapes. The dedicated
-> binary introducer in dig-gossip (opcodes 63/64/218/219) remains a **separate** transport from this
-> JSON-over-WebSocket relay wire.
+> The dedicated binary introducer in dig-gossip (opcodes 63/64/218/219) remains a **separate**
+> transport from this JSON-over-WebSocket relay wire.
 
 ## Operational surface
 
@@ -203,8 +198,8 @@ NLB, `relay.dig.net` via Route53 + ACM) is documented in the superproject `infra
 src/
   main.rs        # CLI (clap): --listen / --health-listen / --stun-listen / limits / --json; starts the server
   lib.rs         # public surface; re-exports; binds the relay + health + STUN listeners
-  registry.rs    # in-memory peer registry (register/unregister/lookup/list + announce/known_peers, per network_id)
-  server.rs      # WebSocket accept loop + per-connection task; RelayMessage dispatch (incl. introducer)
+  registry.rs    # in-memory peer registry (register/unregister/lookup/list, per network_id)
+  server.rs      # WebSocket accept loop + per-connection task; RelayMessage dispatch (RLY-001..007)
   stun.rs        # RFC 5389 STUN Binding responder (UDP) — reflexive-address discovery
   health.rs      # /health HTTP endpoint for the load balancer
   config.rs      # RelayServerConfig (listen addrs incl. stun_listen, limits, timeouts) — pure, unit-tested

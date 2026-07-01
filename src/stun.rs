@@ -2,7 +2,7 @@
 //!
 //! A DIG Node behind NAT needs to know the `IP:port` the outside world sees for it (its
 //! *server-reflexive* address) before it can advertise a useful candidate for hole-punching
-//! (RLY-007) or peer exchange (the introducer, RLY-010/011). Classic STUN answers exactly that: the
+//! (RLY-007, supplied as the `external_addr`) or peer exchange. Classic STUN answers exactly that: the
 //! node sends a **Binding Request** to a public STUN server over UDP, and the server replies with a
 //! **Binding Success Response** carrying an **XOR-MAPPED-ADDRESS** attribute — the source address of
 //! the request as observed by the server.

@@ -4,7 +4,7 @@
 //! dig-gossip relay CLIENT emits/expects, or the server and client cannot talk. This test freezes
 //! the `type` discriminators and field names so an accidental rename here fails CI loudly.
 
-use dig_relay::wire::{KnownPeerInfo, RelayMessage, RelayPeerInfo};
+use dig_relay::wire::{RelayMessage, RelayPeerInfo};
 
 fn json(m: &RelayMessage) -> serde_json::Value {
     serde_json::to_value(m).unwrap()
@@ -129,66 +129,6 @@ fn error_and_unregister_shape() {
         peer_id: "a".into(),
     });
     assert_eq!(v["type"], "unregister");
-}
-
-// ---- Introducer / peer-discovery additions (RLY-010..RLY-012), additive to RLY-001..007. ----
-//
-// These pin the NEW message shapes so they, too, can never silently drift. The peer entry
-// (`KnownPeerInfo`) mirrors the dig-gossip peer semantics: a hex `peer_id` plus dialable candidate
-// addresses (host:port), so the requester can attempt a direct dial / hole-punch before relaying.
-
-#[test]
-fn announce_peer_shape() {
-    // RLY-010: a peer announces its externally-reachable candidate addresses.
-    let v = json(&RelayMessage::AnnouncePeer {
-        addrs: vec![
-            "203.0.113.7:9444".parse().unwrap(),
-            "[2001:db8::1]:9444".parse().unwrap(),
-        ],
-    });
-    assert_eq!(v["type"], "announce_peer");
-    assert_eq!(v["addrs"][0], "203.0.113.7:9444");
-    assert_eq!(v["addrs"][1], "[2001:db8::1]:9444");
-}
-
-#[test]
-fn get_known_peers_shape() {
-    // RLY-011: request the known-peer list (optionally filtered + bounded).
-    let v = json(&RelayMessage::GetKnownPeers {
-        network_id: Some("DIG_MAINNET".into()),
-        max: Some(16),
-    });
-    assert_eq!(v["type"], "get_known_peers");
-    assert_eq!(v["network_id"], "DIG_MAINNET");
-    assert_eq!(v["max"], 16);
-
-    // Both fields are optional — omitted → null, which the server reads as "no filter / default".
-    let v = json(&RelayMessage::GetKnownPeers {
-        network_id: None,
-        max: None,
-    });
-    assert_eq!(v["type"], "get_known_peers");
-    assert!(v["network_id"].is_null());
-    assert!(v["max"].is_null());
-}
-
-#[test]
-fn known_peers_shape() {
-    // RLY-012: the known-peer response, each entry carrying dialable candidate addresses.
-    let entry = KnownPeerInfo {
-        peer_id: "a".into(),
-        network_id: "DIG_MAINNET".into(),
-        addrs: vec!["203.0.113.7:9444".parse().unwrap()],
-        connected_at: 100,
-        last_seen: 200,
-    };
-    let v = json(&RelayMessage::KnownPeers { peers: vec![entry] });
-    assert_eq!(v["type"], "known_peers");
-    assert_eq!(v["peers"][0]["peer_id"], "a");
-    assert_eq!(v["peers"][0]["network_id"], "DIG_MAINNET");
-    assert_eq!(v["peers"][0]["addrs"][0], "203.0.113.7:9444");
-    assert_eq!(v["peers"][0]["connected_at"], 100);
-    assert_eq!(v["peers"][0]["last_seen"], 200);
 }
 
 #[test]
