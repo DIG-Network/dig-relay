@@ -18,9 +18,10 @@ repo or the installer.
 
 `dig-relay` implements the **server side** of the DIG Network's relay protocol — the same
 `RelayMessage` wire (JSON over WebSocket, requirements RLY-001..RLY-007) that the `dig-gossip` L2
-peer layer speaks as a client. It is **not** libp2p; see [`DESIGN.md`](./DESIGN.md) for why aligning
-to the existing DIG/Chia-style peer protocol is the right fit. The wire types are vendored
-byte-identically in `src/wire.rs` and pinned by `tests/wire_conformance.rs`.
+peer layer speaks as a client, plus the purely-additive **RLY-008** Peer Exchange (PEX) binding. It is
+**not** libp2p; see [`DESIGN.md`](./DESIGN.md) for why aligning to the existing DIG/Chia-style peer
+protocol is the right fit. The RLY-001..007 wire types are vendored byte-identically in `src/wire.rs`
+and pinned by `tests/wire_conformance.rs`; RLY-008 rides `dig-pex`'s `PexMessage`.
 
 What the server does:
 
@@ -39,6 +40,11 @@ What the server does:
   connect **directly** and the relay carries none of their data. *Relayed transport (last resort,
   high bandwidth):* the relay proxies all data (RLY-002 `RelayGossipMessage` / RLY-003 `Broadcast`)
   only after a hole punch fails.
+- **Peer Exchange / PEX** (RLY-008 `pex_handshake`/`pex_snapshot`/`pex_delta`/`pex_error`) — the
+  introducer *pushes* a registered node a warm snapshot of the OTHER same-network registrants and then
+  only incremental add/drop deltas, so its address book stays current without polling. Gated on the
+  node's `pex_handshake` (legacy nodes see the wire exactly as RLY-001..007); registration-backed +
+  network-scoped; node-sent PEX data is never re-advertised (introducer-only). Normative in `dig-pex`.
 - **STUN (RFC 5389)** — a UDP Binding responder (default port `3478`, the IANA STUN port) so a NAT'd
   node learns its public reflexive `IP:port` (XOR-MAPPED-ADDRESS) to advertise as a candidate.
 

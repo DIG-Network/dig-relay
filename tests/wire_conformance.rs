@@ -3,8 +3,13 @@
 //! The vendored `RelayMessage`/`RelayPeerInfo` types MUST serialize to the exact JSON the
 //! dig-gossip relay CLIENT emits/expects, or the server and client cannot talk. This test freezes
 //! the `type` discriminators and field names so an accidental rename here fails CI loudly.
+//!
+//! It also pins the **RLY-008** PEX binding as purely additive: the re-exported `PexMessage`'s
+//! `pex_*` `type` tags must be disjoint from every RLY-001..RLY-007 tag (so no existing message
+//! changes meaning), and the PEX shapes are frozen too (their normative home is `dig-pex`, but the
+//! relay wire depends on them so we pin them here as well).
 
-use dig_relay::wire::{RelayMessage, RelayPeerInfo};
+use dig_relay::wire::{PexMessage, RelayMessage, RelayPeerInfo};
 
 fn json(m: &RelayMessage) -> serde_json::Value {
     serde_json::to_value(m).unwrap()
@@ -155,4 +160,97 @@ fn round_trips_through_json() {
         }
         other => panic!("round-trip changed the variant: {other:?}"),
     }
+}
+
+// ---- RLY-008: the additive PEX binding ----
+
+/// The RLY-001..RLY-007 `type` tags (the frozen relay wire, unchanged by RLY-008).
+const RLY_TAGS: &[&str] = &[
+    "register",
+    "register_ack",
+    "unregister",
+    "relay_message",
+    "broadcast",
+    "peer_connected",
+    "peer_disconnected",
+    "get_peers",
+    "peers",
+    "ping",
+    "pong",
+    "hole_punch_request",
+    "hole_punch_coordinate",
+    "hole_punch_result",
+    "error",
+];
+
+#[test]
+fn pex_type_tags_do_not_collide_with_any_rly_tag() {
+    // RLY-008 is purely additive: every PEX tag begins with `pex_` and none is an RLY tag, so no
+    // existing relay message changes shape or meaning.
+    for tag in ["pex_handshake", "pex_snapshot", "pex_delta", "pex_error"] {
+        assert!(tag.starts_with("pex_"));
+        assert!(
+            !RLY_TAGS.contains(&tag),
+            "PEX tag {tag} must not collide with an RLY-001..007 tag"
+        );
+    }
+}
+
+#[test]
+fn pex_message_shapes_are_frozen() {
+    // The relay uses the bare-JSON text-frame form on this binding (`to_json`).
+    let hs = PexMessage::PexHandshake {
+        version: 1,
+        network_id: "DIG_MAINNET".into(),
+        interval: 60,
+        flags: vec![],
+    };
+    let v: serde_json::Value = serde_json::from_str(&hs.to_json()).unwrap();
+    assert_eq!(v["type"], "pex_handshake");
+    assert_eq!(v["version"], 1);
+    assert_eq!(v["network_id"], "DIG_MAINNET");
+    assert_eq!(v["interval"], 60);
+
+    let snap = PexMessage::PexSnapshot { peers: vec![] };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&snap.to_json()).unwrap()["type"],
+        "pex_snapshot"
+    );
+
+    let delta = PexMessage::PexDelta {
+        added: vec![],
+        dropped: vec![],
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&delta.to_json()).unwrap()["type"],
+        "pex_delta"
+    );
+
+    let err = PexMessage::PexError {
+        code: 3,
+        message: "rate violation".into(),
+    };
+    let v: serde_json::Value = serde_json::from_str(&err.to_json()).unwrap();
+    assert_eq!(v["type"], "pex_error");
+    assert_eq!(v["code"], 3);
+}
+
+#[test]
+fn a_pex_frame_is_not_a_valid_relay_message_and_vice_versa() {
+    // The two tag spaces are disjoint, so a PEX frame never deserializes as a RelayMessage (the
+    // server routes it via the `pex_` type peek before the RLY parse).
+    let pex = PexMessage::PexHandshake {
+        version: 1,
+        network_id: "n".into(),
+        interval: 60,
+        flags: vec![],
+    }
+    .to_json();
+    assert!(
+        serde_json::from_str::<RelayMessage>(&pex).is_err(),
+        "a PEX frame must not parse as a RelayMessage"
+    );
+    // An RLY frame is not a PEX message either.
+    let rly = serde_json::to_string(&RelayMessage::Ping { timestamp: 1 }).unwrap();
+    assert!(PexMessage::from_json(&rly).is_err());
 }
