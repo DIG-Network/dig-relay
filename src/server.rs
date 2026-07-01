@@ -12,7 +12,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -20,8 +20,14 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::RelayServerConfig;
+use crate::pex::PexRelay;
 use crate::registry::Registry;
-use crate::wire::{RelayMessage, RelayPeerInfo};
+use crate::wire::{PexMessage, RelayMessage, RelayPeerInfo};
+
+/// How often the PEX housekeeping timer drives [`PexRelay::tick`] (SPEC §6, Appendix A step 4). The
+/// PEX engine spaces each link's own `pex_delta`s by its effective interval (≥ 30 s); this cadence is
+/// only how often the relay *checks* whether a link is due, so ~1/s is ample and cheap.
+const PEX_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Stable relay error codes (the `code` field of [`RelayMessage::Error`]). Catalogued so an agent
 /// never has to scrape prose to learn what the relay rejected.
@@ -41,6 +47,10 @@ pub struct RelayState {
     /// The peer registry (the only routing state). Guarded by an async mutex; locks are held
     /// briefly (clone a sender out, drop the lock, then send).
     pub registry: Mutex<Registry>,
+    /// The introducer PEX subsystem (RLY-008): one `PexEngine` per network + per-connection PEX
+    /// senders. Registration mirrors into it; the housekeeping tick routes its deltas out. Guarded by
+    /// its own async mutex so PEX work never blocks the RLY routing lock (and vice versa).
+    pub pex: Mutex<PexRelay>,
     /// Live connected-peer count, mirrored from the registry for a lock-free `/health` read.
     pub connected: AtomicU64,
     /// Process start time, for `/health` uptime.
@@ -54,6 +64,7 @@ impl RelayState {
     pub fn new(config: RelayServerConfig) -> Arc<Self> {
         Arc::new(RelayState {
             registry: Mutex::new(Registry::new()),
+            pex: Mutex::new(PexRelay::new()),
             connected: AtomicU64::new(0),
             started: SystemTime::now(),
             config,
@@ -66,11 +77,24 @@ impl RelayState {
     }
 }
 
+/// Current Unix-epoch time in milliseconds (saturating) — the clock the [`PexRelay`] runs on (SPEC
+/// timestamps are Unix-epoch ms). Wall-clock, matching the registrant `last_seen` semantics.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Per-connection registration state, set after a successful `Register`.
 #[derive(Debug, Clone, Default)]
 struct Session {
     peer_id: Option<String>,
     network_id: Option<String>,
+    /// Whether this connection has sent its `pex_handshake` (RLY-008 capability gate). The relay
+    /// MUST NOT send any PEX to a connection until this is `true`; a legacy node that never sends one
+    /// sees the wire exactly as RLY-001..RLY-007 (SPEC §10.2).
+    pex_active: bool,
 }
 
 /// What the dispatcher decided a parsed [`RelayMessage`] should do. Pure data — the async task
@@ -221,11 +245,78 @@ impl TapNetwork for Action {
     }
 }
 
+/// Whether a raw inbound text/binary frame is a PEX message (RLY-008) rather than an RLY-001..007
+/// `RelayMessage`. PEX rides the same `type`-tagged JSON WebSocket; every PEX `type` tag begins with
+/// `pex_` and none collides with an RLY tag, so a cheap `"type":"pex_…"` peek classifies the frame
+/// before a full parse — a legacy RLY frame never enters the PEX path and vice versa (SPEC §10.2).
+fn is_pex_frame(frame: &[u8]) -> bool {
+    // Parse just the `type` discriminator; anything that isn't an object with a `pex_`-prefixed
+    // `type` is not ours.
+    serde_json::from_slice::<serde_json::Value>(frame)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|t| t.starts_with("pex_"))
+        })
+        .unwrap_or(false)
+}
+
+/// What to do with a `pex_`-typed frame from a connection, decided purely from the connection's
+/// registration/handshake state and whether the frame decoded (SPEC §10.2). Keeping this separate
+/// from the async I/O makes the RLY-008 gating unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum PexAction {
+    /// Not registered yet — answer with the relay's own `error` envelope code `1` (`NOT_REGISTERED`),
+    /// consistent with every other pre-registration message (SPEC §10.2). Never processed as PEX.
+    NotRegistered,
+    /// The node's first `pex_handshake` — bring PEX up for this link (`link_up` + `on_message`) and
+    /// mark the session PEX-active. Carries the decoded handshake.
+    Handshake(PexMessage),
+    /// A subsequent PEX data message on an already-active link — fed to the engine for validation +
+    /// rate-limiting; candidate/dropped events are discarded (introducer-only), only errors reply.
+    Data(PexMessage),
+    /// A `pex_`-typed but undecodable frame from an active link — a `PEX_BAD_MESSAGE` strike.
+    BadFrame,
+    /// A PEX frame arriving before the node ever handshaked (and not itself a handshake) — the relay
+    /// has not brought PEX up for this link, so it is silently ignored (no RLY error; PEX is optional).
+    IgnorePreHandshake,
+}
+
+/// Decide how to treat a `pex_`-typed `frame` given the connection's [`Session`]. Pure: no I/O, no
+/// engine access. `decoded` is the result of [`PexMessage::from_json`] on the frame.
+fn pex_dispatch(session: &Session, decoded: Option<&PexMessage>) -> PexAction {
+    if session.peer_id.is_none() {
+        // A `pex_handshake` (or any PEX) before RLY-001 registration is answered like any other
+        // pre-registration message: the relay's own NOT_REGISTERED error (SPEC §10.2).
+        return PexAction::NotRegistered;
+    }
+    match decoded {
+        Some(msg @ PexMessage::PexHandshake { .. }) if !session.pex_active => {
+            PexAction::Handshake(msg.clone())
+        }
+        Some(msg) if session.pex_active => PexAction::Data(msg.clone()),
+        // A non-handshake PEX frame before the node handshaked: the relay never brought PEX up for
+        // this link, so there is nothing to validate against — ignore it (PEX is an optional overlay).
+        Some(_) => PexAction::IgnorePreHandshake,
+        // Undecodable `pex_` frame: a bad message only counts once PEX is active (there is no link
+        // state to strike otherwise); before handshake it is ignored.
+        None if session.pex_active => PexAction::BadFrame,
+        None => PexAction::IgnorePreHandshake,
+    }
+}
+
 /// Run the relay WebSocket accept loop until the listener errors or the process is cancelled.
-/// Each accepted TCP connection is upgraded to a WebSocket and handled in its own task.
+/// Each accepted TCP connection is upgraded to a WebSocket and handled in its own task. A background
+/// task drives the PEX housekeeping tick (RLY-008) on [`PEX_TICK_INTERVAL`].
 pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
     let listener = TcpListener::bind(state.config.listen).await?;
     tracing::info!(addr = %state.config.listen, "dig-relay listening (RelayMessage/WebSocket)");
+
+    // PEX housekeeping (RLY-008): drive every network's engine cadence and route its per-link deltas
+    // to the matching connection's PEX channel. Runs for the lifetime of the accept loop.
+    tokio::spawn(pex_housekeeping(state.clone()));
+
     loop {
         let (stream, peer_addr) = match listener.accept().await {
             Ok(v) => v,
@@ -243,9 +334,23 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
     }
 }
 
+/// The PEX housekeeping loop (RLY-008, SPEC §6 + Appendix A step 4): on [`PEX_TICK_INTERVAL`], drive
+/// every per-network engine's send cadence and route each due `pex_delta` to the matching connection.
+/// [`PexRelay::tick`] itself does the per-network scoping + routing to the retained PEX senders; this
+/// loop only supplies the clock. It ends when the process is torn down (the task is aborted with the
+/// runtime).
+async fn pex_housekeeping(state: Arc<RelayState>) {
+    let mut ticker = tokio::time::interval(PEX_TICK_INTERVAL);
+    loop {
+        ticker.tick().await;
+        state.pex.lock().await.tick(now_ms());
+    }
+}
+
 /// Handle one WebSocket connection: enforce the connection cap, then read/dispatch frames until
 /// close. A dedicated writer task drains the peer's outbound channel onto the socket so messages
 /// forwarded by OTHER connections are delivered concurrently with this connection's own replies.
+/// PEX frames (RLY-008) ride a parallel outbound channel merged by the same writer.
 async fn handle_connection(
     state: Arc<RelayState>,
     stream: tokio::net::TcpStream,
@@ -260,16 +365,36 @@ async fn handle_connection(
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut write, mut read) = ws.split();
 
-    // Outbound channel: anything (this task, or another peer forwarding to us) pushes a
+    // Outbound RLY channel: anything (this task, or another peer forwarding to us) pushes a
     // RelayMessage here; the writer half drains it to the socket.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RelayMessage>();
+    // Outbound PEX channel (RLY-008): the PEX subsystem (handshake reply + tick-driven deltas) pushes
+    // `PexMessage`s here. Kept separate from the RLY channel so the registry / RLY-001..007 wire is
+    // byte-for-byte unchanged; the one writer merges both onto the socket as JSON text frames.
+    let (pex_tx, mut pex_rx) = mpsc::unbounded_channel::<PexMessage>();
 
-    // Writer task: serialize each RelayMessage as JSON text and write it.
+    // Writer task: serialize each outbound RLY or PEX message as one JSON text frame and write it.
+    // Both are `type`-tagged JSON on the same WebSocket; a PEX frame uses the bare-JSON form
+    // (`PexMessage::to_json`, no length prefix — SPEC §10.2). The loop ends when the RLY channel
+    // closes (teardown drops `out_tx`); a closed PEX channel just stops being polled.
     let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            let txt = match serde_json::to_string(&msg) {
-                Ok(t) => t,
-                Err(_) => continue,
+        let mut pex_open = true;
+        loop {
+            let txt = tokio::select! {
+                m = out_rx.recv() => match m {
+                    Some(msg) => match serde_json::to_string(&msg) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    },
+                    None => break, // RLY channel closed → connection is tearing down
+                },
+                m = pex_rx.recv(), if pex_open => match m {
+                    Some(msg) => msg.to_json(),
+                    None => {
+                        pex_open = false; // PEX channel closed; keep serving RLY
+                        continue;
+                    }
+                },
             };
             if write.send(Message::Text(txt)).await.is_err() {
                 break;
@@ -296,6 +421,14 @@ async fn handle_connection(
             Ok(Some(Ok(Message::Binary(b)))) => b,
             Ok(Some(Ok(Message::Frame(_)))) => continue,
         };
+
+        // RLY-008: a PEX frame (`type:"pex_…"`) is routed to the PEX subsystem, never parsed as an
+        // RLY message. This is checked BEFORE the RLY parse so a valid PEX frame never trips the
+        // BAD_MESSAGE path, and a legacy RLY frame never enters PEX (their tag spaces are disjoint).
+        if is_pex_frame(&frame) {
+            handle_pex_frame(&state, &mut session, &frame, peer_addr, &pex_tx, &out_tx).await;
+            continue;
+        }
 
         let msg: RelayMessage = match serde_json::from_slice(&frame) {
             Ok(m) => m,
@@ -328,7 +461,9 @@ async fn handle_connection(
                     peer_id,
                     network_id,
                     protocol_version,
+                    peer_addr,
                     &out_tx,
+                    &pex_tx,
                 )
                 .await
                 {
@@ -355,22 +490,99 @@ async fn handle_connection(
         }
     }
 
-    // Connection teardown: unregister + notify peers + stop the writer.
+    // Connection teardown: unregister from the registry + the PEX subsystem, notify peers, and stop
+    // the writer (dropping both outbound channels ends the writer's select loop).
     deregister(&state, &session).await;
+    drop(pex_tx);
     drop(out_tx);
     let _ = writer.await;
     Ok(())
 }
 
+/// Route one PEX frame (RLY-008) to the introducer PEX subsystem, per the [`pex_dispatch`] decision
+/// (SPEC §10.2). On the node's first `pex_handshake` this brings PEX up for the link and marks the
+/// session PEX-active; subsequent data messages are validated + rate-limited only (their peer hints
+/// are discarded — introducer-only); replies (our handshake + snapshot, or a `pex_error`) go out on
+/// the PEX channel, and a pre-registration PEX frame gets the relay's own NOT_REGISTERED error.
+async fn handle_pex_frame(
+    state: &Arc<RelayState>,
+    session: &mut Session,
+    frame: &[u8],
+    peer_addr: std::net::SocketAddr,
+    pex_tx: &mpsc::UnboundedSender<PexMessage>,
+    out_tx: &mpsc::UnboundedSender<RelayMessage>,
+) {
+    let decoded = std::str::from_utf8(frame)
+        .ok()
+        .and_then(|s| PexMessage::from_json(s).ok());
+
+    let peer_id = session.peer_id.clone().unwrap_or_default();
+    let network_id = session.network_id.clone().unwrap_or_default();
+    let now = now_ms();
+
+    match pex_dispatch(session, decoded.as_ref()) {
+        PexAction::NotRegistered => {
+            let _ = out_tx.send(RelayMessage::Error {
+                code: errcode::NOT_REGISTERED,
+                message: "register before sending PEX (RLY-001)".to_string(),
+            });
+        }
+        PexAction::Handshake(msg) => {
+            // First handshake: register this link's PEX sender, bring PEX up, and reply with our
+            // handshake + a snapshot of the OTHER same-network registrants (routed on the PEX channel).
+            let replies = {
+                let mut pex = state.pex.lock().await;
+                // Ensure our engine has this connection's PEX sender for tick-driven deltas. The
+                // register-time mirror already inserted it, but a connection could handshake before
+                // its register mirror ran in an unusual interleaving; re-registering is idempotent.
+                pex.on_register(&peer_id, &network_id, peer_addr, pex_tx.clone(), now);
+                pex.on_node_handshake(&peer_id, &network_id, msg, now)
+            };
+            session.pex_active = true;
+            for m in replies {
+                let _ = pex_tx.send(m);
+            }
+        }
+        PexAction::Data(msg) => {
+            let replies = state
+                .pex
+                .lock()
+                .await
+                .on_node_message(&peer_id, &network_id, msg, now);
+            for m in replies {
+                let _ = pex_tx.send(m);
+            }
+        }
+        PexAction::BadFrame => {
+            let replies = state
+                .pex
+                .lock()
+                .await
+                .on_node_bad_frame(&peer_id, &network_id, now);
+            for m in replies {
+                let _ = pex_tx.send(m);
+            }
+        }
+        PexAction::IgnorePreHandshake => {}
+    }
+}
+
 /// Register the connection (RLY-001), enforcing the cap. Returns `false` (after sending a failing
-/// `register_ack`) if the relay is full.
+/// `register_ack`) if the relay is full. On success it also MIRRORS the registration into the PEX
+/// introducer subsystem (RLY-008, SPEC §10.2): the registrant becomes a first-hand, advertisable
+/// entry (`via: introducer`, its observed reflexive `peer_addr`, `relay-only`), and its PEX sender is
+/// retained for tick-driven deltas. Mirroring happens for EVERY registration — a legacy node that
+/// never speaks PEX is still a real peer other nodes must learn about.
+#[allow(clippy::too_many_arguments)]
 async fn register_peer(
     state: &Arc<RelayState>,
     session: &mut Session,
     peer_id: String,
     network_id: String,
     protocol_version: u32,
+    peer_addr: std::net::SocketAddr,
     out_tx: &mpsc::UnboundedSender<RelayMessage>,
+    pex_tx: &mpsc::UnboundedSender<PexMessage>,
 ) -> bool {
     let mut reg = state.registry.lock().await;
     if reg.len() >= state.config.max_connections {
@@ -415,6 +627,14 @@ async fn register_peer(
     for (_, tx) in targets {
         let _ = tx.send(RelayMessage::PeerConnected { peer: info.clone() });
     }
+
+    // RLY-008: mirror the registration into the PEX introducer set. Done after the RLY lock is
+    // released to keep the two subsystems' locks independent.
+    state
+        .pex
+        .lock()
+        .await
+        .on_register(&peer_id, &network_id, peer_addr, pex_tx.clone(), now_ms());
 
     session.peer_id = Some(peer_id);
     session.network_id = Some(network_id);
@@ -472,7 +692,9 @@ async fn broadcast(
 }
 
 /// Remove the connection from the registry on teardown and notify same-network peers (RLY-005
-/// PeerDisconnected).
+/// PeerDisconnected). Also MIRRORS the departure into the PEX introducer subsystem (RLY-008, SPEC
+/// §10.2): the peer drops from the advertise set (surfacing as a `dropped` delta to the links that
+/// were told it) and its PEX link state is discarded.
 async fn deregister(state: &Arc<RelayState>, session: &Session) {
     let (Some(peer_id), Some(network_id)) = (&session.peer_id, &session.network_id) else {
         return;
@@ -487,6 +709,7 @@ async fn deregister(state: &Arc<RelayState>, session: &Session) {
                 peer_id: peer_id.clone(),
             });
         }
+        state.pex.lock().await.on_unregister(peer_id, network_id);
     }
 }
 
@@ -499,7 +722,19 @@ mod tests {
         Session {
             peer_id: Some("me".to_string()),
             network_id: Some("net1".to_string()),
+            ..Default::default()
         }
+    }
+
+    /// A test peer address (the observed reflexive source a real connection would carry).
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:40000".parse().unwrap()
+    }
+
+    /// A throwaway PEX outbound sender for `register_peer` call sites that don't assert on PEX
+    /// output (the PEX mirroring is exercised directly in the dedicated PEX tests below).
+    fn pex_sink() -> mpsc::UnboundedSender<PexMessage> {
+        mpsc::unbounded_channel().0
     }
 
     #[test]
@@ -747,7 +982,17 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
 
-        let ok = register_peer(&state, &mut session, "p".into(), "net".into(), 1, &tx).await;
+        let ok = register_peer(
+            &state,
+            &mut session,
+            "p".into(),
+            "net".into(),
+            1,
+            test_addr(),
+            &tx,
+            &pex_sink(),
+        )
+        .await;
         assert!(ok);
         assert_eq!(state.connected.load(Ordering::Relaxed), 1);
         assert_eq!(session.peer_id.as_deref(), Some("p"));
@@ -786,7 +1031,17 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
-        let ok = register_peer(&state, &mut session, "second".into(), "net".into(), 1, &tx).await;
+        let ok = register_peer(
+            &state,
+            &mut session,
+            "second".into(),
+            "net".into(),
+            1,
+            test_addr(),
+            &tx,
+            &pex_sink(),
+        )
+        .await;
         assert!(!ok, "register must fail at capacity");
         assert!(session.peer_id.is_none(), "session stays unregistered");
         assert_eq!(state.connected.load(Ordering::Relaxed), 1, "no extra bump");
@@ -811,12 +1066,36 @@ mod tests {
         let state = RelayState::new(RelayServerConfig::default());
         let (tx1, _rx1) = mpsc::unbounded_channel();
         let mut s1 = Session::default();
-        assert!(register_peer(&state, &mut s1, "p".into(), "net".into(), 1, &tx1).await);
+        assert!(
+            register_peer(
+                &state,
+                &mut s1,
+                "p".into(),
+                "net".into(),
+                1,
+                test_addr(),
+                &tx1,
+                &pex_sink()
+            )
+            .await
+        );
         assert_eq!(state.connected.load(Ordering::Relaxed), 1);
 
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         let mut s2 = Session::default();
-        assert!(register_peer(&state, &mut s2, "p".into(), "net".into(), 1, &tx2).await);
+        assert!(
+            register_peer(
+                &state,
+                &mut s2,
+                "p".into(),
+                "net".into(),
+                1,
+                test_addr(),
+                &tx2,
+                &pex_sink()
+            )
+            .await
+        );
         assert_eq!(
             state.connected.load(Ordering::Relaxed),
             1,
@@ -845,6 +1124,7 @@ mod tests {
         let session = Session {
             peer_id: Some("me".into()),
             network_id: Some("net".into()),
+            ..Default::default()
         };
         forward_to(
             &state,
@@ -872,6 +1152,7 @@ mod tests {
         let session = Session {
             peer_id: Some("me".into()),
             network_id: Some("net".into()),
+            ..Default::default()
         };
         forward_to(
             &state,
@@ -924,6 +1205,7 @@ mod tests {
         let session = Session {
             peer_id: Some("a".into()),
             network_id: Some("net".into()),
+            ..Default::default()
         };
         broadcast(
             &state,
@@ -965,6 +1247,7 @@ mod tests {
         let b_session = Session {
             peer_id: Some("b".into()),
             network_id: Some("net".into()),
+            ..Default::default()
         };
         deregister(&state, &b_session).await;
         assert_eq!(state.connected.load(Ordering::Relaxed), 1);
@@ -1007,5 +1290,305 @@ mod tests {
             }
             other => panic!("expected Broadcast, got {other:?}"),
         }
+    }
+
+    // ---- RLY-008 PEX binding (frame classification, gating, and the server wiring) ----
+
+    /// A `<64hex>` peer id from a byte.
+    fn hex(b: u8) -> String {
+        format!("{b:02x}").repeat(32)
+    }
+
+    /// A node `pex_handshake` on `net`, version 1 — as the bare JSON text a node sends.
+    fn handshake_json(network_id: &str) -> String {
+        PexMessage::PexHandshake {
+            version: 1,
+            network_id: network_id.into(),
+            interval: 60,
+            flags: vec![],
+        }
+        .to_json()
+    }
+
+    /// Drain a PEX receiver (non-blocking).
+    fn drain_pex(rx: &mut mpsc::UnboundedReceiver<PexMessage>) -> Vec<PexMessage> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(m);
+        }
+        out
+    }
+
+    #[test]
+    fn is_pex_frame_recognizes_only_pex_typed_frames() {
+        assert!(is_pex_frame(handshake_json("net").as_bytes()));
+        assert!(is_pex_frame(br#"{"type":"pex_snapshot","peers":[]}"#));
+        // RLY frames are not PEX.
+        assert!(!is_pex_frame(br#"{"type":"register","peer_id":"a"}"#));
+        assert!(!is_pex_frame(br#"{"type":"ping","timestamp":1}"#));
+        // Non-JSON / no type / non-pex type.
+        assert!(!is_pex_frame(b"not json"));
+        assert!(!is_pex_frame(br#"{"no":"type"}"#));
+        assert!(!is_pex_frame(br#"{"type":"pexish"}"#));
+    }
+
+    #[test]
+    fn pex_dispatch_unregistered_is_not_registered() {
+        let s = Session::default();
+        let hs = PexMessage::from_json(&handshake_json("net")).unwrap();
+        assert_eq!(pex_dispatch(&s, Some(&hs)), PexAction::NotRegistered);
+    }
+
+    #[test]
+    fn pex_dispatch_first_handshake_brings_pex_up() {
+        let s = registered_session();
+        let hs = PexMessage::from_json(&handshake_json("net1")).unwrap();
+        assert!(matches!(
+            pex_dispatch(&s, Some(&hs)),
+            PexAction::Handshake(_)
+        ));
+    }
+
+    #[test]
+    fn pex_dispatch_data_before_handshake_is_ignored() {
+        // A registered but not-yet-PEX-active connection sending a non-handshake PEX frame: the relay
+        // never brought PEX up, so it is ignored (not an RLY error, not fed to the engine).
+        let s = registered_session();
+        let snap = PexMessage::PexSnapshot { peers: vec![] };
+        assert_eq!(pex_dispatch(&s, Some(&snap)), PexAction::IgnorePreHandshake);
+    }
+
+    #[test]
+    fn pex_dispatch_data_after_handshake_is_data() {
+        let s = Session {
+            pex_active: true,
+            ..registered_session()
+        };
+        let snap = PexMessage::PexSnapshot { peers: vec![] };
+        assert!(matches!(pex_dispatch(&s, Some(&snap)), PexAction::Data(_)));
+        // A second handshake once active is a data message (the engine strikes it as a protocol
+        // violation), not a re-handshake.
+        let hs = PexMessage::from_json(&handshake_json("net1")).unwrap();
+        assert!(matches!(pex_dispatch(&s, Some(&hs)), PexAction::Data(_)));
+    }
+
+    #[test]
+    fn pex_dispatch_bad_frame_only_strikes_when_active() {
+        let inactive = registered_session();
+        assert_eq!(pex_dispatch(&inactive, None), PexAction::IgnorePreHandshake);
+        let active = Session {
+            pex_active: true,
+            ..registered_session()
+        };
+        assert_eq!(pex_dispatch(&active, None), PexAction::BadFrame);
+    }
+
+    /// Register a peer into a real `RelayState` and return its (RLY rx, PEX rx). Mirrors what a live
+    /// connection does at register time (RLY-005 + the RLY-008 PEX mirror).
+    async fn register_into(
+        state: &Arc<RelayState>,
+        peer_id: &str,
+        network_id: &str,
+        port: u16,
+    ) -> (
+        Session,
+        mpsc::UnboundedReceiver<RelayMessage>,
+        mpsc::UnboundedSender<PexMessage>,
+        mpsc::UnboundedReceiver<PexMessage>,
+    ) {
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (pex_tx, pex_rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let ok = register_peer(
+            state,
+            &mut session,
+            peer_id.into(),
+            network_id.into(),
+            1,
+            addr,
+            &out_tx,
+            &pex_tx,
+        )
+        .await;
+        assert!(ok, "registration should succeed");
+        (session, out_rx, pex_tx, pex_rx)
+    }
+
+    #[tokio::test]
+    async fn register_mirrors_into_the_pex_introducer_set() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let _a = register_into(&state, &hex(0x0a), "net", 4001).await;
+        let _b = register_into(&state, &hex(0x0b), "net", 4002).await;
+        assert_eq!(
+            state.pex.lock().await.known_count("net"),
+            2,
+            "both registrants are first-hand known to the introducer"
+        );
+        assert_eq!(state.pex.lock().await.conn_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn node_handshake_gets_our_handshake_then_a_snapshot_of_other_peers() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (a, b) = (hex(0x0a), hex(0x0b));
+        let (mut sess_a, _a_rly, a_pex_tx, mut a_pex_rx) =
+            register_into(&state, &a, "net", 4001).await;
+        let _b = register_into(&state, &b, "net", 4002).await;
+
+        // A sends its pex_handshake as a raw frame → handled by the server PEX path.
+        let (dummy_rly, _drx) = mpsc::unbounded_channel();
+        handle_pex_frame(
+            &state,
+            &mut sess_a,
+            handshake_json("net").as_bytes(),
+            "127.0.0.1:4001".parse().unwrap(),
+            &a_pex_tx,
+            &dummy_rly,
+        )
+        .await;
+
+        assert!(sess_a.pex_active, "A is now PEX-active");
+        let msgs = drain_pex(&mut a_pex_rx);
+        assert!(
+            matches!(msgs[0], PexMessage::PexHandshake { .. }),
+            "first reply is our handshake"
+        );
+        match &msgs[1] {
+            PexMessage::PexSnapshot { peers } => {
+                let ids: Vec<_> = peers.iter().map(|p| p.peer_id.clone()).collect();
+                assert_eq!(
+                    ids,
+                    vec![b.clone()],
+                    "snapshot has the OTHER peer, not A itself"
+                );
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pex_frame_before_registration_gets_not_registered() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let mut session = Session::default(); // never registered
+        let (rly_tx, mut rly_rx) = mpsc::unbounded_channel();
+        let (pex_tx, mut pex_rx) = mpsc::unbounded_channel();
+        handle_pex_frame(
+            &state,
+            &mut session,
+            handshake_json("net").as_bytes(),
+            "127.0.0.1:4001".parse().unwrap(),
+            &pex_tx,
+            &rly_tx,
+        )
+        .await;
+        // The relay's own error envelope, code NOT_REGISTERED, on the RLY channel — never PEX.
+        match drain(&mut rly_rx).as_slice() {
+            [RelayMessage::Error { code, .. }] => assert_eq!(*code, errcode::NOT_REGISTERED),
+            other => panic!("expected NOT_REGISTERED error, got {other:?}"),
+        }
+        assert!(
+            drain_pex(&mut pex_rx).is_empty(),
+            "no PEX before registration"
+        );
+        assert!(!session.pex_active);
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_scoped_to_the_registered_network() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (a, z) = (hex(0x0a), hex(0x0c));
+        let (mut sess_a, _rly, a_pex_tx, mut a_pex_rx) =
+            register_into(&state, &a, "netX", 4001).await;
+        // A peer on a DIFFERENT network — must never appear in netX's snapshot.
+        let _z = register_into(&state, &z, "netY", 4003).await;
+
+        let (dummy_rly, _drx) = mpsc::unbounded_channel();
+        handle_pex_frame(
+            &state,
+            &mut sess_a,
+            handshake_json("netX").as_bytes(),
+            "127.0.0.1:4001".parse().unwrap(),
+            &a_pex_tx,
+            &dummy_rly,
+        )
+        .await;
+        let msgs = drain_pex(&mut a_pex_rx);
+        match &msgs[1] {
+            PexMessage::PexSnapshot { peers } => {
+                assert!(
+                    peers.is_empty(),
+                    "no same-network peer besides A; Z (netY) excluded"
+                );
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_node_pex_data_never_enters_the_introducer_registry() {
+        // The introducer-only discard rule (SPEC §10.2): a node advertising a peer to the relay must
+        // NOT cause the relay to re-advertise it.
+        let state = RelayState::new(RelayServerConfig::default());
+        let a = hex(0x0a);
+        let injected = hex(0x0f);
+        let (mut sess_a, _rly, a_pex_tx, _a_pex_rx) = register_into(&state, &a, "net", 4001).await;
+        assert_eq!(state.pex.lock().await.known_count("net"), 1);
+
+        // A activates PEX, then sends a snapshot advertising a NEW peer.
+        let (dummy_rly, _drx) = mpsc::unbounded_channel();
+        handle_pex_frame(
+            &state,
+            &mut sess_a,
+            handshake_json("net").as_bytes(),
+            "127.0.0.1:4001".parse().unwrap(),
+            &a_pex_tx,
+            &dummy_rly,
+        )
+        .await;
+        // A well-formed node snapshot advertising a fresh, valid injected peer (fresh `last_seen` so
+        // the entry itself validates — proving the peer is discarded by the introducer-only rule, not
+        // merely rejected as stale).
+        let injected_entry = dig_pex::PeerEntry::new(
+            injected.clone(),
+            "net",
+            now_ms() / 1000,
+            dig_pex::Provenance::Direct,
+        )
+        .with_address(dig_pex::Address::direct("203.0.113.9", 9444));
+        let node_snapshot = PexMessage::PexSnapshot {
+            peers: vec![injected_entry],
+        };
+        handle_pex_frame(
+            &state,
+            &mut sess_a,
+            node_snapshot.to_json().as_bytes(),
+            "127.0.0.1:4001".parse().unwrap(),
+            &a_pex_tx,
+            &dummy_rly,
+        )
+        .await;
+
+        assert_eq!(
+            state.pex.lock().await.known_count("net"),
+            1,
+            "node-sent PEX data must not grow the introducer's first-hand set"
+        );
+    }
+
+    #[tokio::test]
+    async fn deregister_drops_the_peer_from_the_pex_set() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (sess_a, _rly, _pt, _pr) = register_into(&state, &hex(0x0a), "net", 4001).await;
+        assert_eq!(state.pex.lock().await.known_count("net"), 1);
+        assert_eq!(state.pex.lock().await.conn_count(), 1);
+
+        deregister(&state, &sess_a).await;
+        assert_eq!(
+            state.pex.lock().await.known_count("net"),
+            0,
+            "unregister drops the peer from the advertise set"
+        );
+        assert_eq!(state.pex.lock().await.conn_count(), 0);
     }
 }

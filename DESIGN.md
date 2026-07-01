@@ -47,8 +47,8 @@ ecosystem already speaks it:
   `Broadcast` (fan-out), `GetPeers`/`Peers`, `Ping`/`Pong`, and the NAT-traversal trio
   `HolePunchRequest`/`HolePunchCoordinate`/`HolePunchResult`. The wire is **JSON over WebSocket**.
 - `dig-gossip` ships the **client** side (`relay_client.rs`) and the client **state machines**
-  (`relay_service.rs`: reconnect/backoff per RLY-004, hole-punch state machine per RLY-007, transport
-  selection per RLY-008) — but **no server**. There is no code anywhere that *accepts* a `Register`,
+  (`relay_service.rs`: reconnect/backoff, the RLY-007 hole-punch state machine, and direct-first
+  transport selection) — but **no server**. There is no code anywhere that *accepts* a `Register`,
   answers `RegisterAck`, forwards a `RelayGossipMessage`, fans out a `Broadcast`, or coordinates a
   hole punch.
 - That **server is exactly what `dig-relay` is.**
@@ -80,10 +80,11 @@ so an accidental rename fails CI loudly. The superproject `SYSTEM.md` records th
 a change to the relay wire in `dig-gossip` must be mirrored in `dig-relay/src/wire.rs` in the same
 unit of work.
 
-## What the server does (RLY-001..RLY-007)
+## What the server does (RLY-001..RLY-008)
 
-`dig-relay` is a stateful WebSocket connection broker. Per the `RelayMessage` contract (the wire is
-strictly RLY-001..RLY-007, as pinned by the DIG node peer-network protocol):
+`dig-relay` is a stateful WebSocket connection broker. Per the `RelayMessage` contract (RLY-001..
+RLY-007, as pinned by the DIG node peer-network protocol) plus the purely-additive **RLY-008** PEX
+binding (defined in `dig-pex`'s `SPEC.md` §10.2, and detailed below):
 
 | Concern | Messages | Server behaviour |
 |---|---|---|
@@ -93,7 +94,8 @@ strictly RLY-001..RLY-007, as pinned by the DIG node peer-network protocol):
 | **Introducer / peer discovery** (RLY-005) | `GetPeers { network_id }` → `Peers { peers }` | The relay's **introducer** role: return the relay's current registered-peer list (optionally filtered by `network_id`) so a node can discover peers to hole-punch toward. Registration (RLY-001) *is* the introducer advertisement; while registered, a node also receives `PeerConnected` / `PeerDisconnected` for same-network peers so its view stays fresh without polling. |
 | **Keepalive** (RLY-006) | `Ping`/`Pong` | Bidirectional liveness. The relay reaps connections idle past a timeout so the registry stays accurate. |
 | **NAT traversal coordination** (RLY-007) | `HolePunchRequest { peer_id, target_peer_id, external_addr }` → `HolePunchCoordinate { peer_id, external_addr }` (to the target) → `HolePunchResult` | The relay is the rendezvous point that exchanges each side's externally-observed (STUN-derived) reflexive address so both nodes can attempt a **simultaneous open** (UDP/TCP hole punch). On success the nodes migrate to a direct connection and stop relaying; the relay is fallback, not the steady state. |
-| **Errors** | `Error { code, message }` | Stable error envelope for protocol violations (codes 1–4: `NOT_REGISTERED`, `BAD_MESSAGE`, `PEER_NOT_FOUND`, `CAPACITY`). |
+| **Peer Exchange** (RLY-008) | `pex_handshake` / `pex_snapshot` / `pex_delta` / `pex_error` | The introducer's **PEX** binding (see the dedicated section below). After registration a PEX-capable node sends `pex_handshake`; the relay then pushes a snapshot of the OTHER same-network registrants and periodic add/drop deltas as registrations come and go. Purely additive — a node that never handshakes sees exactly RLY-001..RLY-007. |
+| **Errors** | `Error { code, message }` | Stable error envelope for protocol violations (codes 1–4: `NOT_REGISTERED`, `BAD_MESSAGE`, `PEER_NOT_FOUND`, `CAPACITY`). PEX-level errors use the separate `pex_error` envelope (the PEX §4.5 code table), keeping the RLY code space intact. |
 
 The hole-punch *state machine* (waiting → connecting → succeeded/failed, 300 s retry) and the
 **reconnect/backoff** + **transport selection** (direct-first, relay-fallback, `prefer_relay`
@@ -122,6 +124,61 @@ low-bandwidth one first (matching the peer-network protocol's "four relay roles"
 coordinated punch trigger via the signalling path while asserting the relay proxies no data, and a
 separate test exercises the data-relay path as the distinct fallback.
 
+## Peer Exchange (PEX) — the introducer binding (RLY-008)
+
+The relay's introducer role also speaks the **DIG Peer Exchange protocol (PEX)** toward registered
+nodes. Where RLY-005 (`GetPeers` → `Peers`) is a *pull* the node polls, PEX is a *push*: after a node
+opts in, the relay proactively streams it a warm snapshot of the network's other registrants and then
+only the incremental changes, so a node's address book stays current without polling. PEX is defined
+normatively in the `dig-pex` crate (its `SPEC.md`); the relay embeds `dig-pex`'s transport-agnostic,
+sans-IO `PexEngine` and is a thin I/O adapter over it (`src/pex.rs`). The wire designation is
+**RLY-008**.
+
+**Purely additive to RLY-001..RLY-007.** PEX rides the *same* `type`-tagged JSON WebSocket. The four
+PEX `type` tags (`pex_handshake`, `pex_snapshot`, `pex_delta`, `pex_error`) all begin with `pex_` and
+none collides with an RLY-001..RLY-007 tag, so no existing relay message changes shape or meaning. On
+this binding a PEX message is one WebSocket **text** frame carrying the bare JSON object
+(`PexMessage::to_json` / `PexMessage::from_json`) — *not* the node↔node u32-length-prefixed byte
+framing. A frame's `type` is peeked before the RLY parse so a PEX frame never trips the RLY
+`BAD_MESSAGE` path and a legacy RLY frame never enters the PEX path. `tests/wire_conformance.rs` pins
+both the frozen PEX shapes and the tag non-collision.
+
+**Capability gate.** The relay MUST NOT send any PEX to a connection that has not sent
+`pex_handshake` — a legacy node that never handshakes sees the wire exactly as RLY-001..RLY-007. A PEX
+frame from a connection that has not completed RLY-001 registration is answered with the relay's own
+`error` envelope code `1` (`NOT_REGISTERED`), consistent with every other pre-registration message. On
+the node's first `pex_handshake` the relay brings PEX up for that link and replies with its own
+`pex_handshake` followed by a `pex_snapshot` of the OTHER same-network registrants (never the node
+itself).
+
+**Registry mirroring.** The relay MIRRORS its RLY-001 registry into the PEX engine: on register, the
+registrant becomes a first-hand, advertisable entry (`via: introducer`, the relay-observed
+**reflexive** source address of its WebSocket, and the `relay-only` flag — the relay never learns a
+node's direct inbound listener from a `Register`, which carries no address); on
+unregister/disconnect/idle-timeout it is removed (surfacing as a `dropped` delta to the links that
+were told it). Registration **is** the relay's first-hand evidence; `last_seen` is the registrant's
+relay-connection liveness. Mirroring happens for *every* registration, so even a legacy non-PEX node
+is advertised to the PEX subscribers that must learn about it.
+
+**Introducer-only (no gossip amplification).** A node's `pex_handshake` is a capability signal; a node
+SHOULD NOT send PEX data messages to the relay, and the relay **MUST NOT** fold node-sent PEX entries
+into its introducer set (a PEX hint must never impersonate a registration). Inbound node data messages
+are still fed to the engine so the relay enforces the anti-flood rate floor / caps against a chatty
+node, but the resulting candidate/dropped events are **discarded** — only advisory `pex_error` replies
+flow back. The relay's advertise set is therefore *exactly* its live registrations, nothing more.
+
+**Scoping & timing.** All PEX is scoped to the node's registered `network_id`, structurally enforced
+by keeping **one `PexEngine` per network** (an engine only ever knows that one network's registrants).
+A background housekeeping task drives `PexEngine::tick` on a ~1 s cadence; the engine spaces each
+link's own `pex_delta`s by its effective interval (≥ 30 s, jittered) and routes each due delta to the
+matching connection's PEX channel. The per-connection writer merges the PEX channel with the existing
+RLY outbound channel onto the one socket, so the registry and the RLY-001..007 wire are byte-for-byte
+unchanged.
+
+> **Change-impact.** The PEX message shapes and the RLY-008 binding rules are normative in `dig-pex`
+> (`SPEC.md`). A change to either must be mirrored across `dig-pex`, this relay, and `dig-node`'s PEX
+> client in the same unit of work, and the docs.dig.net peer-network page updated to list RLY-008.
+
 ## STUN (RFC 5389) — learning the reflexive address
 
 Before a node can announce a *useful* candidate for hole-punching or the introducer, it must know the
@@ -140,11 +197,13 @@ reply to a non-STUN packet). STUN is stateless, so it needs none of the relay's 
 > - **STUN** is served on the IANA port **3478** (matching `relay.dig.net:3478`), RFC 5389 Binding,
 >   XOR-MAPPED-ADDRESS — the spec's STUN role. (dig-gossip itself has no STUN client yet; any
 >   conformant STUN client — including the one `dig-nat` is built to — works.)
-> - **The relay wire is strictly RLY-001..RLY-007** — no additional message types. The relay's
->   **introducer** role is exactly RLY-005 (`GetPeers` → `Peers` of address-less `RelayPeerInfo`) plus
->   the RLY-001 registration-as-advertisement; the address-carrying candidate `PeerRecord`
->   (`{ peer_id, addresses:[{host,port,kind}], network_id, last_seen, via }`) belongs to the node
->   **RPC** layer (`dig.getPeers` / `dig.announce`), which is a node-side surface, not the relay wire.
+> - **The relay wire is RLY-001..RLY-007 plus the purely-additive RLY-008 PEX binding** — no other
+>   message types. The relay's **introducer** role is RLY-005 (`GetPeers` → `Peers` of address-less
+>   `RelayPeerInfo`) + the RLY-001 registration-as-advertisement + the RLY-008 PEX push (which does
+>   carry address-bearing entries: the registrant's relay-observed reflexive address, `via:
+>   introducer`). The address-carrying candidate `PeerRecord`
+>   (`{ peer_id, addresses:[{host,port,kind}], network_id, last_seen, via }`) also belongs to the node
+>   **RPC** layer (`dig.getPeers` / `dig.announce`), a node-side surface distinct from the relay wire.
 > - **Hole-punch signalling vs. relayed transport** are two distinct roles/code paths, with signalling
 >   preferred — matching the spec's "four relay roles" and the NAT-traversal ladder's strategy (e)
 >   before (f). Candidate reflexive addresses travel as the `external_addr` of the `HolePunch*` trio.
@@ -199,7 +258,8 @@ src/
   main.rs        # CLI (clap): --listen / --health-listen / --stun-listen / limits / --json; starts the server
   lib.rs         # public surface; re-exports; binds the relay + health + STUN listeners
   registry.rs    # in-memory peer registry (register/unregister/lookup/list, per network_id)
-  server.rs      # WebSocket accept loop + per-connection task; RelayMessage dispatch (RLY-001..007)
+  server.rs      # WebSocket accept loop + per-connection task; RelayMessage dispatch (RLY-001..007) + PEX (RLY-008) routing + housekeeping tick
+  pex.rs         # RLY-008 introducer PEX binding: embeds dig-pex's PexEngine (registry mirroring, per-network scoping, introducer-only discard)
   stun.rs        # RFC 5389 STUN Binding responder (UDP) — reflexive-address discovery
   health.rs      # /health HTTP endpoint for the load balancer
   config.rs      # RelayServerConfig (listen addrs incl. stun_listen, limits, timeouts) — pure, unit-tested

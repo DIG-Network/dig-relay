@@ -23,11 +23,29 @@
 //!
 //! Relay messages use **JSON** over WebSocket (not Chia's binary protocol). The
 //! `#[serde(tag = "type")]` attribute produces `{"type": "register", ...}`.
+//!
+//! # RLY-008 — the PEX message
+//!
+//! The relay's introducer role also carries the DIG Peer Exchange protocol (PEX) toward registered
+//! nodes. PEX messages ride this same `type`-tagged JSON WebSocket as **RLY-008**, a purely-additive
+//! binding: the `pex_handshake` / `pex_snapshot` / `pex_delta` / `pex_error` `type` tags do **not**
+//! collide with any RLY-001..RLY-007 tag, so no existing relay message changes shape or meaning. The
+//! PEX message type is [`dig_pex::PexMessage`], re-exported here as [`PexMessage`] so this module is
+//! the single description of the whole relay wire (RLY-001..RLY-008). On this binding a PEX message
+//! is one WebSocket **text** frame containing the bare JSON object (`PexMessage::to_json` /
+//! `PexMessage::from_json`) — **not** the node↔node length-prefixed byte framing. The relay-side
+//! embedding lives in [`crate::pex`]; the shapes + non-collision are pinned by
+//! `tests/wire_conformance.rs`.
 
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+/// The **RLY-008** PEX message that rides this relay wire — re-exported from `dig-pex` (its normative
+/// home). See the module docs and `DESIGN.md`; the relay uses the bare-JSON text-frame form
+/// (`to_json`/`from_json`), never the byte-stream framing.
+pub use dig_pex::PexMessage;
 
 /// Complete relay protocol message enum.
 ///

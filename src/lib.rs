@@ -1,24 +1,29 @@
 //! DIG Relay — NAT-traversal rendezvous + circuit relay for the DIG Network L2 peer layer.
 //!
-//! `dig-relay` is the publicly-reachable SERVER side of the DIG relay protocol (RLY-001..RLY-007,
+//! `dig-relay` is the publicly-reachable SERVER side of the DIG relay protocol (RLY-001..RLY-008,
 //! JSON over WebSocket): DIG Nodes behind NAT register a constant reservation, discover peers,
 //! coordinate hole-punching, and — when a direct dial fails — exchange gossip traffic THROUGH the
-//! relay as a fallback. The canonical deployment is `relay.dig.net`.
+//! relay as a fallback. As its introducer role it also speaks the DIG Peer Exchange protocol (PEX)
+//! toward registered nodes — **RLY-008**, a purely-additive ride on the same WebSocket. The
+//! canonical deployment is `relay.dig.net`.
 //!
-//! The wire types ([`wire::RelayMessage`], [`wire::RelayPeerInfo`]) are vendored byte-identical to
-//! the `dig-gossip` relay CLIENT's, so the server and client wire can never drift (pinned by
-//! `tests/wire_conformance.rs`). See `DESIGN.md` for why this is the protocol-grade fit (and why
-//! NOT libp2p).
+//! The RLY-001..RLY-007 wire types ([`wire::RelayMessage`], [`wire::RelayPeerInfo`]) are vendored
+//! byte-identical to the `dig-gossip` relay CLIENT's, so the server and client wire can never drift
+//! (pinned by `tests/wire_conformance.rs`). RLY-008 rides `dig_pex::PexMessage` (re-exported as
+//! [`wire::PexMessage`]). See `DESIGN.md` for why this is the protocol-grade fit (and why NOT libp2p).
 //!
-//! Layering: [`wire`] is the vendored relay wire types; [`config`] is pure validated configuration;
-//! [`registry`] is the in-memory peer registry + pure routing decisions + the introducer peer store;
-//! [`server`] is the WebSocket accept loop + per-connection task + the pure `RelayMessage`
-//! dispatcher; [`stun`] is the RFC 5389 STUN Binding responder (UDP) that tells a node its reflexive
-//! address; [`health`] is the load-balancer HTTP probe; [`service`] installs/controls the relay as
-//! an OS service (run-your-own-relay) and [`win_service`] is the Windows SCM dispatcher.
+//! Layering: [`wire`] is the vendored relay wire types plus the RLY-008 PEX message; [`config`] is
+//! pure validated configuration; [`registry`] is the in-memory peer registry plus pure routing
+//! decisions; [`pex`] embeds the `dig-pex` `PexEngine` for the introducer PEX binding (registry
+//! mirroring, per-network scoping, and the introducer-only discard rule); [`server`] is the
+//! WebSocket accept loop, the per-connection task, the pure `RelayMessage` dispatcher, and the PEX
+//! housekeeping tick; [`stun`] is the RFC 5389 STUN Binding responder (UDP) that tells a node its
+//! reflexive address; [`health`] is the load-balancer HTTP probe; [`service`] installs/controls the
+//! relay as an OS service (run-your-own-relay) and [`win_service`] is the Windows SCM dispatcher.
 
 pub mod config;
 pub mod health;
+pub mod pex;
 pub mod registry;
 pub mod server;
 pub mod service;
