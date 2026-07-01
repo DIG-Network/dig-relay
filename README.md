@@ -29,17 +29,16 @@ What the server does:
 - **Relayed transport** (RLY-002 targeted, RLY-003 broadcast) — forwards gossip payloads between
   registered peers when a direct dial isn't possible. The relay is an untrusted forwarder; payloads
   are authenticated end-to-end by the gossip layer.
-- **Peer discovery** (RLY-005 `GetPeers`/`Peers`, `PeerConnected`/`PeerDisconnected`).
-- **Introducer / peer discovery with dialable addresses** (RLY-010 `AnnouncePeer`, RLY-011
-  `GetKnownPeers` → RLY-012 `KnownPeers`) — a node announces its candidate addresses and requests a
-  sampled list of other peers WITH their candidate addresses, so it can bootstrap the mesh by dialing
-  / hole-punching directly (the address-carrying counterpart to `GetPeers`).
+- **Introducer / peer discovery** (RLY-005 `GetPeers`/`Peers`, `PeerConnected`/`PeerDisconnected`) —
+  a registered node is advertised to other nodes' `GetPeers`, so registration *is* the introducer
+  advertisement; a node discovers peers to hole-punch toward.
 - **Keepalive** (RLY-006 `Ping`/`Pong`) with idle reaping.
-- **NAT-traversal coordination — two tiers.** *Signaling (preferred, low bandwidth):* the relay only
-  brokers candidate exchange (announce/known-peers) + a coordinated hole punch (RLY-007
-  `HolePunchRequest` → `HolePunchCoordinate`), then peers connect **directly** and the relay carries
-  none of their data. *Relayed transport (last resort, high bandwidth):* the relay proxies all data
-  (RLY-002 `RelayGossipMessage` / RLY-003 `Broadcast`) only after a hole punch fails.
+- **NAT-traversal coordination — two tiers.** *Signalling (preferred, low bandwidth):* the relay only
+  brokers discovery (`GetPeers`) + a coordinated hole punch (RLY-007 `HolePunchRequest` →
+  `HolePunchCoordinate`, carrying each side's STUN-derived reflexive `external_addr`), then peers
+  connect **directly** and the relay carries none of their data. *Relayed transport (last resort,
+  high bandwidth):* the relay proxies all data (RLY-002 `RelayGossipMessage` / RLY-003 `Broadcast`)
+  only after a hole punch fails.
 - **STUN (RFC 5389)** — a UDP Binding responder (default port `3478`, the IANA STUN port) so a NAT'd
   node learns its public reflexive `IP:port` (XOR-MAPPED-ADDRESS) to advertise as a candidate.
 

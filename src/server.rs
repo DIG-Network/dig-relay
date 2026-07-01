@@ -169,16 +169,6 @@ fn dispatch(session: &Session, msg: RelayMessage) -> Action {
         ])
         .tap_network(network_id),
 
-        // RLY-010: announce candidate addresses. Needs a registry WRITE, so the async path
-        // intercepts it before dispatch (like GetPeers). Reaching here (registered) is a no-op.
-        RelayMessage::AnnouncePeer { .. } => Action::Nothing,
-
-        // RLY-011: known-peer list. The async path intercepts this for the registry read; the pure
-        // dispatcher returns a placeholder KnownPeers so the routing logic stays uniform.
-        RelayMessage::GetKnownPeers { .. } => {
-            Action::ReplyToSelf(vec![RelayMessage::KnownPeers { peers: Vec::new() }])
-        }
-
         // RLY-006: keepalive. A ping is answered with a pong; a pong we receive is ignored.
         RelayMessage::Ping { timestamp } => {
             Action::ReplyToSelf(vec![RelayMessage::Pong { timestamp }])
@@ -212,7 +202,6 @@ fn dispatch(session: &Session, msg: RelayMessage) -> Action {
         // Server→client messages a client should never send us: ignore politely.
         RelayMessage::RegisterAck { .. }
         | RelayMessage::Peers { .. }
-        | RelayMessage::KnownPeers { .. }
         | RelayMessage::PeerConnected { .. }
         | RelayMessage::PeerDisconnected { .. }
         | RelayMessage::HolePunchCoordinate { .. }
@@ -324,18 +313,6 @@ async fn handle_connection(
             let filter = network_id.clone().or_else(|| session.network_id.clone());
             let peers = state.registry.lock().await.peers(filter.as_deref());
             let _ = out_tx.send(RelayMessage::Peers { peers });
-            continue;
-        }
-
-        // RLY-010 AnnouncePeer + RLY-011 GetKnownPeers also touch the registry (a write / an
-        // address-carrying read), so they are handled here rather than in the pure dispatcher. Both
-        // require a registered session; an unregistered one gets NOT_REGISTERED (as dispatch would).
-        if let RelayMessage::AnnouncePeer { addrs } = &msg {
-            announce_peer(&state, &session, addrs.clone(), &out_tx).await;
-            continue;
-        }
-        if let RelayMessage::GetKnownPeers { network_id, max } = &msg {
-            get_known_peers(&state, &session, network_id.clone(), *max, &out_tx).await;
             continue;
         }
 
@@ -471,57 +448,6 @@ async fn forward_to(
             });
         }
     }
-}
-
-/// Hard cap on how many peers a single `GetKnownPeers` (RLY-011) may return, regardless of the
-/// client's requested `max`. Bounds the response size (introducer sampling) so one request can't
-/// pull the entire registry; a client wanting more pages by reconnecting/re-requesting.
-pub const MAX_KNOWN_PEERS: usize = 64;
-
-/// Record a peer's announced candidate addresses (RLY-010 `AnnouncePeer`). Requires a registered
-/// session; the announce is scoped to the session's registered id + network (a peer can only
-/// announce for itself). An unregistered session gets a NOT_REGISTERED error.
-async fn announce_peer(
-    state: &Arc<RelayState>,
-    session: &Session,
-    addrs: Vec<std::net::SocketAddr>,
-    out_tx: &mpsc::UnboundedSender<RelayMessage>,
-) {
-    let (Some(peer_id), Some(network_id)) = (&session.peer_id, &session.network_id) else {
-        let _ = out_tx.send(RelayMessage::Error {
-            code: errcode::NOT_REGISTERED,
-            message: "register before announcing (RLY-001)".to_string(),
-        });
-        return;
-    };
-    state
-        .registry
-        .lock()
-        .await
-        .announce(peer_id, network_id, addrs);
-}
-
-/// Reply with a sampled known-peer list carrying dialable candidate addresses (RLY-011 →
-/// RLY-012). Requires a registered session; `network_id` defaults to the session's network and the
-/// requested `max` is clamped to [`MAX_KNOWN_PEERS`]. Never returns the requester itself.
-async fn get_known_peers(
-    state: &Arc<RelayState>,
-    session: &Session,
-    network_id: Option<String>,
-    max: Option<usize>,
-    out_tx: &mpsc::UnboundedSender<RelayMessage>,
-) {
-    let (Some(peer_id), Some(session_net)) = (&session.peer_id, &session.network_id) else {
-        let _ = out_tx.send(RelayMessage::Error {
-            code: errcode::NOT_REGISTERED,
-            message: "register before requesting known peers (RLY-001)".to_string(),
-        });
-        return;
-    };
-    let net = network_id.unwrap_or_else(|| session_net.clone());
-    let cap = max.unwrap_or(MAX_KNOWN_PEERS).min(MAX_KNOWN_PEERS);
-    let peers = state.registry.lock().await.known_peers(peer_id, &net, cap);
-    let _ = out_tx.send(RelayMessage::KnownPeers { peers });
 }
 
 /// Fan one message out to all same-network peers except the sender + `exclude` (RLY-003).
@@ -708,67 +634,6 @@ mod tests {
             }
             other => panic!("expected ForwardTo, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn announce_peer_dispatch_is_nothing_handled_in_async_path() {
-        // Like GetPeers, AnnouncePeer needs a registry WRITE, so the async path intercepts it before
-        // dispatch; the pure dispatcher just treats it as a no-op for a registered session.
-        let act = dispatch(
-            &registered_session(),
-            RelayMessage::AnnouncePeer {
-                addrs: vec!["203.0.113.1:9444".parse().unwrap()],
-            },
-        );
-        assert!(matches!(act, Action::Nothing));
-    }
-
-    #[test]
-    fn get_known_peers_dispatch_returns_a_known_peers_sentinel() {
-        // The async path intercepts GetKnownPeers for the registry read; the pure dispatcher returns
-        // a placeholder KnownPeers so the routing logic stays uniform (mirrors GetPeers).
-        let act = dispatch(
-            &registered_session(),
-            RelayMessage::GetKnownPeers {
-                network_id: Some("net1".into()),
-                max: Some(8),
-            },
-        );
-        match act {
-            Action::ReplyToSelf(msgs) => {
-                assert!(matches!(msgs.as_slice(), [RelayMessage::KnownPeers { .. }]));
-            }
-            other => panic!("expected ReplyToSelf(KnownPeers), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn announce_and_get_known_peers_are_rejected_before_registration() {
-        let s = Session::default();
-        for msg in [
-            RelayMessage::AnnouncePeer {
-                addrs: vec!["203.0.113.1:9444".parse().unwrap()],
-            },
-            RelayMessage::GetKnownPeers {
-                network_id: None,
-                max: None,
-            },
-        ] {
-            match dispatch(&s, msg) {
-                Action::Error { code, .. } => assert_eq!(code, errcode::NOT_REGISTERED),
-                other => panic!("expected NOT_REGISTERED, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn known_peers_message_received_from_a_client_is_ignored() {
-        // KnownPeers is a server→client message; a well-behaved client never sends it to us.
-        let act = dispatch(
-            &registered_session(),
-            RelayMessage::KnownPeers { peers: vec![] },
-        );
-        assert!(matches!(act, Action::Nothing));
     }
 
     #[test]
@@ -1107,113 +972,6 @@ mod tests {
         match drain(&mut arx).as_slice() {
             [RelayMessage::PeerDisconnected { peer_id }] => assert_eq!(peer_id, "b"),
             other => panic!("A should get PeerDisconnected for b, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn announce_peer_stores_addrs_and_get_known_peers_returns_them() {
-        // A registers + announces; B (registered) requests known peers and sees A with its addrs.
-        let state = RelayState::new(RelayServerConfig::default());
-        let (atx, _arx) = mpsc::unbounded_channel();
-        let (btx, mut brx) = mpsc::unbounded_channel();
-        state.registry.lock().await.register(
-            "a".into(),
-            "net".into(),
-            RelayPeerInfo::new("a".into(), "net".into(), 1),
-            atx,
-        );
-        state.registry.lock().await.register(
-            "b".into(),
-            "net".into(),
-            RelayPeerInfo::new("b".into(), "net".into(), 1),
-            btx.clone(),
-        );
-
-        let a_session = Session {
-            peer_id: Some("a".into()),
-            network_id: Some("net".into()),
-        };
-        let addr: std::net::SocketAddr = "203.0.113.9:9444".parse().unwrap();
-        announce_peer(&state, &a_session, vec![addr], &btx).await;
-
-        let b_session = Session {
-            peer_id: Some("b".into()),
-            network_id: Some("net".into()),
-        };
-        get_known_peers(&state, &b_session, None, None, &btx).await;
-
-        match drain(&mut brx).as_slice() {
-            [RelayMessage::KnownPeers { peers }] => {
-                assert_eq!(peers.len(), 1, "b sees a, not itself");
-                assert_eq!(peers[0].peer_id, "a");
-                assert_eq!(
-                    peers[0].addrs,
-                    vec![addr],
-                    "a's announced addrs are returned"
-                );
-            }
-            other => panic!("expected one KnownPeers reply, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn announce_and_get_known_peers_require_registration() {
-        let state = RelayState::new(RelayServerConfig::default());
-        let unregistered = Session::default();
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        announce_peer(&state, &unregistered, vec![], &tx).await;
-        assert!(matches!(
-            drain(&mut rx)[0],
-            RelayMessage::Error {
-                code: errcode::NOT_REGISTERED,
-                ..
-            }
-        ));
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        get_known_peers(&state, &unregistered, None, None, &tx).await;
-        assert!(matches!(
-            drain(&mut rx)[0],
-            RelayMessage::Error {
-                code: errcode::NOT_REGISTERED,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn get_known_peers_clamps_max_to_the_hard_cap() {
-        // Requesting more than MAX_KNOWN_PEERS is clamped; register cap+5 peers and ask for a huge max.
-        let state = RelayState::new(RelayServerConfig::default());
-        for i in 0..(MAX_KNOWN_PEERS + 5) {
-            let (tx, _rx) = mpsc::unbounded_channel();
-            let id = format!("peer{i:03}");
-            state.registry.lock().await.register(
-                id.clone(),
-                "net".into(),
-                RelayPeerInfo::new(id, "net".into(), 1),
-                tx,
-            );
-        }
-        let (rtx, _rrx) = mpsc::unbounded_channel();
-        state.registry.lock().await.register(
-            "req".into(),
-            "net".into(),
-            RelayPeerInfo::new("req".into(), "net".into(), 1),
-            rtx.clone(),
-        );
-        let req_session = Session {
-            peer_id: Some("req".into()),
-            network_id: Some("net".into()),
-        };
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        get_known_peers(&state, &req_session, None, Some(10_000), &tx).await;
-        match drain(&mut rx).as_slice() {
-            [RelayMessage::KnownPeers { peers }] => {
-                assert_eq!(peers.len(), MAX_KNOWN_PEERS, "clamped to the hard cap");
-            }
-            other => panic!("expected KnownPeers, got {other:?}"),
         }
     }
 

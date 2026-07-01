@@ -1,22 +1,22 @@
-//! Integration test: the relay as a low-bandwidth **hole-punch SIGNALING** channel — distinct from
+//! Integration test: the relay as a low-bandwidth **hole-punch SIGNALLING** channel — distinct from
 //! the TURN-like full data-relay path.
 //!
-//! The DIG relay offers two clearly-separated NAT-traversal tiers (DESIGN.md):
+//! The DIG relay's NAT-traversal roles are clearly separated (DESIGN.md / the peer-network protocol):
 //!
-//! 1. **Hole-punch signaling (preferred, low bandwidth).** Two NAT'd peers use the relay ONLY to
-//!    (a) discover each other's dialable candidate addresses (RLY-010 `AnnouncePeer` + RLY-011
-//!    `GetKnownPeers` → RLY-012 `KnownPeers`) and (b) coordinate a simultaneous open (RLY-007
-//!    `HolePunchRequest` → `HolePunchCoordinate`). The relay brokers the introduction + the "punch
-//!    now" rendezvous, then the peers connect DIRECTLY — the relay carries NONE of their subsequent
-//!    application data. Only the small coordination messages pass through it.
+//! 1. **Hole-punch signalling (preferred, low bandwidth).** Two NAT'd peers use the relay ONLY to
+//!    (a) discover each other via the introducer (RLY-005 `get_peers` → `peers`) and (b) coordinate a
+//!    simultaneous open (RLY-007 `hole_punch_request` → `hole_punch_coordinate`), each side carrying
+//!    its STUN-derived reflexive `external_addr`. The relay brokers the candidate exchange + the
+//!    "punch now" rendezvous, then the peers connect **directly** — the relay carries NONE of their
+//!    subsequent application data. Only the small coordination messages pass through it.
 //!
 //! 2. **Full relayed transport (TURN-like, last resort, high bandwidth).** The relay proxies ALL
-//!    data (RLY-002 `RelayGossipMessage` / RLY-003 `Broadcast`). This is the fallback AFTER a hole
-//!    punch fails — covered by `relay_fallback.rs`.
+//!    data (RLY-002 `relay_message` / RLY-003 `broadcast`). This is the fallback AFTER a hole punch
+//!    fails — also covered by `relay_fallback.rs`.
 //!
-//! This test drives the SIGNALING path with two mock peers and asserts: candidate exchange works,
-//! a coordinated punch trigger reaches the target with the requester's external address, and the
-//! relay does NOT proxy any application data on this path (no `RelayGossipMessage` is involved).
+//! This test drives the SIGNALLING path with two mock peers and asserts: discovery via the
+//! introducer works, a coordinated punch trigger reaches the target with the requester's reflexive
+//! address, and the relay does NOT proxy any application data on this path (no `relay_message`).
 
 use std::time::Duration;
 
@@ -112,55 +112,29 @@ async fn connect_and_register(
 }
 
 #[tokio::test]
-async fn relay_brokers_candidate_exchange_and_a_coordinated_punch_without_proxying_data() {
+async fn relay_brokers_discovery_and_a_coordinated_punch_without_proxying_data() {
     let url = start_relay().await;
 
     // Two NAT'd peers connect + register. B first so it is present when A discovers it.
     let mut b = connect_and_register(&url, "peerB").await;
     let mut a = connect_and_register(&url, "peerA").await;
 
-    // B announces its dialable candidate addresses (reflexive from STUN + a local candidate).
-    let b_reflexive: std::net::SocketAddr = "198.51.100.20:9444".parse().unwrap();
-    let b_local: std::net::SocketAddr = "192.168.1.20:9444".parse().unwrap();
-    send_relay_msg(
-        &mut b,
-        &RelayMessage::AnnouncePeer {
-            addrs: vec![b_reflexive, b_local],
-        },
-    )
-    .await;
-
-    // --- SIGNALING step 1: A discovers B's candidates via the introducer (low bandwidth). ---
-    send_relay_msg(
-        &mut a,
-        &RelayMessage::GetKnownPeers {
-            network_id: None,
-            max: Some(16),
-        },
-    )
-    .await;
-    let b_candidates = loop {
+    // --- SIGNALLING step 1: A discovers B via the introducer (RLY-005, low bandwidth). ---
+    send_relay_msg(&mut a, &RelayMessage::GetPeers { network_id: None }).await;
+    let found_b = loop {
         match next_relay_msg(&mut a).await {
-            RelayMessage::KnownPeers { peers } => {
-                let entry = peers
-                    .iter()
-                    .find(|p| p.peer_id == "peerB")
-                    .expect("A discovers B in the known-peer list");
-                assert!(
-                    entry.addrs.contains(&b_reflexive) && entry.addrs.contains(&b_local),
-                    "A learns B's announced candidate addresses to dial directly"
-                );
-                break entry.addrs.clone();
+            RelayMessage::Peers { peers } => {
+                break peers.iter().any(|p| p.peer_id == "peerB");
             }
             RelayMessage::PeerConnected { .. } => continue, // A may see its own connect notice
-            other => panic!("expected KnownPeers, got {other:?}"),
+            other => panic!("expected Peers, got {other:?}"),
         }
     };
-    assert_eq!(b_candidates.len(), 2);
+    assert!(found_b, "A discovers B in the relay's introducer peer list");
 
-    // --- SIGNALING step 2: A asks the relay to broker a coordinated punch to B, carrying A's own
-    // reflexive address. The relay forwards a "punch now" coordinate to B with A's external addr —
-    // it is a rendezvous broker, NOT a data path. ---
+    // --- SIGNALLING step 2: A asks the relay to broker a coordinated punch to B, carrying A's own
+    // STUN-derived reflexive address. The relay forwards a "punch now" coordinate to B with A's
+    // external addr — it is a rendezvous broker, NOT a data path. ---
     let a_reflexive: std::net::SocketAddr = "203.0.113.10:9444".parse().unwrap();
     send_relay_msg(
         &mut a,
@@ -187,14 +161,14 @@ async fn relay_brokers_candidate_exchange_and_a_coordinated_punch_without_proxyi
                 break;
             }
             RelayMessage::PeerConnected { .. } => continue, // B's notice that A connected
-            other => panic!("B got unexpected signaling message: {other:?}"),
+            other => panic!("B got unexpected signalling message: {other:?}"),
         }
     }
 
-    // --- Assert the relay did NOT proxy any application DATA on the signaling path. After the punch
+    // --- Assert the relay did NOT proxy any application DATA on the signalling path. After the punch
     // is coordinated, peers connect directly; the relay carries none of their data. We prove the
-    // signaling path never produced a data-relay frame by confirming neither side has a pending
-    // `RelayGossipMessage` (the TURN-like data path is a DISTINCT message + code path). ---
+    // signalling path never produced a data-relay frame by confirming neither side has a pending
+    // `relay_message` (the TURN-like data path is a DISTINCT message + code path). ---
     let quiet_a = tokio::time::timeout(Duration::from_millis(300), a.next()).await;
     let quiet_b = tokio::time::timeout(Duration::from_millis(300), b.next()).await;
     for (who, r) in [("A", quiet_a), ("B", quiet_b)] {
@@ -202,7 +176,7 @@ async fn relay_brokers_candidate_exchange_and_a_coordinated_punch_without_proxyi
             if let Ok(m) = serde_json::from_str::<RelayMessage>(&t) {
                 assert!(
                     !matches!(m, RelayMessage::RelayGossipMessage { .. }),
-                    "the SIGNALING path must never carry proxied data (peer {who})"
+                    "the SIGNALLING path must never carry proxied data (peer {who})"
                 );
             }
         }

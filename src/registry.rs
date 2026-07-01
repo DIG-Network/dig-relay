@@ -12,11 +12,10 @@
 //! hold the lock briefly (clone out the sender, drop the lock, then send) — see [`Registry`] doc.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 
 use tokio::sync::mpsc;
 
-use crate::wire::{KnownPeerInfo, RelayMessage, RelayPeerInfo};
+use crate::wire::{RelayMessage, RelayPeerInfo};
 
 /// A registered peer's server-side record.
 pub struct Peer {
@@ -24,10 +23,6 @@ pub struct Peer {
     pub network_id: String,
     /// Public peer info, returned in `Peers`/`PeerConnected` (RLY-005).
     pub info: RelayPeerInfo,
-    /// The peer's announced externally-reachable candidate addresses (RLY-010 `AnnouncePeer`),
-    /// handed out in `KnownPeers` (RLY-012) so requesters can dial/hole-punch directly. Empty until
-    /// the peer announces.
-    pub addrs: Vec<SocketAddr>,
     /// Outbound channel to this peer's connection task — the task forwards each `RelayMessage`
     /// it receives here onto the WebSocket.
     pub tx: mpsc::UnboundedSender<RelayMessage>,
@@ -71,7 +66,6 @@ impl Registry {
             Peer {
                 network_id,
                 info,
-                addrs: Vec::new(),
                 tx,
             },
         )
@@ -106,44 +100,6 @@ impl Registry {
             .map(|p| p.info.clone())
             .collect();
         out.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
-        out
-    }
-
-    /// Record a peer's announced candidate addresses (RLY-010 `AnnouncePeer`), scoped to
-    /// `network_id`. Returns `false` (a no-op) if `peer_id` is not registered on `network_id` — a
-    /// peer may only announce for its own id (the caller passes the connection's registered id, so
-    /// this is the network-scoping guard, mirroring `sender_in_network`). Also refreshes `last_seen`.
-    pub fn announce(&mut self, peer_id: &str, network_id: &str, addrs: Vec<SocketAddr>) -> bool {
-        match self.peers.get_mut(peer_id) {
-            Some(p) if p.network_id == network_id => {
-                p.addrs = addrs;
-                p.info.last_seen = crate::wire::unix_secs();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// The sampled known-peer list for `GetKnownPeers` (RLY-011): up to `max` OTHER peers on
-    /// `network_id` (never the requester `from`, never another network), each with its announced
-    /// candidate addresses. Deterministic order (sorted by `peer_id`) so the sample is stable and
-    /// testable; `max` bounds the result (the server caps `max` before calling). A peer that has not
-    /// announced still appears (empty `addrs`) so the requester at least learns the id to hole-punch.
-    pub fn known_peers(&self, from: &str, network_id: &str, max: usize) -> Vec<KnownPeerInfo> {
-        let mut out: Vec<KnownPeerInfo> = self
-            .peers
-            .iter()
-            .filter(|(id, p)| id.as_str() != from && p.network_id == network_id)
-            .map(|(id, p)| KnownPeerInfo {
-                peer_id: id.clone(),
-                network_id: p.network_id.clone(),
-                addrs: p.addrs.clone(),
-                connected_at: p.info.connected_at,
-                last_seen: p.info.last_seen,
-            })
-            .collect();
-        out.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
-        out.truncate(max);
         out
     }
 
@@ -227,91 +183,6 @@ mod tests {
         assert_eq!(ids, vec!["a", "c"], "only net1, sorted");
 
         assert_eq!(r.peers(None).len(), 3, "None returns all networks");
-    }
-
-    #[test]
-    fn announce_sets_addrs_and_is_returned_in_known_peers() {
-        let mut r = Registry::new();
-        r.register("a".into(), "net1".into(), info("a", "net1"), chan());
-        r.register("b".into(), "net1".into(), info("b", "net1"), chan());
-
-        let a1: std::net::SocketAddr = "203.0.113.1:9444".parse().unwrap();
-        let a2: std::net::SocketAddr = "203.0.113.2:9444".parse().unwrap();
-        assert!(
-            r.announce("a", "net1", vec![a1, a2]),
-            "announce for a known peer succeeds"
-        );
-
-        // b asks for known peers → gets a (with its announced addrs), not itself.
-        let known = r.known_peers("b", "net1", 10);
-        assert_eq!(known.len(), 1, "b sees only a (not itself)");
-        assert_eq!(known[0].peer_id, "a");
-        assert_eq!(
-            known[0].addrs,
-            vec![a1, a2],
-            "a's announced candidate addrs are returned"
-        );
-    }
-
-    #[test]
-    fn announce_for_wrong_network_or_unknown_peer_fails() {
-        let mut r = Registry::new();
-        r.register("a".into(), "net1".into(), info("a", "net1"), chan());
-        let a1: std::net::SocketAddr = "203.0.113.1:9444".parse().unwrap();
-        // Wrong network → refused (can't announce for a peer id in another network).
-        assert!(!r.announce("a", "net2", vec![a1]));
-        // Unknown peer → refused.
-        assert!(!r.announce("ghost", "net1", vec![a1]));
-    }
-
-    #[test]
-    fn known_peers_excludes_self_and_other_networks() {
-        let mut r = Registry::new();
-        r.register("a".into(), "net1".into(), info("a", "net1"), chan());
-        r.register("b".into(), "net1".into(), info("b", "net1"), chan());
-        r.register("z".into(), "net2".into(), info("z", "net2"), chan());
-
-        let ids: Vec<_> = r
-            .known_peers("a", "net1", 10)
-            .into_iter()
-            .map(|p| p.peer_id)
-            .collect();
-        assert_eq!(
-            ids,
-            vec!["b".to_string()],
-            "only same-network others; never self, never net2"
-        );
-    }
-
-    #[test]
-    fn known_peers_respects_the_max_bound() {
-        let mut r = Registry::new();
-        r.register("req".into(), "net1".into(), info("req", "net1"), chan());
-        for id in ["a", "b", "c", "d", "e"] {
-            r.register(id.into(), "net1".into(), info(id, "net1"), chan());
-        }
-        // 5 other peers exist, but max=2 caps the sample.
-        assert_eq!(r.known_peers("req", "net1", 2).len(), 2);
-        // max=0 → empty.
-        assert!(r.known_peers("req", "net1", 0).is_empty());
-        // max above the count → all others.
-        assert_eq!(r.known_peers("req", "net1", 100).len(), 5);
-    }
-
-    #[test]
-    fn known_peers_returns_entries_even_without_announced_addrs() {
-        // A peer that registered but hasn't announced still appears (with empty addrs) so a
-        // requester at least learns the peer_id exists to hole-punch toward.
-        let mut r = Registry::new();
-        r.register("a".into(), "net1".into(), info("a", "net1"), chan());
-        r.register("b".into(), "net1".into(), info("b", "net1"), chan());
-        let known = r.known_peers("b", "net1", 10);
-        assert_eq!(known.len(), 1);
-        assert_eq!(known[0].peer_id, "a");
-        assert!(
-            known[0].addrs.is_empty(),
-            "no announced addrs yet → empty list"
-        );
     }
 
     #[test]
