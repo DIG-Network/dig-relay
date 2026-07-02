@@ -21,11 +21,21 @@
 //! peer-network protocol) alongside the WebSocket (9450) and health (9451) listeners, dual-stack
 //! (see [`crate::net`]) so it answers both IPv6 and IPv4 Binding Requests on the one socket.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::net::bind_udp_dual_stack;
 use crate::server::RelayState;
+
+/// Hard cap on the number of distinct source IPs the [`StunRateLimiter`] tracks at once. A STUN
+/// server answers spoofable, unauthenticated datagrams, so the per-IP bucket map is itself an
+/// attacker-controlled data structure: without a bound, a flood of forged source IPs would grow it
+/// without limit (a memory-exhaustion vector). When the map is full and an unseen IP arrives, the
+/// limiter evicts the least-recently-seen bucket. 65_536 buckets is far more than any legitimate
+/// concurrent client population and is tiny in memory (~a few MiB).
+const MAX_TRACKED_IPS: usize = 65_536;
 
 /// The STUN magic cookie (RFC 5389 §6): a fixed 32-bit value in bytes 4..8 of every STUN message.
 /// Its top 16 bits also key the XOR of XOR-MAPPED-ADDRESS.
@@ -248,17 +258,179 @@ pub fn find_xor_mapped_address(message: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// Per-source token bucket: a whole-token count refilled to `capacity` once per one-second window.
+///
+/// A fixed one-second refill window (rather than continuous drip) keeps the arithmetic integer-only
+/// and trivially testable, while still bounding the sustained rate to `capacity` responses/second.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    /// Tokens remaining in the current window.
+    tokens: u32,
+    /// The one-second window this bucket's `tokens` belong to (`now_ms / 1000`).
+    window: u64,
+    /// Last time (ms) this bucket was touched — used for LRU eviction when the map is full.
+    last_seen_ms: u64,
+}
+
+impl Bucket {
+    fn new(capacity: u32, now_ms: u64) -> Self {
+        Bucket {
+            tokens: capacity,
+            window: now_ms / 1000,
+            last_seen_ms: now_ms,
+        }
+    }
+
+    /// Try to spend one token in the window containing `now_ms`, refilling to `capacity` at each new
+    /// one-second window. Returns `true` if a token was available (the caller may respond).
+    fn try_spend(&mut self, capacity: u32, now_ms: u64) -> bool {
+        let window = now_ms / 1000;
+        if window != self.window {
+            self.window = window;
+            self.tokens = capacity;
+        }
+        self.last_seen_ms = now_ms;
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Rate limiter for STUN responses (SECURITY_AUDIT_P2P dig-relay #2): a per-source-IP token bucket
+/// plus a single global token bucket. `allow(src, now)` returns whether the relay may send a Binding
+/// Success Response to `src` right now. Both budgets must permit the response; a `0` capacity for
+/// either dimension disables THAT dimension (the check is skipped).
+///
+/// STUN answers spoofable, unauthenticated UDP, so without this the relay is a listed open reflector
+/// that reflects at the attacker's send rate toward any forged victim IP. The per-IP bucket caps how
+/// fast the relay reflects toward any single (spoofed) address; the global bucket caps total
+/// reflection so a distributed spoof across many forged IPs still cannot make the relay a
+/// high-volume reflector. The per-IP map is LRU-bounded ([`MAX_TRACKED_IPS`]) so the limiter's own
+/// state cannot be grown without bound by spoofed source IPs.
+struct StunRateLimiter {
+    per_ip_capacity: u32,
+    global_capacity: u32,
+    per_ip: HashMap<IpAddr, Bucket>,
+    global: Bucket,
+}
+
+impl StunRateLimiter {
+    fn new(per_ip_capacity: u32, global_capacity: u32, now_ms: u64) -> Self {
+        StunRateLimiter {
+            per_ip_capacity,
+            global_capacity,
+            per_ip: HashMap::new(),
+            // The global bucket starts full for the current window regardless of whether it is used.
+            global: Bucket::new(global_capacity.max(1), now_ms),
+        }
+    }
+
+    /// Whether a STUN response to `src` is allowed at `now_ms`. Checks the per-IP budget first (so a
+    /// single spoofed IP cannot drain the global budget), then the global budget; a token is spent in
+    /// each enabled dimension only when BOTH permit, so a request rejected by the per-IP limit does
+    /// not consume a global token.
+    fn allow(&mut self, src: IpAddr, now_ms: u64) -> bool {
+        // Normalize IPv4-mapped IPv6 to the canonical IPv4 so a client cannot get two budgets by
+        // switching between `a.b.c.d` and `::ffff:a.b.c.d` on the dual-stack socket.
+        let key = src.to_canonical();
+        let per_ip_capacity = self.per_ip_capacity;
+        let global_capacity = self.global_capacity;
+        let now_window = now_ms / 1000;
+
+        // Per-IP check WITHOUT committing yet: peek whether a token is available.
+        if per_ip_capacity > 0 {
+            let bucket = self.bucket_for(key, now_ms);
+            let available = if bucket.window != now_window {
+                per_ip_capacity // a new window will refill
+            } else {
+                bucket.tokens
+            };
+            if available == 0 {
+                // Touch last_seen so an actively-probing (even if throttled) IP isn't evicted first.
+                bucket.last_seen_ms = now_ms;
+                return false;
+            }
+        }
+
+        // Global check (peek): if the global budget is exhausted this window, reject before spending
+        // the per-IP token, so a global-cap rejection doesn't unfairly drain one IP's budget.
+        if global_capacity > 0 {
+            let global_available = if self.global.window != now_window {
+                global_capacity
+            } else {
+                self.global.tokens
+            };
+            if global_available == 0 {
+                return false;
+            }
+        }
+
+        // Both permit: commit a token in each enabled dimension.
+        if per_ip_capacity > 0 {
+            self.bucket_for(key, now_ms)
+                .try_spend(per_ip_capacity, now_ms);
+        }
+        if global_capacity > 0 {
+            self.global.try_spend(global_capacity, now_ms);
+        }
+        true
+    }
+
+    /// Get (or create) the bucket for `key`, evicting the least-recently-seen bucket first when the
+    /// map is at [`MAX_TRACKED_IPS`] and `key` is not already tracked.
+    fn bucket_for(&mut self, key: IpAddr, now_ms: u64) -> &mut Bucket {
+        if !self.per_ip.contains_key(&key) && self.per_ip.len() >= MAX_TRACKED_IPS {
+            if let Some(&victim) = self
+                .per_ip
+                .iter()
+                .min_by_key(|(_, b)| b.last_seen_ms)
+                .map(|(ip, _)| ip)
+            {
+                self.per_ip.remove(&victim);
+            }
+        }
+        self.per_ip
+            .entry(key)
+            .or_insert_with(|| Bucket::new(self.per_ip_capacity.max(1), now_ms))
+    }
+}
+
+/// Current Unix-epoch time in milliseconds (saturating) — the monotone-enough wall clock the STUN
+/// rate limiter's one-second windows run on.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Serve STUN Binding Requests over UDP until the socket errors.
 ///
 /// Binds `state.config.stun_listen`, then loops: receive a datagram, parse it as a Binding Request,
-/// and — on success — reply with a Binding Success Response carrying the sender's reflexive address.
-/// A datagram that is not a valid Binding Request is dropped without a reply (a STUN server must
-/// never answer a non-STUN packet, and a stateless server ignores requests it doesn't handle).
+/// and — on success AND within the response-rate budget — reply with a Binding Success Response
+/// carrying the sender's reflexive address. A datagram that is not a valid Binding Request is dropped
+/// without a reply (a STUN server must never answer a non-STUN packet, and a stateless server ignores
+/// requests it doesn't handle). A valid request that exceeds the per-source-IP or global response
+/// budget ([`StunRateLimiter`]) is also dropped without a reply, so the relay can never be an
+/// unlimited open UDP reflector (SECURITY_AUDIT_P2P dig-relay #2).
 pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
     // IPv6-first, IPv4-fallback: dual-stack bind (see `crate::net`) so the default `[::]` STUN
     // socket answers both native-IPv6 and IPv4 Binding Requests on the one UDP port.
     let socket = bind_udp_dual_stack(state.config.stun_listen)?;
-    tracing::info!(addr = %state.config.stun_listen, "dig-relay STUN listening (RFC 5389/UDP)");
+    tracing::info!(
+        addr = %state.config.stun_listen,
+        per_ip_rps = state.config.stun_per_ip_responses_per_sec,
+        global_rps = state.config.stun_global_responses_per_sec,
+        "dig-relay STUN listening (RFC 5389/UDP, rate-limited)"
+    );
+    let mut limiter = StunRateLimiter::new(
+        state.config.stun_per_ip_responses_per_sec,
+        state.config.stun_global_responses_per_sec,
+        now_ms(),
+    );
     // Max STUN message we accept. Requests are tiny; a full MTU-sized buffer is generous.
     let mut buf = [0u8; 1500];
     loop {
@@ -271,6 +443,12 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
         };
         match parse_binding_request(&buf[..n]) {
             Ok(req) => {
+                // Rate-limit BEFORE building/sending the response so an over-budget (possibly spoofed)
+                // source produces no outbound datagram at all — the relay never reflects past budget.
+                if !limiter.allow(src.ip(), now_ms()) {
+                    tracing::trace!(%src, "STUN response suppressed by rate limit");
+                    continue;
+                }
                 let response = build_binding_response(&req.transaction_id, src);
                 if let Err(e) = socket.send_to(&response, src).await {
                     tracing::debug!(error = %e, %src, "STUN response send failed");
@@ -401,5 +579,141 @@ mod tests {
     fn find_xor_mapped_address_returns_none_when_absent() {
         // A bare header with no attributes has no XOR-MAPPED-ADDRESS.
         assert!(find_xor_mapped_address(&binding_request(TID)).is_none());
+    }
+
+    // ---- STUN rate limiter (SECURITY_AUDIT_P2P dig-relay #2) ----
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// The response never amplifies beyond a small class bound: a Binding Success Response must be a
+    /// bounded multiple of the minimal 20-byte request, never a large amplification (this is what
+    /// keeps a rate-limited reflector from also being an amplifier). IPv4 = 32 bytes, IPv6 = 44.
+    #[test]
+    fn response_size_is_a_small_bounded_multiple_of_the_request() {
+        let req_len = binding_request(TID).len(); // 20 (minimal)
+        let v4 = build_binding_response(&TID, SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 5)));
+        let v6 = build_binding_response(
+            &TID,
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 5)),
+        );
+        assert_eq!(v4.len(), 32, "IPv4 response is header(20)+attr(12)");
+        assert_eq!(v6.len(), 44, "IPv6 response is header(20)+attr(24)");
+        // Amplification factor stays under ~2.5x even against the smallest possible request.
+        assert!((v6.len() as f64) / (req_len as f64) < 2.5);
+    }
+
+    /// A single source IP is capped at its per-second budget; the (N+1)th response in the same second
+    /// is denied — the relay stops reflecting toward that (spoofable) address once the budget is spent.
+    #[test]
+    fn per_ip_budget_caps_a_single_source_within_one_second() {
+        let mut rl = StunRateLimiter::new(3, 1000, 0);
+        let victim = ip("203.0.113.7");
+        // 3 allowed in the window [0,1000).
+        assert!(rl.allow(victim, 10));
+        assert!(rl.allow(victim, 20));
+        assert!(rl.allow(victim, 30));
+        // 4th within the same second is denied.
+        assert!(!rl.allow(victim, 40), "over per-IP budget must be denied");
+    }
+
+    /// The per-IP budget refills each new one-second window.
+    #[test]
+    fn per_ip_budget_refills_next_second() {
+        let mut rl = StunRateLimiter::new(2, 1000, 0);
+        let a = ip("198.51.100.9");
+        assert!(rl.allow(a, 0));
+        assert!(rl.allow(a, 100));
+        assert!(!rl.allow(a, 200), "budget spent this second");
+        // Next second → refilled.
+        assert!(rl.allow(a, 1000));
+        assert!(rl.allow(a, 1100));
+    }
+
+    /// Distinct source IPs have independent per-IP budgets (one throttled IP does not starve others),
+    /// but the GLOBAL cap still bounds the total across all of them.
+    #[test]
+    fn global_cap_bounds_total_across_sources() {
+        // Generous per-IP (so per-IP never trips) but a global cap of 2/sec.
+        let mut rl = StunRateLimiter::new(100, 2, 0);
+        assert!(rl.allow(ip("203.0.113.1"), 0));
+        assert!(rl.allow(ip("203.0.113.2"), 0));
+        // Third distinct source in the same second is denied by the GLOBAL cap.
+        assert!(
+            !rl.allow(ip("203.0.113.3"), 0),
+            "global cap must bound the aggregate"
+        );
+        // Global refills next second.
+        assert!(rl.allow(ip("203.0.113.3"), 1000));
+    }
+
+    /// A per-IP rejection must NOT consume a global token (so one flooding IP can't drain the global
+    /// budget and deny service to everyone else).
+    #[test]
+    fn a_per_ip_rejection_does_not_consume_global_budget() {
+        let mut rl = StunRateLimiter::new(1, 5, 0);
+        let flooder = ip("203.0.113.9");
+        assert!(rl.allow(flooder, 0)); // spends flooder's only per-IP token (+1 global)
+        assert!(!rl.allow(flooder, 1)); // per-IP denied — must not touch global
+        assert!(!rl.allow(flooder, 2)); // still denied
+                                        // Four other distinct IPs should still each get a response (global had 5, only 1 spent).
+        for i in 1..=4u8 {
+            assert!(
+                rl.allow(ip(&format!("198.51.100.{i}")), 3),
+                "other IPs keep their global share"
+            );
+        }
+    }
+
+    /// IPv4-mapped IPv6 and plain IPv4 for the same address share ONE budget (a client can't double
+    /// its allowance by switching families on the dual-stack socket).
+    #[test]
+    fn ipv4_mapped_and_plain_ipv4_share_one_budget() {
+        let mut rl = StunRateLimiter::new(1, 1000, 0);
+        let plain = ip("203.0.113.5");
+        let mapped = ip("::ffff:203.0.113.5");
+        assert!(rl.allow(plain, 0));
+        assert!(
+            !rl.allow(mapped, 1),
+            "the IPv4-mapped form must not get a second budget"
+        );
+    }
+
+    /// A `0` capacity disables that dimension (limit off).
+    #[test]
+    fn zero_capacity_disables_a_dimension() {
+        // per-IP disabled, global 1/sec.
+        let mut rl = StunRateLimiter::new(0, 1, 0);
+        let a = ip("203.0.113.1");
+        assert!(rl.allow(a, 0));
+        assert!(!rl.allow(ip("203.0.113.2"), 0), "global still enforced");
+        // Both disabled → always allowed.
+        let mut open = StunRateLimiter::new(0, 0, 0);
+        for i in 0..100 {
+            assert!(open.allow(a, i));
+        }
+    }
+
+    /// The per-IP bucket map is LRU-bounded so a flood of forged source IPs cannot grow the limiter's
+    /// own state without limit (the limiter must not itself be a memory-exhaustion vector).
+    #[test]
+    fn per_ip_map_is_bounded_under_a_flood_of_distinct_ips() {
+        let mut rl = StunRateLimiter::new(1, u32::MAX, 0);
+        // Feed many more distinct IPs than the cap; the map must never exceed MAX_TRACKED_IPS.
+        for i in 0..(MAX_TRACKED_IPS as u64 + 5000) {
+            let a = i & 0xFF;
+            let b = (i >> 8) & 0xFF;
+            let c = (i >> 16) & 0xFF;
+            let d = (i >> 24) & 0xFF;
+            let addr = IpAddr::from(Ipv6Addr::new(
+                0x2001, 0xdb8, a as u16, b as u16, c as u16, d as u16, 0, 1,
+            ));
+            rl.allow(addr, i);
+            assert!(
+                rl.per_ip.len() <= MAX_TRACKED_IPS,
+                "per-IP map must stay bounded"
+            );
+        }
     }
 }

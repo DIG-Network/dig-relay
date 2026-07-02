@@ -45,6 +45,17 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 /// registry stays accurate. Generous relative to the gossip client's 30 s ping interval.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 
+/// Default per-source-IP STUN response budget (responses per second per IP). A legitimate NAT'd node
+/// sends a Binding Request only occasionally (before advertising a candidate / on a refresh), so a
+/// handful per second per IP is generous; it caps how fast the relay will reflect toward any single
+/// (spoofable) source address, so it can never be an unlimited open reflector for one victim.
+pub const DEFAULT_STUN_PER_IP_RESPONSES_PER_SEC: u32 = 5;
+
+/// Default GLOBAL STUN response budget (responses per second across all sources). A backstop cap on
+/// the relay's total outbound STUN reflection so a distributed spoof (many forged source IPs) still
+/// cannot turn the relay into a high-volume reflector; well above any legitimate aggregate need.
+pub const DEFAULT_STUN_GLOBAL_RESPONSES_PER_SEC: u32 = 1000;
+
 /// Validated relay server configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayServerConfig {
@@ -59,6 +70,10 @@ pub struct RelayServerConfig {
     pub max_connections: usize,
     /// Idle timeout after which a silent connection is reaped.
     pub idle_timeout: Duration,
+    /// Per-source-IP STUN response budget (responses/sec/IP). `0` disables the per-IP limit.
+    pub stun_per_ip_responses_per_sec: u32,
+    /// Global STUN response budget (responses/sec across all sources). `0` disables the global cap.
+    pub stun_global_responses_per_sec: u32,
 }
 
 impl Default for RelayServerConfig {
@@ -74,6 +89,8 @@ impl Default for RelayServerConfig {
             stun_listen: SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, DEFAULT_STUN_PORT)),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+            stun_per_ip_responses_per_sec: DEFAULT_STUN_PER_IP_RESPONSES_PER_SEC,
+            stun_global_responses_per_sec: DEFAULT_STUN_GLOBAL_RESPONSES_PER_SEC,
         }
     }
 }
@@ -155,6 +172,22 @@ mod tests {
     #[test]
     fn default_is_valid() {
         assert!(RelayServerConfig::default().validate().is_ok());
+    }
+
+    /// The STUN reflector protection (SECURITY_AUDIT_P2P dig-relay #2) is ON by default: both the
+    /// per-IP and the global response budgets are non-zero out of the box, so a freshly-defaulted
+    /// relay is never an unlimited open STUN reflector.
+    #[test]
+    fn stun_rate_limits_are_enabled_by_default() {
+        let c = RelayServerConfig::default();
+        assert!(
+            c.stun_per_ip_responses_per_sec > 0,
+            "per-IP STUN limit must default ON"
+        );
+        assert!(
+            c.stun_global_responses_per_sec > 0,
+            "global STUN limit must default ON"
+        );
     }
 
     #[test]

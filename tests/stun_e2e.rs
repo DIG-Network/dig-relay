@@ -79,6 +79,65 @@ async fn stun_binding_request_returns_the_clients_reflexive_address() {
 }
 
 #[tokio::test]
+async fn stun_rate_limit_suppresses_responses_beyond_the_per_ip_budget() {
+    // SECURITY_AUDIT_P2P dig-relay #2: with a tiny per-IP budget, a burst of Binding Requests from
+    // one source gets at most `budget` responses in a one-second window — the relay is not an
+    // unlimited reflector. We send 10 requests rapidly and assert we receive no more than the budget
+    // (2) responses within the window.
+    let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    drop(relay);
+    let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let health_addr = health.local_addr().unwrap();
+    drop(health);
+    let stun_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stun_addr = stun_sock.local_addr().unwrap();
+    drop(stun_sock);
+
+    let budget = 2u32;
+    let config = RelayServerConfig {
+        listen: relay_addr,
+        health_listen: health_addr,
+        stun_listen: stun_addr,
+        stun_per_ip_responses_per_sec: budget,
+        ..Default::default()
+    };
+    tokio::spawn(async move {
+        let _ = dig_relay::serve(config).await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // Fire a rapid burst from the single client source.
+    for i in 0..10u8 {
+        let tid: TransactionId = [i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        client
+            .send_to(&binding_request(&tid), stun_addr)
+            .await
+            .expect("send");
+    }
+
+    // Count how many responses come back within the budget's window. Reads stop on the first ~300ms
+    // gap (all in-window responses have arrived).
+    let mut responses = 0u32;
+    let mut buf = [0u8; 256];
+    while let Ok(Ok(_)) =
+        tokio::time::timeout(Duration::from_millis(300), client.recv(&mut buf)).await
+    {
+        responses += 1;
+    }
+
+    assert!(
+        responses >= 1,
+        "at least one request within budget is answered"
+    );
+    assert!(
+        responses <= budget,
+        "the relay must answer at most {budget} responses/sec/IP, got {responses}"
+    );
+}
+
+#[tokio::test]
 async fn stun_ignores_a_non_stun_datagram() {
     let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_addr = relay.local_addr().unwrap();

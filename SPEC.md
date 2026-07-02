@@ -164,6 +164,27 @@ a thin I/O adapter.
 - No authentication, `FINGERPRINT`, `SOFTWARE`, or non-XOR `MAPPED-ADDRESS` — out of scope; every
   modern STUN client reads `XOR-MAPPED-ADDRESS`.
 
+### 5.1 Reflection rate limiting (normative)
+
+Because STUN answers spoofable, unauthenticated UDP, the responder MUST bound its outbound response
+rate so it can never act as an unlimited open reflector:
+
+- **Per-source-IP budget.** At most `stun_per_ip_responses_per_sec` Binding Success Responses are
+  sent to any single source IP per one-second window (default 5). A request over this budget is
+  dropped WITHOUT a reply. IPv4-mapped IPv6 (`::ffff:a.b.c.d`) and plain IPv4 for the same address
+  share ONE budget.
+- **Global budget.** At most `stun_global_responses_per_sec` responses are sent in total across all
+  sources per one-second window (default 1000), a backstop against a distributed spoof across many
+  forged source IPs. A per-IP rejection does NOT consume a global token.
+- **Bounded limiter state.** The per-IP accounting map is itself capacity-bounded with
+  least-recently-seen eviction, so a flood of forged source IPs cannot grow the relay's memory
+  without limit.
+- Either budget set to `0` disables that dimension. Both default to non-zero, so a
+  default-configured relay is never an unlimited reflector.
+
+The response is also non-amplifying: a Binding Success Response (32 bytes IPv4 / 44 bytes IPv6) is a
+small bounded multiple of the 20-byte minimal request, so the reflector is never an amplifier.
+
 ## 6. Health
 
 `GET /health` on `health_listen` (§2) returns `200` with:
@@ -187,12 +208,15 @@ collide with the relay WebSocket.
 | `stun_listen` | `[::]:3478` | any `SocketAddr` |
 | `max_connections` | 4096 | MUST be ≥ 1 |
 | `idle_timeout` | 120 s | MUST be > 0 |
+| `stun_per_ip_responses_per_sec` | 5 | `0` disables the per-IP STUN limit (§5.1) |
+| `stun_global_responses_per_sec` | 1000 | `0` disables the global STUN limit (§5.1) |
 
 `validate()` rejects `max_connections == 0` and a zero `idle_timeout` with a stable error string.
 Config may be built from CLI flags (`main.rs`, `clap`) or environment variables consumed by the
 service installer (`DIG_RELAY_LISTEN`, `DIG_RELAY_HEALTH_LISTEN`, `DIG_RELAY_STUN_LISTEN`,
-`DIG_RELAY_MAX_CONNECTIONS` — see `src/service.rs::config_from_env`), so an installed OS service
-serves identically to a manually-run `dig-relay serve` with the same flags.
+`DIG_RELAY_MAX_CONNECTIONS`, `DIG_RELAY_STUN_PER_IP_RPS`, `DIG_RELAY_STUN_GLOBAL_RPS` — see
+`src/service.rs::config_from_env`), so an installed OS service serves identically to a manually-run
+`dig-relay serve` with the same flags.
 
 ## 8. Transport security
 
