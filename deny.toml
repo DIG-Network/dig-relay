@@ -1,0 +1,72 @@
+# cargo-deny configuration — dependency hygiene gate for dig-relay.
+#
+# Enforced in CI (`.github/workflows/ci.yml` → `deny` job) so every push/PR is checked for
+# security advisories, disallowed licenses, banned/duplicate crates, and untrusted sources.
+# Run locally with: `cargo deny check`.
+
+[graph]
+# Check every target the crate builds for (Windows SCM, systemd, launchd all pull distinct deps).
+all-features = true
+
+[advisories]
+# RustSec advisory database. Fail on any unhandled vulnerability.
+version = 2
+ignore = [
+    # ---------------------------------------------------------------------------------------------
+    # quick-xml <0.41 memory-exhaustion / quadratic-parse advisories, pulled in TRANSITIVELY and
+    # only through:   service-manager 0.7 -> plist 1.9 -> quick-xml 0.39
+    #
+    # NOT REACHABLE / NOT EXPLOITABLE in dig-relay:
+    #   * `plist` is used by `service-manager` ONLY to WRITE a launchd plist file during the local,
+    #     operator-run `dig-relay install` on macOS. The relay never PARSES untrusted XML — the
+    #     advisories are about parsing attacker-controlled XML into an `NsReader`, a code path
+    #     dig-relay never executes.
+    #   * The relay's network wire is JSON over WebSocket (`src/wire.rs`) + binary STUN
+    #     (`src/stun.rs`); no XML crosses any network boundary.
+    #
+    # NO SAFE FIX AVAILABLE:
+    #   * The fixed quick-xml (>=0.41) is not reachable while `plist` (latest 1.9.0) still requires
+    #     `quick-xml ^0.39`; there is no `plist` release on the fixed line to update to.
+    #   * `service-manager` >=0.11 drops `plist`/`quick-xml` entirely (switches to `xml-rs`), but
+    #     0.7 -> 0.11 is a BREAKING major with `ServiceInstallCtx` API changes, and the crate is
+    #     pinned to 0.7 ecosystem-wide (dig-node, dig-installer share the identical service pattern
+    #     per SYSTEM.md). Bumping it is a coordinated cross-repo change, tracked separately — not a
+    #     safe single-repo update.
+    #
+    # Re-evaluate when `plist` ships a quick-xml >=0.41 release, or when the ecosystem-wide
+    # service-manager major bump lands.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml <0.41 via service-manager->plist launchd-write only; never parses untrusted XML; no safe fix (see note above)" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml <0.41 via service-manager->plist launchd-write only; never parses untrusted XML; no safe fix (see note above)" },
+]
+
+[licenses]
+version = 2
+# dig-relay is GPL-2.0-only; every dependency license below is a permissive/GPL-compatible license
+# actually present in the resolved graph (`cargo deny check licenses` enumerates them).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "GPL-2.0-only",
+]
+confidence-threshold = 0.8
+
+[bans]
+# A duplicate (multiple-version) crate is a warning, not a hard failure — transitive graphs
+# routinely carry two majors of a low-level crate and forcing a single version is often impossible.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[sources.allow-org]
+# dig-relay's only git dependency is dig-pex, from the DIG-Network org (see Cargo.toml rationale).
+github = ["DIG-Network"]
