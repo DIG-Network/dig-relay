@@ -28,6 +28,22 @@ pub struct Peer {
     pub tx: mpsc::UnboundedSender<RelayMessage>,
 }
 
+/// The outcome of a [`Registry::register`] call — a first registration, a reconnect that reclaimed
+/// a dead prior connection, or a refusal because a LIVE peer already holds the id (anti-hijack).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    /// The `peer_id` was unused — a fresh registration. The caller increments the connected count.
+    Registered,
+    /// The `peer_id` was held by a prior connection whose channel is already CLOSED (a genuine
+    /// reconnect after the old socket dropped); the stale record was replaced. The connected count
+    /// is unchanged (one dead slot swapped for one live one).
+    Reconnected,
+    /// The `peer_id` is held by a LIVE peer (its channel is still open). The registration is REFUSED
+    /// so an unauthenticated client cannot evict + impersonate an existing peer. The incumbent keeps
+    /// its slot.
+    Occupied,
+}
+
 /// The relay's peer registry, keyed by `peer_id`.
 #[derive(Default)]
 pub struct Registry {
@@ -52,15 +68,46 @@ impl Registry {
         self.peers.is_empty()
     }
 
-    /// Register (or replace) a peer. Returns the prior record if this `peer_id` was already
-    /// registered (a reconnect / duplicate id) so the caller can close the stale connection.
+    /// Register a peer, refusing to evict a LIVE incumbent holding the same `peer_id`.
+    ///
+    /// # Security — peer-ID hijack protection (SECURITY_AUDIT_P2P dig-relay #1)
+    ///
+    /// The relay does not (yet) prove that a registrant owns the identity key its `peer_id` commits
+    /// to (the node-class mTLS transport / signed-`Register` proof-of-possession is a coordinated
+    /// cross-repo follow-up — see `SPEC.md` §3.2). Until identity is bound, a plain replace-on-collide
+    /// would let ANY unauthenticated client register a `peer_id` already held by a live peer, evict
+    /// the incumbent, and thereafter receive every message routed to that id — a full
+    /// rendezvous-hijack and availability primitive. This method therefore treats a `peer_id` whose
+    /// incumbent channel is still OPEN as occupied and REFUSES the registration
+    /// ([`RegisterOutcome::Occupied`]); the live peer keeps its slot and its rendezvous.
+    ///
+    /// A genuine reconnect is still honoured: when the incumbent's outbound channel is already CLOSED
+    /// (its connection task has torn down — `tx.is_closed()`), the stale record is reclaimed and
+    /// replaced ([`RegisterOutcome::Reconnected`]). A first registration for an unused id is
+    /// [`RegisterOutcome::Registered`].
     pub fn register(
         &mut self,
         peer_id: String,
         network_id: String,
         info: RelayPeerInfo,
         tx: mpsc::UnboundedSender<RelayMessage>,
-    ) -> Option<Peer> {
+    ) -> RegisterOutcome {
+        if let Some(existing) = self.peers.get(&peer_id) {
+            // A live incumbent holds this id: refuse (anti-hijack). Only a demonstrably-dead prior
+            // connection (closed channel) may be reclaimed.
+            if !existing.tx.is_closed() {
+                return RegisterOutcome::Occupied;
+            }
+            self.peers.insert(
+                peer_id,
+                Peer {
+                    network_id,
+                    info,
+                    tx,
+                },
+            );
+            return RegisterOutcome::Reconnected;
+        }
         self.peers.insert(
             peer_id,
             Peer {
@@ -68,7 +115,8 @@ impl Registry {
                 info,
                 tx,
             },
-        )
+        );
+        RegisterOutcome::Registered
     }
 
     /// Remove a peer by id, returning its record if present.
@@ -161,13 +209,63 @@ mod tests {
     }
 
     #[test]
-    fn register_same_id_returns_prior_record() {
+    fn first_registration_reports_registered() {
         let mut r = Registry::new();
-        assert!(r
-            .register("a".into(), "net1".into(), info("a", "net1"), chan())
-            .is_none());
-        let prior = r.register("a".into(), "net1".into(), info("a", "net1"), chan());
-        assert!(prior.is_some(), "reconnect must surface the stale record");
+        assert_eq!(
+            r.register("a".into(), "net1".into(), info("a", "net1"), chan()),
+            RegisterOutcome::Registered
+        );
+        assert_eq!(r.len(), 1);
+    }
+
+    /// Anti-hijack (SECURITY_AUDIT_P2P dig-relay #1): a second registration for a `peer_id` whose
+    /// incumbent connection is still LIVE must be REFUSED — never replace + drop the live peer — so an
+    /// unauthenticated client cannot evict and impersonate an existing node's rendezvous.
+    #[test]
+    fn duplicate_id_with_a_live_incumbent_is_refused() {
+        let mut r = Registry::new();
+        // First registration keeps a live sender (rx held → channel stays open).
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        assert_eq!(
+            r.register("a".into(), "net1".into(), info("a", "net1"), tx1),
+            RegisterOutcome::Registered
+        );
+
+        // A hijack attempt under the same id while the incumbent is live: refused.
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        assert_eq!(
+            r.register("a".into(), "net1".into(), info("a", "net1"), tx2),
+            RegisterOutcome::Occupied,
+            "a live incumbent must NOT be evicted by a duplicate-id register"
+        );
+        assert_eq!(r.len(), 1, "still exactly one peer for that id");
+
+        // The incumbent's sender is still the one in the registry (not replaced): it can still route.
+        assert!(
+            r.sender_in_network("a", "net1").is_some(),
+            "the original live peer keeps its slot"
+        );
+    }
+
+    /// A genuine reconnect: when the incumbent's channel is CLOSED (its connection task tore down),
+    /// the same id may be reclaimed. The dead record is replaced and the count is unchanged.
+    #[test]
+    fn duplicate_id_with_a_dead_incumbent_reconnects() {
+        let mut r = Registry::new();
+        let (tx1, rx1) = mpsc::unbounded_channel();
+        assert_eq!(
+            r.register("a".into(), "net1".into(), info("a", "net1"), tx1),
+            RegisterOutcome::Registered
+        );
+        // Drop the receiver → the incumbent's sender is now closed (its connection is gone).
+        drop(rx1);
+
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        assert_eq!(
+            r.register("a".into(), "net1".into(), info("a", "net1"), tx2),
+            RegisterOutcome::Reconnected,
+            "a dead prior connection may be reclaimed by a reconnect"
+        );
         assert_eq!(r.len(), 1, "still exactly one peer for that id");
     }
 

@@ -2,7 +2,7 @@
 //! pure-dispatch unit tests can't reach: registration ack + capacity refusal, broadcast fan-out,
 //! `GetPeers` registry read, hole-punch coordinate delivery, `PeerConnected`/`PeerDisconnected`
 //! notifications, keepalive ping→pong over the wire, the bad-JSON error reply, graceful
-//! `Unregister`, and the duplicate-id (reconnect) replacement. These exercise `server.rs`'s
+//! `Unregister`, and the duplicate-id anti-hijack refusal. These exercise `server.rs`'s
 //! `handle_connection`/`register_peer`/`forward_to`/`broadcast`/`deregister` + the `/health` route.
 
 use std::time::Duration;
@@ -396,6 +396,73 @@ async fn health_endpoint_reports_connected_peers() {
         body.contains("\"connected_peers\":1"),
         "one peer connected: {body}"
     );
+}
+
+#[tokio::test]
+async fn a_second_live_connection_cannot_hijack_an_existing_peer_id() {
+    // SECURITY_AUDIT_P2P dig-relay #1: an unauthenticated client that registers a peer_id already
+    // held by a LIVE peer must be REFUSED (a failing ack + ID_IN_USE error), and the incumbent must
+    // keep its slot + its rendezvous — no evict-and-impersonate.
+    let (url, _health) = start_relay(4096).await;
+
+    // The legitimate peer A registers and holds its connection open.
+    let mut a = connect(&url).await;
+    register_ok(&mut a, "victim", "net").await;
+
+    // An attacker connects and tries to register the SAME id.
+    let mut attacker = connect(&url).await;
+    send(
+        &mut attacker,
+        &RelayMessage::Register {
+            peer_id: "victim".into(),
+            network_id: "net".into(),
+            protocol_version: 1,
+        },
+    )
+    .await;
+    match next_msg(&mut attacker).await {
+        RelayMessage::RegisterAck { success, .. } => {
+            assert!(
+                !success,
+                "hijack register must be refused while the victim is live"
+            )
+        }
+        other => panic!("expected a failing RegisterAck, got {other:?}"),
+    }
+    match next_msg(&mut attacker).await {
+        RelayMessage::Error { code, .. } => {
+            assert_eq!(code, dig_relay::server::errcode::ID_IN_USE)
+        }
+        other => panic!("expected ID_IN_USE error, got {other:?}"),
+    }
+
+    // The victim is unaffected: a third peer forwarding to "victim" reaches A, not the attacker, and
+    // A still answers a ping (its connection was never dropped).
+    let mut c = connect(&url).await;
+    register_ok(&mut c, "carol", "net").await;
+    send(
+        &mut c,
+        &RelayMessage::RelayGossipMessage {
+            from: "carol".into(),
+            to: "victim".into(),
+            payload: b"for-the-real-victim".to_vec(),
+            seq: 1,
+        },
+    )
+    .await;
+
+    // A receives the forwarded payload (skipping the PeerConnected notices for carol).
+    loop {
+        match next_msg(&mut a).await {
+            RelayMessage::RelayGossipMessage { from, payload, .. } => {
+                assert_eq!(from, "carol");
+                assert_eq!(payload, b"for-the-real-victim".to_vec());
+                break;
+            }
+            RelayMessage::PeerConnected { .. } => continue,
+            other => panic!("unexpected frame at victim: {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]

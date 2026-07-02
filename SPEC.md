@@ -78,18 +78,45 @@ byte-identically into `src/wire.rs` (pinned by `tests/wire_conformance.rs`). Mes
 
 | Requirement | Messages | Behavior |
 |---|---|---|
-| RLY-001 Registration | `Register` → `RegisterAck` | Registers `peer_id` + `network_id` + `protocol_version` in the in-memory registry; rejects a `network_id` mismatch; `RegisterAck{success, message, connected_peers}`. Holding this connection open is the node's reachability reservation. |
+| RLY-001 Registration | `Register` → `RegisterAck` | Registers `peer_id` + `network_id` + `protocol_version` in the in-memory registry; rejects a `network_id` mismatch; rejects a `peer_id` already held by a LIVE connection (§3.2); `RegisterAck{success, message, connected_peers}`. Holding this connection open is the node's reachability reservation. |
 | RLY-002 Targeted forward | `RelayGossipMessage{from,to,payload,seq}` | Forwards `payload` to the single registered peer `to` in the sender's network. |
 | RLY-003 Broadcast | `Broadcast{from,payload,exclude}` | Fans `payload` out to every registered peer in the sender's network except `from` and any peer in `exclude`. |
 | RLY-005 Introducer | `GetPeers{network_id}` → `Peers{peers}` | Returns the relay's registered-peer list for a network; while registered, a node additionally receives `PeerConnected`/`PeerDisconnected` pushes for same-network peers. |
 | RLY-006 Keepalive | `Ping`/`Pong` | Bidirectional liveness; an idle connection past `idle_timeout` is reaped. |
 | RLY-007 Hole-punch coordination | `HolePunchRequest{peer_id,target_peer_id,external_addr}` → `HolePunchCoordinate{peer_id,external_addr}` (to target) → `HolePunchResult` | Exchanges each side's STUN-derived reflexive address so both peers can attempt a simultaneous-open hole punch; the relay carries no application data for this path. |
 | RLY-008 Peer Exchange (PEX) | `pex_handshake` / `pex_snapshot` / `pex_delta` / `pex_error` | Purely additive introducer PUSH binding (§4). |
-| Errors | `Error{code,message}` | Stable envelope: `1=NOT_REGISTERED`, `2=BAD_MESSAGE`, `3=PEER_NOT_FOUND`, `4=CAPACITY`. |
+| Errors | `Error{code,message}` | Stable envelope: `1=NOT_REGISTERED`, `2=BAD_MESSAGE`, `3=PEER_NOT_FOUND`, `4=CAPACITY`, `5=ID_IN_USE`. |
 
 A message before RLY-001 registration (other than `Register` itself) is answered with
 `Error{code:1}`. Full message shapes are frozen by `tests/wire_conformance.rs`; a shape change here
 requires a matching change in `dig-gossip` in the same unit of work (see `SYSTEM.md`).
+
+### 3.2 Registration identity — peer-ID occupancy (normative)
+
+A `peer_id` is the hex `SHA-256(TLS SPKI DER)` of the node's identity key (matching `dig-gossip`).
+The relay MUST NOT let a `Register` for a `peer_id` that is **already held by a live connection**
+evict that connection: a duplicate-id `Register` while the incumbent's connection is still open is
+REFUSED with `RegisterAck{success:false}` + `Error{code:5, ID_IN_USE}`, and the incumbent keeps its
+slot and its rendezvous. Only a **stale** registration — one whose connection has already torn down
+(its outbound channel is closed) — may be reclaimed by a reconnecting node under the same `peer_id`;
+that reclaim replaces the dead record without changing `connected_peers`.
+
+This closes an unauthenticated peer-ID hijack: without it, any client could register a `peer_id`
+belonging to a live peer, evict it, and thereafter receive every message routed to that id. It does
+NOT by itself prove the registrant owns the identity key `peer_id` commits to — that
+proof-of-possession is the node-class transport requirement below and is enforced end-to-end once the
+signed-`Register` / mTLS binding lands ecosystem-wide.
+
+**Proof-of-possession (planned, coordinated).** The DIG ecosystem mandates that a node-class client
+prove possession of its identity key when registering (`peer_id == SHA-256(client-cert SPKI DER)`
+under mTLS, or a signed `Register` over a relay nonce). In the canonical `relay.dig.net` deployment
+TLS is terminated at the load balancer (§8), so the relay container cannot see a client certificate;
+binding `peer_id` to a proof therefore requires either an mTLS-terminating gateway or a signed-
+`Register` wire extension mirrored byte-for-byte in `dig-gossip`'s `relay_types.rs`. Until that
+coordinated cross-repo change ships, the live-incumbent refusal above is the enforced protection and
+payloads remain end-to-end authenticated by the gossip layer (§8). Adding the proof-of-possession
+field is a purely-additive `Register` extension (a new optional field + a new `Error` code); it MUST
+be introduced in the same unit of work across `dig-relay` and `dig-gossip`.
 
 ### 3.1 Two NAT-traversal tiers
 
