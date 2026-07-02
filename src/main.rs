@@ -51,6 +51,12 @@ struct Cli {
     /// Seconds of silence before an idle connection is reaped (default 120).
     #[arg(long, value_name = "SECS", global = true)]
     idle_timeout_secs: Option<u64>,
+    /// STUN Binding responses per second per source IP (default 5; 0 disables the per-IP limit).
+    #[arg(long, value_name = "N", global = true)]
+    stun_per_ip_rps: Option<u32>,
+    /// STUN Binding responses per second across all sources (default 1000; 0 disables the cap).
+    #[arg(long, value_name = "N", global = true)]
+    stun_global_rps: Option<u32>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -96,6 +102,12 @@ fn apply_overrides(mut config: RelayServerConfig, cli: &Cli) -> RelayServerConfi
     }
     if let Some(s) = cli.idle_timeout_secs {
         config.idle_timeout = Duration::from_secs(s);
+    }
+    if let Some(n) = cli.stun_per_ip_rps {
+        config.stun_per_ip_responses_per_sec = n;
+    }
+    if let Some(n) = cli.stun_global_rps {
+        config.stun_global_responses_per_sec = n;
     }
     config
 }
@@ -291,6 +303,7 @@ mod tests {
             stun_listen: "10.0.0.1:3333".parse().unwrap(),
             max_connections: 7,
             idle_timeout: Duration::from_secs(33),
+            ..Default::default()
         };
         let cli = parse(&["serve"]);
         let out = apply_overrides(base.clone(), &cli);
@@ -312,6 +325,10 @@ mod tests {
             "10",
             "--idle-timeout-secs",
             "5",
+            "--stun-per-ip-rps",
+            "7",
+            "--stun-global-rps",
+            "500",
         ]);
         let out = apply_overrides(base, &cli);
         assert_eq!(out.listen, "127.0.0.1:8000".parse().unwrap());
@@ -319,6 +336,8 @@ mod tests {
         assert_eq!(out.stun_listen, "127.0.0.1:8002".parse().unwrap());
         assert_eq!(out.max_connections, 10);
         assert_eq!(out.idle_timeout, Duration::from_secs(5));
+        assert_eq!(out.stun_per_ip_responses_per_sec, 7);
+        assert_eq!(out.stun_global_responses_per_sec, 500);
     }
 
     #[test]
@@ -330,6 +349,7 @@ mod tests {
             stun_listen: "10.0.0.1:3333".parse().unwrap(),
             max_connections: 7,
             idle_timeout: Duration::from_secs(33),
+            ..Default::default()
         };
         let cli = parse(&["serve", "--max-connections", "99"]);
         let out = apply_overrides(base.clone(), &cli);
