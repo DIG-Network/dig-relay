@@ -54,3 +54,15 @@ jobs:
           cargo llvm-cov --all
           --ignore-filename-regex 'win_service\.rs'
           --fail-under-lines 80
+
+  # Dependency hygiene: RustSec advisories + license allowlist + banned/duplicate crates + trusted
+  # sources, all enforced by `deny.toml`. Handled advisories (e.g. the launchd-only quick-xml chain,
+  # not reachable by dig-relay) are documented + ignored there with a rationale; anything new fails.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
