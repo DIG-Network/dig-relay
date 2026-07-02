@@ -45,6 +45,11 @@ service-manager = "0.7"
 # dependency surface (serde + serde_json + tokio + rand), so unlike dig-gossip it drops in cleanly.
 # Git-pinned in the bare form (tracks the crate's default branch) like the ecosystem's other DIG deps.
 dig-pex = { git = "https://github.com/DIG-Network/dig-pex" }
+# IPv6-first, IPv4-fallback (dig_ecosystem hard rule): the TCP/UDP listeners default-bind the IPv6
+# unspecified address `[::]`, and `socket2` is how we clear `IPV6_V6ONLY` on that socket before
+# `tokio` takes it over, so the one `[::]` listener stays dual-stack (see `src/net.rs`). Already a
+# transitive dependency via tokio; declared directly because we call its API.
+socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 # Windows Service Control Protocol dispatcher: a service-manager-registered service must itself

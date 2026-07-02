@@ -10,6 +10,7 @@ use std::sync::Arc;
 use axum::{extract::State, routing::get, Json, Router};
 use serde::Serialize;
 
+use crate::net::bind_tcp_dual_stack;
 use crate::server::RelayState;
 
 /// The `/health` JSON body — self-describing, stable field names (agent-friendly).
@@ -44,7 +45,9 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind(state.config.health_listen).await?;
+    // IPv6-first, IPv4-fallback: dual-stack bind (see `crate::net`) so the default `[::]` health
+    // listener still answers the load balancer's IPv4 health check on the same socket.
+    let listener = bind_tcp_dual_stack(state.config.health_listen)?;
     tracing::info!(addr = %state.config.health_listen, "dig-relay /health listening");
     axum::serve(listener, app).await
 }

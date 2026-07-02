@@ -271,6 +271,7 @@ dependencies = [
  "serde",
  "serde_json",
  "service-manager",
+ "socket2",
  "tokio",
  "tokio-tungstenite",
  "tracing",

@@ -183,8 +183,8 @@ unchanged.
 
 Before a node can announce a *useful* candidate for hole-punching or the introducer, it must know the
 public `IP:port` the outside world sees for it (its **server-reflexive** address). `dig-relay`
-answers classic STUN Binding Requests on a dedicated **UDP** port (default `0.0.0.0:3478` = the
-IANA-assigned STUN port, `--stun-listen`): a node sends a Binding Request and the relay replies with
+answers classic STUN Binding Requests on a dedicated **UDP** port (default `[::]:3478`, dual-stack =
+the IANA-assigned STUN port, `--stun-listen`): a node sends a Binding Request and the relay replies with
 a Binding Success Response carrying an **XOR-MAPPED-ADDRESS** attribute — the source address it
 observed. The implementation (`src/stun.rs`) is a minimal, correct RFC 5389 responder (magic cookie
 `0x2112A442`, 96-bit transaction id echo, XOR-MAPPED-ADDRESS for IPv4 + IPv6); it answers only the
@@ -215,20 +215,33 @@ reply to a non-STUN packet). STUN is stateless, so it needs none of the relay's 
 
 ## Operational surface
 
-- **Listen address/port:** configurable (`--listen`, default `0.0.0.0:9450` =
-  `dig_gossip` `DEFAULT_RELAY_PORT`). The relay endpoint clients use is `wss://relay.dig.net:9450`.
+- **Listen address/port:** configurable (`--listen`, default `[::]:9450` =
+  `dig_gossip` `DEFAULT_RELAY_PORT`, IPv6-first + dual-stack — see "Listener binding" below). The
+  relay endpoint clients use is `wss://relay.dig.net:9450`.
 - **Limits:** configurable max concurrent connections and max reservations (so a single relay can be
   sized to its instance), and a per-connection keepalive/idle timeout.
 - **Health:** an HTTP **`/health`** endpoint (separate small HTTP listener, default
-  `0.0.0.0:9451` / `--health-listen`) returning `200` + a tiny JSON `{status, connected_peers,
-  uptime_secs, version}` for the AWS load balancer's target-group health check. Raw TCP/UDP for the
-  relay WebSocket goes through an NLB; the health check is the only HTTP surface.
-- **STUN:** an RFC 5389 Binding responder on a dedicated **UDP** listener (default `0.0.0.0:3478`,
-  the IANA STUN port / `--stun-listen`) so a NAT'd node can learn its reflexive `IP:port`. UDP, so it
-  never collides with the TCP WebSocket/health listeners; behind the NLB it is a distinct UDP target
-  group.
+  `[::]:9451` / `--health-listen`, dual-stack) returning `200` + a tiny JSON `{status,
+  connected_peers, uptime_secs, version}` for the AWS load balancer's target-group health check. Raw
+  TCP/UDP for the relay WebSocket goes through an NLB; the health check is the only HTTP surface.
+- **STUN:** an RFC 5389 Binding responder on a dedicated **UDP** listener (default `[::]:3478`,
+  the IANA STUN port / `--stun-listen`, dual-stack) so a NAT'd node can learn its reflexive
+  `IP:port`. UDP, so it never collides with the TCP WebSocket/health listeners; behind the NLB it is
+  a distinct UDP target group.
 - **Agent-friendly:** `--help`, a `--health`-style JSON status, stable `RelayMessage` JSON wire,
   catalogued `Error` codes, and structured `tracing` logs.
+
+### Listener binding — IPv6-first, IPv4-fallback (dig_ecosystem hard rule)
+
+All three listeners default-bind the IPv6 unspecified address `[::]`, not the IPv4 wildcard
+`0.0.0.0`. Each bind site (`server.rs`'s WebSocket listener, `health.rs`'s HTTP listener, `stun.rs`'s
+UDP socket) goes through the shared `src/net.rs` helper, which explicitly clears `IPV6_V6ONLY` on
+the resulting socket via `socket2` before handing it to `tokio`. The result is a single **dual-stack**
+`[::]` socket per listener: it accepts native IPv6 connections/datagrams AND IPv4 (via IPv4-mapped
+IPv6) ones on the exact same port, so IPv4-only DIG Nodes remain fully reachable — this is additive,
+not a behavior change for existing IPv4 clients. An operator who passes an explicit IPv4 address
+(e.g. `--listen 0.0.0.0:9450`) gets a plain IPv4-only bind, as requested; dual-stack only applies when
+the bind address is IPv6. See `src/net.rs` for the implementation and its unit tests.
 
 ## TLS
 
