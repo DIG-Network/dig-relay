@@ -36,16 +36,22 @@ async fn free_udp_addr() -> std::net::SocketAddr {
 
 /// Start a relay with the given config tweaks and return `(relay_ws_url, health_addr)`.
 async fn start_relay(max_connections: usize) -> (String, std::net::SocketAddr) {
+    start_relay_with(RelayServerConfig {
+        max_connections,
+        ..Default::default()
+    })
+    .await
+}
+
+/// Start a relay with a fully custom config (listen/health/stun addresses are overridden with free
+/// ports), returning `(relay_ws_url, health_addr)`.
+async fn start_relay_with(mut config: RelayServerConfig) -> (String, std::net::SocketAddr) {
     let relay_addr = free_addr().await;
     let health_addr = free_addr().await;
     let stun_addr = free_udp_addr().await;
-    let config = RelayServerConfig {
-        listen: relay_addr,
-        health_listen: health_addr,
-        stun_listen: stun_addr,
-        max_connections,
-        ..Default::default()
-    };
+    config.listen = relay_addr;
+    config.health_listen = health_addr;
+    config.stun_listen = stun_addr;
     tokio::spawn(async move {
         let _ = dig_relay::serve(config).await;
     });
@@ -486,4 +492,67 @@ async fn forward_before_register_is_rejected_not_registered() {
         }
         other => panic!("expected NOT_REGISTERED, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn an_oversized_frame_is_rejected_and_closes_the_connection() {
+    // SECURITY_AUDIT_P2P dig-relay #4: with a small max message size, a frame larger than the ceiling
+    // is rejected at the WebSocket protocol layer (the connection is torn down) rather than buffered.
+    let (url, _health) = start_relay_with(RelayServerConfig {
+        max_message_bytes: 1024, // 1 KiB ceiling
+        ..Default::default()
+    })
+    .await;
+
+    let mut a = connect(&url).await;
+    register_ok(&mut a, "A", "net").await;
+
+    // Send a text frame far larger than the 1 KiB ceiling → the server rejects it and closes.
+    let huge = "x".repeat(64 * 1024);
+    // The send itself may succeed (buffered locally) but the connection must not keep serving after.
+    let _ = a.send(Message::Text(huge)).await;
+
+    // After an oversized frame the connection is closed: reads yield a close/error/None, never a
+    // successful application response. Confirm the stream ends rather than continuing to serve.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let closed = loop {
+        match tokio::time::timeout_at(deadline, a.next()).await {
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break true,
+            Err(_) => break false, // overall timeout: still serving (bug)
+            Ok(Some(Ok(_))) => continue, // drain any control frame
+        }
+    };
+    assert!(
+        closed,
+        "an oversized frame must cause the relay to close the connection, not keep serving it"
+    );
+}
+
+#[tokio::test]
+async fn an_unregistered_connection_is_reaped_after_the_register_timeout() {
+    // SECURITY_AUDIT_P2P dig-relay #5: a socket that connects and never sends Register is dropped
+    // after the short register timeout (distinct from the longer post-register idle timeout), so
+    // never-registering sockets can't sit and consume resources.
+    let (url, _health) = start_relay_with(RelayServerConfig {
+        register_timeout: Duration::from_millis(300),
+        idle_timeout: Duration::from_secs(120),
+        ..Default::default()
+    })
+    .await;
+
+    let mut a = connect(&url).await;
+    // Never register. Within a bound comfortably past the 300 ms register timeout, the relay must
+    // close the connection.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let reaped = loop {
+        match tokio::time::timeout_at(deadline, a.next()).await {
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break true,
+            Ok(Some(Ok(_))) => continue,
+            Err(_) => break false, // overall timeout: never reaped (bug)
+        }
+    };
+    assert!(
+        reaped,
+        "an unregistered connection must be reaped after the register timeout"
+    );
 }

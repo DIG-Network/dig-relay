@@ -56,6 +56,25 @@ pub const DEFAULT_STUN_PER_IP_RESPONSES_PER_SEC: u32 = 5;
 /// cannot turn the relay into a high-volume reflector; well above any legitimate aggregate need.
 pub const DEFAULT_STUN_GLOBAL_RESPONSES_PER_SEC: u32 = 1000;
 
+/// Bound on each connection's outbound message queue depth (one bound applies to the RLY channel and,
+/// separately, to the PEX channel). A relay peer only receives forwards, broadcasts, and peer
+/// notifications — a small queue absorbs normal bursts, while the bound means a slow or hostile reader
+/// that stops draining its socket can only ever hold this many buffered messages before further sends
+/// to it are dropped, so the relay heap stays bounded (SECURITY_AUDIT_P2P dig-relay #3).
+pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 1024;
+
+/// Bound on the size (in bytes) of a single inbound WebSocket message / frame the relay will accept.
+/// Relay control/gossip frames (register, ping, hole_punch, get_peers, RelayGossipMessage) are tiny;
+/// a small ceiling rejects an oversized frame at the protocol layer before a large allocation, rather
+/// than letting tungstenite's 64 MiB default reassemble it (SECURITY_AUDIT_P2P dig-relay #4).
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 256 * 1024;
+
+/// Timeout (seconds) within which an accepted connection MUST complete RLY-001 `Register`. A socket
+/// that connects and never registers is dropped after this, distinct from the (longer) post-register
+/// idle timeout — so half-open/never-registering sockets cannot sit and consume resources
+/// (SECURITY_AUDIT_P2P dig-relay #5).
+pub const DEFAULT_REGISTER_TIMEOUT_SECS: u64 = 10;
+
 /// Validated relay server configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayServerConfig {
@@ -74,6 +93,14 @@ pub struct RelayServerConfig {
     pub stun_per_ip_responses_per_sec: u32,
     /// Global STUN response budget (responses/sec across all sources). `0` disables the global cap.
     pub stun_global_responses_per_sec: u32,
+    /// Bound on each per-connection outbound queue (RLY and PEX each get this bound). A full queue
+    /// means the peer is not draining; further sends to it are dropped so the relay heap stays bounded.
+    pub outbound_queue_capacity: usize,
+    /// Max bytes for a single inbound WebSocket message/frame; an oversized frame is rejected before
+    /// a large allocation.
+    pub max_message_bytes: usize,
+    /// Time an accepted connection has to complete RLY-001 `Register` before it is dropped.
+    pub register_timeout: Duration,
 }
 
 impl Default for RelayServerConfig {
@@ -91,6 +118,9 @@ impl Default for RelayServerConfig {
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             stun_per_ip_responses_per_sec: DEFAULT_STUN_PER_IP_RESPONSES_PER_SEC,
             stun_global_responses_per_sec: DEFAULT_STUN_GLOBAL_RESPONSES_PER_SEC,
+            outbound_queue_capacity: DEFAULT_OUTBOUND_QUEUE_CAPACITY,
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            register_timeout: Duration::from_secs(DEFAULT_REGISTER_TIMEOUT_SECS),
         }
     }
 }
@@ -106,6 +136,15 @@ impl RelayServerConfig {
         }
         if self.idle_timeout.is_zero() {
             return Err("idle_timeout must be > 0".to_string());
+        }
+        if self.outbound_queue_capacity == 0 {
+            return Err("outbound_queue_capacity must be >= 1".to_string());
+        }
+        if self.max_message_bytes == 0 {
+            return Err("max_message_bytes must be >= 1".to_string());
+        }
+        if self.register_timeout.is_zero() {
+            return Err("register_timeout must be > 0".to_string());
         }
         Ok(())
     }
@@ -206,5 +245,48 @@ mod tests {
             ..Default::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn zero_outbound_queue_capacity_is_rejected() {
+        let c = RelayServerConfig {
+            outbound_queue_capacity: 0,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn zero_max_message_bytes_is_rejected() {
+        let c = RelayServerConfig {
+            max_message_bytes: 0,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn zero_register_timeout_is_rejected() {
+        let c = RelayServerConfig {
+            register_timeout: Duration::from_secs(0),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    /// The DoS-hardening defaults (SECURITY_AUDIT_P2P dig-relay #3/#4/#5) are all present and sane out
+    /// of the box: a bounded outbound queue, a small max message size, and a finite register timeout.
+    #[test]
+    fn dos_hardening_defaults_are_bounded() {
+        let c = RelayServerConfig::default();
+        assert!(c.outbound_queue_capacity > 0, "outbound queue is bounded");
+        assert!(
+            c.max_message_bytes > 0 && c.max_message_bytes <= 1024 * 1024,
+            "message size is bounded to a small realistic ceiling"
+        );
+        assert!(
+            !c.register_timeout.is_zero() && c.register_timeout < c.idle_timeout,
+            "register timeout is finite and shorter than the idle timeout"
+        );
     }
 }

@@ -118,6 +118,24 @@ payloads remain end-to-end authenticated by the gossip layer (§8). Adding the p
 field is a purely-additive `Register` extension (a new optional field + a new `Error` code); it MUST
 be introduced in the same unit of work across `dig-relay` and `dig-gossip`.
 
+### 3.0 Resource bounds (normative)
+
+Every per-connection resource is bounded so a slow, hostile, or never-registering client cannot
+exhaust the relay:
+
+- **Bounded outbound queues.** Each connection's RLY and PEX outbound queues are bounded at
+  `outbound_queue_capacity` (default 1024). A forward/broadcast/notification to a peer whose queue is
+  full is DROPPED (non-blocking `try_send`), never buffered without limit — a peer that stops draining
+  its socket can hold at most `outbound_queue_capacity` buffered messages.
+- **Bounded inbound message size.** A single inbound WebSocket message or frame larger than
+  `max_message_bytes` (default 262144) is rejected at the WebSocket protocol layer before a large
+  allocation. All legitimate relay/PEX frames are far smaller.
+- **Open-connection cap.** The `max_connections` cap counts OPEN sockets (registered or not), checked
+  before the WebSocket handshake, so a flood of connect-but-never-register sockets cannot bypass it.
+- **Register timeout.** An accepted connection that has not completed RLY-001 `Register` within
+  `register_timeout` (default 10 s) is dropped. This is distinct from — and shorter than — the
+  post-register `idle_timeout` (§7), so half-open / never-registering sockets are reaped promptly.
+
 ### 3.1 Two NAT-traversal tiers
 
 1. **Hole-punch signalling (preferred).** RLY-005 discovery + RLY-007 coordination only. The relay
@@ -210,11 +228,16 @@ collide with the relay WebSocket.
 | `idle_timeout` | 120 s | MUST be > 0 |
 | `stun_per_ip_responses_per_sec` | 5 | `0` disables the per-IP STUN limit (§5.1) |
 | `stun_global_responses_per_sec` | 1000 | `0` disables the global STUN limit (§5.1) |
+| `outbound_queue_capacity` | 1024 | MUST be ≥ 1 (per-connection queue bound, §3.0) |
+| `max_message_bytes` | 262144 | MUST be ≥ 1 (inbound frame size bound, §3.0) |
+| `register_timeout` | 10 s | MUST be > 0 (register deadline, §3.0) |
 
-`validate()` rejects `max_connections == 0` and a zero `idle_timeout` with a stable error string.
-Config may be built from CLI flags (`main.rs`, `clap`) or environment variables consumed by the
-service installer (`DIG_RELAY_LISTEN`, `DIG_RELAY_HEALTH_LISTEN`, `DIG_RELAY_STUN_LISTEN`,
-`DIG_RELAY_MAX_CONNECTIONS`, `DIG_RELAY_STUN_PER_IP_RPS`, `DIG_RELAY_STUN_GLOBAL_RPS` — see
+`validate()` rejects `max_connections == 0`, a zero `idle_timeout`, a zero `outbound_queue_capacity`,
+a zero `max_message_bytes`, and a zero `register_timeout` with a stable error string. Config may be
+built from CLI flags (`main.rs`, `clap`) or environment variables consumed by the service installer
+(`DIG_RELAY_LISTEN`, `DIG_RELAY_HEALTH_LISTEN`, `DIG_RELAY_STUN_LISTEN`, `DIG_RELAY_MAX_CONNECTIONS`,
+`DIG_RELAY_STUN_PER_IP_RPS`, `DIG_RELAY_STUN_GLOBAL_RPS`, `DIG_RELAY_OUTBOUND_QUEUE_CAPACITY`,
+`DIG_RELAY_MAX_MESSAGE_BYTES`, `DIG_RELAY_REGISTER_TIMEOUT_SECS` — see
 `src/service.rs::config_from_env`), so an installed OS service serves identically to a manually-run
 `dig-relay serve` with the same flags.
 
