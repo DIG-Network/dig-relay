@@ -24,8 +24,10 @@ pub struct Peer {
     /// Public peer info, returned in `Peers`/`PeerConnected` (RLY-005).
     pub info: RelayPeerInfo,
     /// Outbound channel to this peer's connection task — the task forwards each `RelayMessage`
-    /// it receives here onto the WebSocket.
-    pub tx: mpsc::UnboundedSender<RelayMessage>,
+    /// it receives here onto the WebSocket. BOUNDED (SECURITY_AUDIT_P2P dig-relay #3): a full queue
+    /// means the peer is not draining, and further sends to it are dropped rather than buffered
+    /// without limit, so a slow/hostile reader cannot grow the relay heap.
+    pub tx: mpsc::Sender<RelayMessage>,
 }
 
 /// The outcome of a [`Registry::register`] call — a first registration, a reconnect that reclaimed
@@ -90,7 +92,7 @@ impl Registry {
         peer_id: String,
         network_id: String,
         info: RelayPeerInfo,
-        tx: mpsc::UnboundedSender<RelayMessage>,
+        tx: mpsc::Sender<RelayMessage>,
     ) -> RegisterOutcome {
         if let Some(existing) = self.peers.get(&peer_id) {
             // A live incumbent holds this id: refuse (anti-hijack). Only a demonstrably-dead prior
@@ -130,7 +132,7 @@ impl Registry {
         &self,
         peer_id: &str,
         network_id: &str,
-    ) -> Option<mpsc::UnboundedSender<RelayMessage>> {
+    ) -> Option<mpsc::Sender<RelayMessage>> {
         self.peers
             .get(peer_id)
             .filter(|p| p.network_id == network_id)
@@ -158,7 +160,7 @@ impl Registry {
         from: &str,
         network_id: &str,
         exclude: &[String],
-    ) -> Vec<(String, mpsc::UnboundedSender<RelayMessage>)> {
+    ) -> Vec<(String, mpsc::Sender<RelayMessage>)> {
         self.peers
             .iter()
             .filter(|(id, p)| {
@@ -179,8 +181,11 @@ mod tests {
         RelayPeerInfo::new(id.to_string(), net.to_string(), 1)
     }
 
-    fn chan() -> mpsc::UnboundedSender<RelayMessage> {
-        mpsc::unbounded_channel().0
+    /// A sender whose receiver is immediately dropped → the channel reads as CLOSED (`is_closed()`).
+    /// Fine for the distinct-id registration tests that never route through it; the live/dead
+    /// incumbent tests build their own channels and hold the receiver where liveness matters.
+    fn chan() -> mpsc::Sender<RelayMessage> {
+        mpsc::channel(8).0
     }
 
     #[test]
@@ -225,14 +230,14 @@ mod tests {
     fn duplicate_id_with_a_live_incumbent_is_refused() {
         let mut r = Registry::new();
         // First registration keeps a live sender (rx held → channel stays open).
-        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx1, _rx1) = mpsc::channel(8);
         assert_eq!(
             r.register("a".into(), "net1".into(), info("a", "net1"), tx1),
             RegisterOutcome::Registered
         );
 
         // A hijack attempt under the same id while the incumbent is live: refused.
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::channel(8);
         assert_eq!(
             r.register("a".into(), "net1".into(), info("a", "net1"), tx2),
             RegisterOutcome::Occupied,
@@ -252,7 +257,7 @@ mod tests {
     #[test]
     fn duplicate_id_with_a_dead_incumbent_reconnects() {
         let mut r = Registry::new();
-        let (tx1, rx1) = mpsc::unbounded_channel();
+        let (tx1, rx1) = mpsc::channel(8);
         assert_eq!(
             r.register("a".into(), "net1".into(), info("a", "net1"), tx1),
             RegisterOutcome::Registered
@@ -260,7 +265,7 @@ mod tests {
         // Drop the receiver → the incumbent's sender is now closed (its connection is gone).
         drop(rx1);
 
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::channel(8);
         assert_eq!(
             r.register("a".into(), "net1".into(), info("a", "net1"), tx2),
             RegisterOutcome::Reconnected,

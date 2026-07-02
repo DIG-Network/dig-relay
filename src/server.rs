@@ -56,6 +56,11 @@ pub struct RelayState {
     pub pex: Mutex<PexRelay>,
     /// Live connected-peer count, mirrored from the registry for a lock-free `/health` read.
     pub connected: AtomicU64,
+    /// Live OPEN-socket count — every accepted connection (whether or not it has registered) counts
+    /// here, so the connection cap covers half-open / never-registering sockets too (SECURITY_AUDIT_P2P
+    /// dig-relay #5). Incremented right after the WebSocket upgrade, decremented when the connection
+    /// task exits (via an RAII guard so it can never leak).
+    pub open_connections: AtomicU64,
     /// Process start time, for `/health` uptime.
     pub started: SystemTime,
     /// Validated config.
@@ -69,6 +74,7 @@ impl RelayState {
             registry: Mutex::new(Registry::new()),
             pex: Mutex::new(PexRelay::new()),
             connected: AtomicU64::new(0),
+            open_connections: AtomicU64::new(0),
             started: SystemTime::now(),
             config,
         })
@@ -77,6 +83,29 @@ impl RelayState {
     /// Seconds since process start (saturating).
     pub fn uptime_secs(&self) -> u64 {
         self.started.elapsed().map(|d| d.as_secs()).unwrap_or(0)
+    }
+}
+
+/// RAII guard for the open-socket counter (SECURITY_AUDIT_P2P dig-relay #5). Incrementing on
+/// construction and decrementing on `Drop` means an accepted connection is counted for its entire
+/// lifetime and released on EVERY exit path (normal close, ws error, idle/register timeout, panic
+/// unwinding) — the count can never leak, so the open-connection cap stays accurate.
+struct OpenConnectionGuard {
+    state: Arc<RelayState>,
+}
+
+impl OpenConnectionGuard {
+    fn acquire(state: &Arc<RelayState>) -> Self {
+        state.open_connections.fetch_add(1, Ordering::Relaxed);
+        OpenConnectionGuard {
+            state: state.clone(),
+        }
+    }
+}
+
+impl Drop for OpenConnectionGuard {
+    fn drop(&mut self) {
+        self.state.open_connections.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -361,22 +390,42 @@ async fn handle_connection(
     stream: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Connection cap (RLY-001 capacity guard): refuse before the handshake when full.
-    if state.connected.load(Ordering::Relaxed) as usize >= state.config.max_connections {
-        tracing::warn!(%peer_addr, "refusing connection: at capacity");
+    // Connection cap (SECURITY_AUDIT_P2P dig-relay #5): count OPEN sockets, not just registered peers,
+    // so a flood of connect-but-never-register sockets can't bypass the cap. The guard increments the
+    // open-connection counter here and decrements it on ANY exit path (RAII), so the count can never
+    // leak. Refuse before the (cheap) handshake when full.
+    if state.open_connections.load(Ordering::Relaxed) as usize >= state.config.max_connections {
+        tracing::warn!(%peer_addr, "refusing connection: at open-connection cap");
         return Ok(());
     }
+    let _open_guard = OpenConnectionGuard::acquire(&state);
 
-    let ws = tokio_tungstenite::accept_async(stream).await?;
+    // Cap the WebSocket message/frame size at a small realistic bound (SECURITY_AUDIT_P2P dig-relay
+    // #4). All relay control/gossip frames (register, ping, hole_punch, get_peers, RelayGossipMessage,
+    // PEX) are tiny; tungstenite's 64 MiB default would let each connection force the server to buffer
+    // up to 64 MiB reassembling one message (and a Broadcast of that size would then be cloned to
+    // every same-network peer). A `max_message_size`/`max_frame_size` ceiling rejects an oversized
+    // frame at the protocol layer before that allocation.
+    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(state.config.max_message_bytes),
+        max_frame_size: Some(state.config.max_message_bytes),
+        ..Default::default()
+    };
+    let ws = tokio_tungstenite::accept_async_with_config(stream, Some(ws_config)).await?;
     let (mut write, mut read) = ws.split();
 
     // Outbound RLY channel: anything (this task, or another peer forwarding to us) pushes a
-    // RelayMessage here; the writer half drains it to the socket.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RelayMessage>();
+    // RelayMessage here; the writer half drains it to the socket. BOUNDED (SECURITY_AUDIT_P2P
+    // dig-relay #3): a peer that stops reading its socket can only ever hold `outbound_queue_capacity`
+    // buffered messages before further `try_send`s to it are dropped, so a slow/hostile reader cannot
+    // grow the relay heap without limit.
+    let queue_cap = state.config.outbound_queue_capacity;
+    let (out_tx, mut out_rx) = mpsc::channel::<RelayMessage>(queue_cap);
     // Outbound PEX channel (RLY-008): the PEX subsystem (handshake reply + tick-driven deltas) pushes
     // `PexMessage`s here. Kept separate from the RLY channel so the registry / RLY-001..007 wire is
-    // byte-for-byte unchanged; the one writer merges both onto the socket as JSON text frames.
-    let (pex_tx, mut pex_rx) = mpsc::unbounded_channel::<PexMessage>();
+    // byte-for-byte unchanged; the one writer merges both onto the socket as JSON text frames. Also
+    // bounded, for the same reason.
+    let (pex_tx, mut pex_rx) = mpsc::channel::<PexMessage>(queue_cap);
 
     // Writer task: serialize each outbound RLY or PEX message as one JSON text frame and write it.
     // Both are `type`-tagged JSON on the same WebSocket; a PEX frame uses the bare-JSON form
@@ -410,12 +459,26 @@ async fn handle_connection(
 
     let mut session = Session::default();
     let idle = state.config.idle_timeout;
+    let register_timeout = state.config.register_timeout;
 
     loop {
-        let next = tokio::time::timeout(idle, read.next()).await;
+        // Until the connection has registered (RLY-001), it is held only to the SHORT register
+        // timeout, so a connect-but-never-register socket is reaped quickly (SECURITY_AUDIT_P2P
+        // dig-relay #5) rather than sitting for the full (longer) post-register idle timeout. Once
+        // registered, the generous idle timeout applies (keepalive is the node's 30 s ping).
+        let deadline = if session.peer_id.is_some() {
+            idle
+        } else {
+            register_timeout
+        };
+        let next = tokio::time::timeout(deadline, read.next()).await;
         let frame = match next {
             Err(_) => {
-                tracing::debug!(%peer_addr, "idle timeout; reaping");
+                if session.peer_id.is_some() {
+                    tracing::debug!(%peer_addr, "idle timeout; reaping");
+                } else {
+                    tracing::debug!(%peer_addr, "register timeout; reaping unregistered connection");
+                }
                 break;
             }
             Ok(None) => break,         // stream closed
@@ -438,7 +501,7 @@ async fn handle_connection(
         let msg: RelayMessage = match serde_json::from_slice(&frame) {
             Ok(m) => m,
             Err(_) => {
-                let _ = out_tx.send(RelayMessage::Error {
+                let _ = out_tx.try_send(RelayMessage::Error {
                     code: errcode::BAD_MESSAGE,
                     message: "invalid relay JSON".to_string(),
                 });
@@ -450,7 +513,7 @@ async fn handle_connection(
         if let RelayMessage::GetPeers { network_id } = &msg {
             let filter = network_id.clone().or_else(|| session.network_id.clone());
             let peers = state.registry.lock().await.peers(filter.as_deref());
-            let _ = out_tx.send(RelayMessage::Peers { peers });
+            let _ = out_tx.try_send(RelayMessage::Peers { peers });
             continue;
         }
 
@@ -484,11 +547,11 @@ async fn handle_connection(
             }
             Action::ReplyToSelf(msgs) => {
                 for m in msgs {
-                    let _ = out_tx.send(m);
+                    let _ = out_tx.try_send(m);
                 }
             }
             Action::Error { code, message } => {
-                let _ = out_tx.send(RelayMessage::Error { code, message });
+                let _ = out_tx.try_send(RelayMessage::Error { code, message });
             }
             Action::Close => break,
             Action::Nothing => {}
@@ -514,8 +577,8 @@ async fn handle_pex_frame(
     session: &mut Session,
     frame: &[u8],
     peer_addr: std::net::SocketAddr,
-    pex_tx: &mpsc::UnboundedSender<PexMessage>,
-    out_tx: &mpsc::UnboundedSender<RelayMessage>,
+    pex_tx: &mpsc::Sender<PexMessage>,
+    out_tx: &mpsc::Sender<RelayMessage>,
 ) {
     let decoded = std::str::from_utf8(frame)
         .ok()
@@ -527,7 +590,7 @@ async fn handle_pex_frame(
 
     match pex_dispatch(session, decoded.as_ref()) {
         PexAction::NotRegistered => {
-            let _ = out_tx.send(RelayMessage::Error {
+            let _ = out_tx.try_send(RelayMessage::Error {
                 code: errcode::NOT_REGISTERED,
                 message: "register before sending PEX (RLY-001)".to_string(),
             });
@@ -545,7 +608,7 @@ async fn handle_pex_frame(
             };
             session.pex_active = true;
             for m in replies {
-                let _ = pex_tx.send(m);
+                let _ = pex_tx.try_send(m);
             }
         }
         PexAction::Data(msg) => {
@@ -555,7 +618,7 @@ async fn handle_pex_frame(
                 .await
                 .on_node_message(&peer_id, &network_id, msg, now);
             for m in replies {
-                let _ = pex_tx.send(m);
+                let _ = pex_tx.try_send(m);
             }
         }
         PexAction::BadFrame => {
@@ -565,7 +628,7 @@ async fn handle_pex_frame(
                 .await
                 .on_node_bad_frame(&peer_id, &network_id, now);
             for m in replies {
-                let _ = pex_tx.send(m);
+                let _ = pex_tx.try_send(m);
             }
         }
         PexAction::IgnorePreHandshake => {}
@@ -586,17 +649,17 @@ async fn register_peer(
     network_id: String,
     protocol_version: u32,
     peer_addr: std::net::SocketAddr,
-    out_tx: &mpsc::UnboundedSender<RelayMessage>,
-    pex_tx: &mpsc::UnboundedSender<PexMessage>,
+    out_tx: &mpsc::Sender<RelayMessage>,
+    pex_tx: &mpsc::Sender<PexMessage>,
 ) -> bool {
     let mut reg = state.registry.lock().await;
     if reg.len() >= state.config.max_connections {
-        let _ = out_tx.send(RelayMessage::RegisterAck {
+        let _ = out_tx.try_send(RelayMessage::RegisterAck {
             success: false,
             message: "relay at capacity".to_string(),
             connected_peers: reg.len(),
         });
-        let _ = out_tx.send(RelayMessage::Error {
+        let _ = out_tx.try_send(RelayMessage::Error {
             code: errcode::CAPACITY,
             message: "relay at capacity".to_string(),
         });
@@ -628,12 +691,12 @@ async fn register_peer(
             let connected_peers = reg.len();
             drop(reg);
             tracing::warn!(%peer_id, %peer_addr, "refusing register: peer_id already held by a live peer (anti-hijack)");
-            let _ = out_tx.send(RelayMessage::RegisterAck {
+            let _ = out_tx.try_send(RelayMessage::RegisterAck {
                 success: false,
                 message: "peer_id already registered by a live connection".to_string(),
                 connected_peers,
             });
-            let _ = out_tx.send(RelayMessage::Error {
+            let _ = out_tx.try_send(RelayMessage::Error {
                 code: errcode::ID_IN_USE,
                 message: "peer_id already registered by a live connection".to_string(),
             });
@@ -646,13 +709,13 @@ async fn register_peer(
     let targets = reg.broadcast_targets(&peer_id, &network_id, &[]);
     drop(reg);
 
-    let _ = out_tx.send(RelayMessage::RegisterAck {
+    let _ = out_tx.try_send(RelayMessage::RegisterAck {
         success: true,
         message: "registered".to_string(),
         connected_peers,
     });
     for (_, tx) in targets {
-        let _ = tx.send(RelayMessage::PeerConnected { peer: info.clone() });
+        let _ = tx.try_send(RelayMessage::PeerConnected { peer: info.clone() });
     }
 
     // RLY-008: mirror the registration into the PEX introducer set. Done after the RLY lock is
@@ -674,7 +737,7 @@ async fn forward_to(
     session: &Session,
     to: &str,
     msg: RelayMessage,
-    out_tx: &mpsc::UnboundedSender<RelayMessage>,
+    out_tx: &mpsc::Sender<RelayMessage>,
 ) {
     let Some(network_id) = session.network_id.as_deref() else {
         return;
@@ -686,10 +749,10 @@ async fn forward_to(
         .sender_in_network(to, network_id);
     match sender {
         Some(tx) => {
-            let _ = tx.send(msg);
+            let _ = tx.try_send(msg);
         }
         None => {
-            let _ = out_tx.send(RelayMessage::Error {
+            let _ = out_tx.try_send(RelayMessage::Error {
                 code: errcode::PEER_NOT_FOUND,
                 message: format!("peer {to} not connected to this relay"),
             });
@@ -714,7 +777,7 @@ async fn broadcast(
         .await
         .broadcast_targets(from, network_id, exclude);
     for (_, tx) in targets {
-        let _ = tx.send(msg.clone());
+        let _ = tx.try_send(msg.clone());
     }
 }
 
@@ -732,7 +795,7 @@ async fn deregister(state: &Arc<RelayState>, session: &Session) {
         let targets = reg.broadcast_targets(peer_id, network_id, &[]);
         drop(reg);
         for (_, tx) in targets {
-            let _ = tx.send(RelayMessage::PeerDisconnected {
+            let _ = tx.try_send(RelayMessage::PeerDisconnected {
                 peer_id: peer_id.clone(),
             });
         }
@@ -760,8 +823,8 @@ mod tests {
 
     /// A throwaway PEX outbound sender for `register_peer` call sites that don't assert on PEX
     /// output (the PEX mirroring is exercised directly in the dedicated PEX tests below).
-    fn pex_sink() -> mpsc::UnboundedSender<PexMessage> {
-        mpsc::unbounded_channel().0
+    fn pex_sink() -> mpsc::Sender<PexMessage> {
+        mpsc::channel(64).0
     }
 
     #[test]
@@ -984,9 +1047,38 @@ mod tests {
     fn relay_state_new_starts_empty_with_zero_uptime() {
         let st = RelayState::new(RelayServerConfig::default());
         assert_eq!(st.connected.load(Ordering::Relaxed), 0);
+        assert_eq!(st.open_connections.load(Ordering::Relaxed), 0);
         assert!(st.registry.try_lock().unwrap().is_empty());
         // uptime is monotonic and small right after construction.
         assert!(st.uptime_secs() < 5);
+    }
+
+    /// SECURITY_AUDIT_P2P dig-relay #5: the open-connection guard counts a socket for its whole
+    /// lifetime and releases it on drop — the count tracks OPEN sockets (registered or not), so the
+    /// connection cap can't be bypassed by connect-but-never-register sockets, and it never leaks.
+    #[test]
+    fn open_connection_guard_counts_and_releases() {
+        let st = RelayState::new(RelayServerConfig::default());
+        assert_eq!(st.open_connections.load(Ordering::Relaxed), 0);
+        {
+            let _g1 = OpenConnectionGuard::acquire(&st);
+            assert_eq!(st.open_connections.load(Ordering::Relaxed), 1);
+            {
+                // A second UNREGISTERED socket still counts toward the cap (the bug this closes).
+                let _g2 = OpenConnectionGuard::acquire(&st);
+                assert_eq!(st.open_connections.load(Ordering::Relaxed), 2);
+            }
+            assert_eq!(
+                st.open_connections.load(Ordering::Relaxed),
+                1,
+                "dropping a guard releases exactly one slot"
+            );
+        }
+        assert_eq!(
+            st.open_connections.load(Ordering::Relaxed),
+            0,
+            "all slots released on drop — no leak"
+        );
     }
 
     // ---- Direct tests of the connection-state functions (no socket; an mpsc channel stands in for
@@ -995,7 +1087,7 @@ mod tests {
     // capacity ack and the duplicate-id replacement, which the pre-handshake cap guard masks). ----
 
     /// Drain everything currently queued on an unbounded receiver into a Vec (non-blocking).
-    fn drain(rx: &mut mpsc::UnboundedReceiver<RelayMessage>) -> Vec<RelayMessage> {
+    fn drain(rx: &mut mpsc::Receiver<RelayMessage>) -> Vec<RelayMessage> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
             out.push(m);
@@ -1006,7 +1098,7 @@ mod tests {
     #[tokio::test]
     async fn register_peer_acks_success_and_bumps_connected() {
         let state = RelayState::new(RelayServerConfig::default());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(64);
         let mut session = Session::default();
 
         let ok = register_peer(
@@ -1046,7 +1138,7 @@ mod tests {
             ..Default::default()
         });
         {
-            let (tx0, _rx0) = mpsc::unbounded_channel();
+            let (tx0, _rx0) = mpsc::channel(64);
             let info = RelayPeerInfo::new("first".into(), "net".into(), 1);
             state
                 .registry
@@ -1056,7 +1148,7 @@ mod tests {
             state.connected.store(1, Ordering::Relaxed);
         }
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(64);
         let mut session = Session::default();
         let ok = register_peer(
             &state,
@@ -1095,7 +1187,7 @@ mod tests {
     async fn register_peer_refuses_to_evict_a_live_incumbent() {
         let state = RelayState::new(RelayServerConfig::default());
         // First peer registers with a LIVE outbound channel (rx1 held).
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = mpsc::channel(64);
         let mut s1 = Session::default();
         assert!(
             register_peer(
@@ -1118,7 +1210,7 @@ mod tests {
         ));
 
         // A hijack attempt under the same id while the incumbent is live.
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::channel(64);
         let mut s2 = Session::default();
         let ok = register_peer(
             &state,
@@ -1164,7 +1256,7 @@ mod tests {
             .await
             .sender_in_network("p", "net")
             .expect("incumbent keeps its slot")
-            .send(RelayMessage::Ping { timestamp: 1 })
+            .try_send(RelayMessage::Ping { timestamp: 1 })
             .unwrap();
         assert_eq!(
             drain(&mut rx1).len(),
@@ -1179,7 +1271,7 @@ mod tests {
     #[tokio::test]
     async fn register_peer_reconnect_reclaims_a_dead_incumbent_without_double_count() {
         let state = RelayState::new(RelayServerConfig::default());
-        let (tx1, rx1) = mpsc::unbounded_channel();
+        let (tx1, rx1) = mpsc::channel(64);
         let mut s1 = Session::default();
         assert!(
             register_peer(
@@ -1198,7 +1290,7 @@ mod tests {
         // The prior connection dies: its receiver drops → tx1 is closed.
         drop(rx1);
 
-        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::channel(64);
         let mut s2 = Session::default();
         assert!(
             register_peer(
@@ -1229,7 +1321,7 @@ mod tests {
     #[tokio::test]
     async fn forward_to_delivers_to_a_same_network_peer() {
         let state = RelayState::new(RelayServerConfig::default());
-        let (btx, mut brx) = mpsc::unbounded_channel();
+        let (btx, mut brx) = mpsc::channel(64);
         state.registry.lock().await.register(
             "b".into(),
             "net".into(),
@@ -1237,7 +1329,7 @@ mod tests {
             btx,
         );
 
-        let (atx, mut arx) = mpsc::unbounded_channel();
+        let (atx, mut arx) = mpsc::channel(64);
         let session = Session {
             peer_id: Some("me".into()),
             network_id: Some("net".into()),
@@ -1265,7 +1357,7 @@ mod tests {
     #[tokio::test]
     async fn forward_to_unknown_peer_errors_back_to_sender() {
         let state = RelayState::new(RelayServerConfig::default());
-        let (atx, mut arx) = mpsc::unbounded_channel();
+        let (atx, mut arx) = mpsc::channel(64);
         let session = Session {
             peer_id: Some("me".into()),
             network_id: Some("net".into()),
@@ -1292,7 +1384,7 @@ mod tests {
     async fn forward_to_without_a_network_is_a_noop() {
         // A session that never registered a network can't route; forward_to returns silently.
         let state = RelayState::new(RelayServerConfig::default());
-        let (atx, mut arx) = mpsc::unbounded_channel();
+        let (atx, mut arx) = mpsc::channel(64);
         let session = Session::default();
         forward_to(
             &state,
@@ -1305,12 +1397,66 @@ mod tests {
         assert!(drain(&mut arx).is_empty());
     }
 
+    /// SECURITY_AUDIT_P2P dig-relay #3: a peer that stops draining its socket cannot make the relay
+    /// buffer without bound. `forward_to` uses a bounded channel + `try_send`, so once the target's
+    /// queue is full, further forwards to it are DROPPED (never buffered past the capacity) — the
+    /// relay heap for that peer is capped at `outbound_queue_capacity`.
+    #[tokio::test]
+    async fn forward_to_a_stalled_reader_is_bounded_and_drops_the_overflow() {
+        let cap = 4usize;
+        let state = RelayState::new(RelayServerConfig {
+            outbound_queue_capacity: cap,
+            ..Default::default()
+        });
+        // The target "b" NEVER reads its receiver (a stalled/hostile reader): rx is held but idle.
+        let (btx, _brx_never_read) = mpsc::channel(cap);
+        state.registry.lock().await.register(
+            "b".into(),
+            "net".into(),
+            RelayPeerInfo::new("b".into(), "net".into(), 1),
+            btx,
+        );
+        let (atx, _arx) = mpsc::channel(64);
+        let session = Session {
+            peer_id: Some("me".into()),
+            network_id: Some("net".into()),
+            ..Default::default()
+        };
+
+        // Forward far more than the capacity. None of these block, and none grow the queue past `cap`.
+        for i in 0..(cap as u64 * 100) {
+            forward_to(
+                &state,
+                &session,
+                "b",
+                RelayMessage::Ping { timestamp: i },
+                &atx,
+            )
+            .await;
+        }
+
+        // The target's queue holds at most `cap` messages — the overflow was dropped, not buffered.
+        let tx = state
+            .registry
+            .lock()
+            .await
+            .sender_in_network("b", "net")
+            .unwrap();
+        // A bounded Sender reports remaining capacity; the queue is full (0 free), never over-full.
+        assert_eq!(
+            tx.capacity(),
+            0,
+            "the stalled reader's queue is full at capacity, not grown past it"
+        );
+        assert_eq!(tx.max_capacity(), cap, "capacity is the configured bound");
+    }
+
     #[tokio::test]
     async fn broadcast_reaches_only_same_network_non_excluded_peers() {
         let state = RelayState::new(RelayServerConfig::default());
         let mut rxs = std::collections::HashMap::new();
         for (id, net) in [("a", "net"), ("b", "net"), ("c", "net"), ("z", "other")] {
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(64);
             state.registry.lock().await.register(
                 id.into(),
                 net.into(),
@@ -1344,8 +1490,8 @@ mod tests {
     #[tokio::test]
     async fn deregister_removes_the_peer_and_notifies_others() {
         let state = RelayState::new(RelayServerConfig::default());
-        let (atx, mut arx) = mpsc::unbounded_channel();
-        let (btx, _brx) = mpsc::unbounded_channel();
+        let (atx, mut arx) = mpsc::channel(64);
+        let (btx, _brx) = mpsc::channel(64);
         state.registry.lock().await.register(
             "a".into(),
             "net".into(),
@@ -1428,7 +1574,7 @@ mod tests {
     }
 
     /// Drain a PEX receiver (non-blocking).
-    fn drain_pex(rx: &mut mpsc::UnboundedReceiver<PexMessage>) -> Vec<PexMessage> {
+    fn drain_pex(rx: &mut mpsc::Receiver<PexMessage>) -> Vec<PexMessage> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
             out.push(m);
@@ -1509,12 +1655,12 @@ mod tests {
         port: u16,
     ) -> (
         Session,
-        mpsc::UnboundedReceiver<RelayMessage>,
-        mpsc::UnboundedSender<PexMessage>,
-        mpsc::UnboundedReceiver<PexMessage>,
+        mpsc::Receiver<RelayMessage>,
+        mpsc::Sender<PexMessage>,
+        mpsc::Receiver<PexMessage>,
     ) {
-        let (out_tx, out_rx) = mpsc::unbounded_channel();
-        let (pex_tx, pex_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let (pex_tx, pex_rx) = mpsc::channel(64);
         let mut session = Session::default();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let ok = register_peer(
@@ -1554,7 +1700,7 @@ mod tests {
         let _b = register_into(&state, &b, "net", 4002).await;
 
         // A sends its pex_handshake as a raw frame → handled by the server PEX path.
-        let (dummy_rly, _drx) = mpsc::unbounded_channel();
+        let (dummy_rly, _drx) = mpsc::channel(64);
         handle_pex_frame(
             &state,
             &mut sess_a,
@@ -1588,8 +1734,8 @@ mod tests {
     async fn a_pex_frame_before_registration_gets_not_registered() {
         let state = RelayState::new(RelayServerConfig::default());
         let mut session = Session::default(); // never registered
-        let (rly_tx, mut rly_rx) = mpsc::unbounded_channel();
-        let (pex_tx, mut pex_rx) = mpsc::unbounded_channel();
+        let (rly_tx, mut rly_rx) = mpsc::channel(64);
+        let (pex_tx, mut pex_rx) = mpsc::channel(64);
         handle_pex_frame(
             &state,
             &mut session,
@@ -1620,7 +1766,7 @@ mod tests {
         // A peer on a DIFFERENT network — must never appear in netX's snapshot.
         let _z = register_into(&state, &z, "netY", 4003).await;
 
-        let (dummy_rly, _drx) = mpsc::unbounded_channel();
+        let (dummy_rly, _drx) = mpsc::channel(64);
         handle_pex_frame(
             &state,
             &mut sess_a,
@@ -1653,7 +1799,7 @@ mod tests {
         assert_eq!(state.pex.lock().await.known_count("net"), 1);
 
         // A activates PEX, then sends a snapshot advertising a NEW peer.
-        let (dummy_rly, _drx) = mpsc::unbounded_channel();
+        let (dummy_rly, _drx) = mpsc::channel(64);
         handle_pex_frame(
             &state,
             &mut sess_a,

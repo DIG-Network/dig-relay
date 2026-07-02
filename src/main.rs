@@ -57,6 +57,15 @@ struct Cli {
     /// STUN Binding responses per second across all sources (default 1000; 0 disables the cap).
     #[arg(long, value_name = "N", global = true)]
     stun_global_rps: Option<u32>,
+    /// Per-connection outbound queue depth (default 1024). A slow reader past this has messages dropped.
+    #[arg(long, value_name = "N", global = true)]
+    outbound_queue_capacity: Option<usize>,
+    /// Max bytes for a single inbound WebSocket message/frame (default 262144).
+    #[arg(long, value_name = "BYTES", global = true)]
+    max_message_bytes: Option<usize>,
+    /// Seconds an accepted connection has to Register before being dropped (default 10).
+    #[arg(long, value_name = "SECS", global = true)]
+    register_timeout_secs: Option<u64>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -108,6 +117,15 @@ fn apply_overrides(mut config: RelayServerConfig, cli: &Cli) -> RelayServerConfi
     }
     if let Some(n) = cli.stun_global_rps {
         config.stun_global_responses_per_sec = n;
+    }
+    if let Some(n) = cli.outbound_queue_capacity {
+        config.outbound_queue_capacity = n;
+    }
+    if let Some(n) = cli.max_message_bytes {
+        config.max_message_bytes = n;
+    }
+    if let Some(s) = cli.register_timeout_secs {
+        config.register_timeout = Duration::from_secs(s);
     }
     config
 }
@@ -329,6 +347,12 @@ mod tests {
             "7",
             "--stun-global-rps",
             "500",
+            "--outbound-queue-capacity",
+            "256",
+            "--max-message-bytes",
+            "4096",
+            "--register-timeout-secs",
+            "3",
         ]);
         let out = apply_overrides(base, &cli);
         assert_eq!(out.listen, "127.0.0.1:8000".parse().unwrap());
@@ -338,6 +362,9 @@ mod tests {
         assert_eq!(out.idle_timeout, Duration::from_secs(5));
         assert_eq!(out.stun_per_ip_responses_per_sec, 7);
         assert_eq!(out.stun_global_responses_per_sec, 500);
+        assert_eq!(out.outbound_queue_capacity, 256);
+        assert_eq!(out.max_message_bytes, 4096);
+        assert_eq!(out.register_timeout, Duration::from_secs(3));
     }
 
     #[test]

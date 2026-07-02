@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use dig_pex::{
     Address, AddressKind, PeerEntry, PexConfig, PexEngine, PexErrorCode, PexMessage, Provenance,
@@ -67,7 +67,7 @@ pub struct PexRelay {
     /// `peer_id → ` that connection's PEX outbound sender (the writer's PEX channel). Keyed by
     /// `peer_id` (globally unique across the relay, mirroring the registry's own keying), so
     /// [`tick`](Self::tick) can route each engine output `(peer_id, message)` to the matching socket.
-    conns: HashMap<String, UnboundedSender<PexMessage>>,
+    conns: HashMap<String, Sender<PexMessage>>,
 }
 
 impl PexRelay {
@@ -101,7 +101,7 @@ impl PexRelay {
         peer_id: &str,
         network_id: &str,
         observed: SocketAddr,
-        pex_tx: UnboundedSender<PexMessage>,
+        pex_tx: Sender<PexMessage>,
         now_ms: u64,
     ) {
         let entry = introducer_entry(peer_id, network_id, observed, now_ms / 1000);
@@ -192,7 +192,7 @@ impl PexRelay {
         }
         for (peer_id, msg) in routed {
             if let Some(tx) = self.conns.get(&peer_id) {
-                let _ = tx.send(msg);
+                let _ = tx.try_send(msg);
             }
         }
     }
@@ -246,7 +246,7 @@ fn introducer_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc::{self, UnboundedReceiver};
+    use tokio::sync::mpsc::{self, Receiver};
 
     /// A `<64hex>` peer id from a byte (each byte repeated 32× → 64 hex chars).
     fn hex(b: u8) -> String {
@@ -267,12 +267,12 @@ mod tests {
         }
     }
 
-    fn chan() -> (UnboundedSender<PexMessage>, UnboundedReceiver<PexMessage>) {
-        mpsc::unbounded_channel()
+    fn chan() -> (Sender<PexMessage>, Receiver<PexMessage>) {
+        mpsc::channel(64)
     }
 
     /// Drain everything currently queued on a receiver (non-blocking).
-    fn drain(rx: &mut UnboundedReceiver<PexMessage>) -> Vec<PexMessage> {
+    fn drain(rx: &mut Receiver<PexMessage>) -> Vec<PexMessage> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
             out.push(m);
