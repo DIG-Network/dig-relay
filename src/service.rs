@@ -212,6 +212,27 @@ pub fn status(config: &RelayServerConfig) -> std::io::Result<Outcome> {
     ))
 }
 
+/// Rewrite an unspecified bind address to the matching loopback address (a status check always
+/// runs on the same host as the relay). PURE — no I/O, so the family-selection logic is
+/// unit-testable without a socket.
+///
+/// IPv6-first: an unspecified `[::]` bind (this crate's default, per `RelayServerConfig`) probes
+/// `::1`, not `127.0.0.1` — a dual-stack `[::]` listener answers on `::1` natively, and probing the
+/// same family avoids depending on IPv4-mapped loopback support (not universal on Windows). An
+/// unspecified `0.0.0.0` bind (an operator's explicit IPv4-only override) still probes
+/// `127.0.0.1` as before. A non-unspecified address is returned unchanged.
+fn loopback_probe_addr(addr: SocketAddr) -> SocketAddr {
+    if !addr.ip().is_unspecified() {
+        return addr;
+    }
+    let loopback = if addr.is_ipv6() {
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    };
+    SocketAddr::new(loopback, addr.port())
+}
+
 /// Minimal blocking HTTP/1.0 `GET /health` probe. Returns whether the status line is `2xx`. Avoids
 /// pulling an async client into the status path.
 fn probe_health(addr: &SocketAddr) -> std::io::Result<bool> {
@@ -219,12 +240,7 @@ fn probe_health(addr: &SocketAddr) -> std::io::Result<bool> {
     use std::net::TcpStream;
     use std::time::Duration;
 
-    // Probe loopback even when the bind addr is 0.0.0.0 (a status check runs on the same host).
-    let connect_addr = if addr.ip().is_unspecified() {
-        SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), addr.port())
-    } else {
-        *addr
-    };
+    let connect_addr = loopback_probe_addr(*addr);
     let mut stream = match TcpStream::connect(connect_addr) {
         Ok(s) => s,
         Err(_) => return Ok(false),
@@ -414,6 +430,59 @@ mod tests {
         let unspecified = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), addr.port());
         // The rewrite targets 127.0.0.1:<port>, which is exactly where our server listens.
         assert!(probe_health(&unspecified).unwrap());
+    }
+
+    /// Regression test for IPv6-first (dig_ecosystem hard rule): `RelayServerConfig`'s default bind
+    /// is now the IPv6 unspecified `[::]`, so the status probe must rewrite it to `::1` — the
+    /// SAME-FAMILY loopback — not silently fall back to `127.0.0.1` (which would depend on
+    /// IPv4-mapped loopback support that isn't universal, e.g. on Windows).
+    #[test]
+    fn loopback_probe_addr_prefers_ipv6_loopback_for_unspecified_ipv6() {
+        let unspecified_v6 = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 9451);
+        let probe = loopback_probe_addr(unspecified_v6);
+        assert_eq!(
+            probe,
+            SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), 9451),
+            "an unspecified [::] bind must probe ::1, not 127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn loopback_probe_addr_still_prefers_ipv4_loopback_for_unspecified_ipv4() {
+        // An operator who explicitly overrides to 0.0.0.0 (IPv4-only) keeps the IPv4 loopback probe.
+        let unspecified_v4 = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 9451);
+        let probe = loopback_probe_addr(unspecified_v4);
+        assert_eq!(
+            probe,
+            SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 9451)
+        );
+    }
+
+    #[test]
+    fn loopback_probe_addr_leaves_a_specific_address_unchanged() {
+        let specific: SocketAddr = "10.0.0.5:9451".parse().unwrap();
+        assert_eq!(loopback_probe_addr(specific), specific);
+        let specific_v6: SocketAddr = "[2001:db8::1]:9451".parse().unwrap();
+        assert_eq!(loopback_probe_addr(specific_v6), specific_v6);
+    }
+
+    #[test]
+    fn probe_health_against_ipv6_unspecified_bind_reaches_an_ipv6_loopback_server() {
+        // End-to-end: a one-shot server bound to ::1 must be reachable via the unspecified-[::]
+        // rewrite, proving `probe_health` itself (not just the pure helper) goes to the right family.
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+                let _ = sock.flush();
+            }
+        });
+        let unspecified_v6 = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), port);
+        assert!(probe_health(&unspecified_v6).unwrap());
     }
 
     #[test]

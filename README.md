@@ -58,8 +58,9 @@ cargo test
 ## Run
 
 ```bash
-dig-relay                          # serve on 0.0.0.0:9450 (relay) + :9451 (/health) + :3478/udp (STUN)
-dig-relay --listen 0.0.0.0:9450 --health-listen 0.0.0.0:9451 --stun-listen 0.0.0.0:3478 \
+dig-relay                          # serve on [::]:9450 (relay) + :9451 (/health) + :3478/udp (STUN)
+                                    # dual-stack: also reachable over IPv4 on the same ports
+dig-relay --listen [::]:9450 --health-listen [::]:9451 --stun-listen [::]:3478 \
           --max-connections 4096 --idle-timeout-secs 120
 ```
 

@@ -15,11 +15,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::RelayServerConfig;
+use crate::net::bind_tcp_dual_stack;
 use crate::pex::PexRelay;
 use crate::registry::Registry;
 use crate::wire::{PexMessage, RelayMessage, RelayPeerInfo};
@@ -310,7 +310,9 @@ fn pex_dispatch(session: &Session, decoded: Option<&PexMessage>) -> PexAction {
 /// Each accepted TCP connection is upgraded to a WebSocket and handled in its own task. A background
 /// task drives the PEX housekeeping tick (RLY-008) on [`PEX_TICK_INTERVAL`].
 pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
-    let listener = TcpListener::bind(state.config.listen).await?;
+    // IPv6-first, IPv4-fallback: dual-stack bind so the default `[::]` listener still accepts
+    // IPv4 (and IPv4-mapped) peers on the same socket (see `crate::net`).
+    let listener = bind_tcp_dual_stack(state.config.listen)?;
     tracing::info!(addr = %state.config.listen, "dig-relay listening (RelayMessage/WebSocket)");
 
     // PEX housekeeping (RLY-008): drive every network's engine cadence and route its per-link deltas

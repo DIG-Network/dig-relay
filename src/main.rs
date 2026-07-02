@@ -36,13 +36,13 @@ struct Cli {
     json: bool,
 
     // ---- `serve` flags (also accepted at the top level so bare `dig-relay` serves) ----
-    /// Address the relay WebSocket listener binds (default 0.0.0.0:9450).
+    /// Address the relay WebSocket listener binds (default [::]:9450, dual-stack IPv6+IPv4).
     #[arg(long, value_name = "ADDR", global = true)]
     listen: Option<SocketAddr>,
-    /// Address the HTTP /health listener binds (default 0.0.0.0:9451).
+    /// Address the HTTP /health listener binds (default [::]:9451, dual-stack IPv6+IPv4).
     #[arg(long, value_name = "ADDR", global = true)]
     health_listen: Option<SocketAddr>,
-    /// Address the STUN (RFC 5389) UDP listener binds (default 0.0.0.0:3478).
+    /// Address the STUN (RFC 5389) UDP listener binds (default [::]:3478, dual-stack IPv6+IPv4).
     #[arg(long, value_name = "ADDR", global = true)]
     stun_listen: Option<SocketAddr>,
     /// Maximum concurrent relay connections (default 4096).

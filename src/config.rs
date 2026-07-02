@@ -1,11 +1,19 @@
 //! Relay server configuration — pure, validated, unit-tested.
 //!
 //! The relay listens for DIG-node WebSocket connections on [`RelayServerConfig::listen`]
-//! (default `0.0.0.0:9450`, matching `dig_gossip`'s `DEFAULT_RELAY_PORT`), exposes a tiny
-//! HTTP `/health` endpoint on [`RelayServerConfig::health_listen`] (default `0.0.0.0:9451`) for
+//! (default `[::]:9450`, matching `dig_gossip`'s `DEFAULT_RELAY_PORT`), exposes a tiny
+//! HTTP `/health` endpoint on [`RelayServerConfig::health_listen`] (default `[::]:9451`) for
 //! the AWS load balancer's target-group health check, and answers STUN Binding Requests on
-//! [`RelayServerConfig::stun_listen`] (default `0.0.0.0:3478`, the IANA STUN port, UDP) so a NAT'd
+//! [`RelayServerConfig::stun_listen`] (default `[::]:3478`, the IANA STUN port, UDP) so a NAT'd
 //! node can learn its public reflexive address (RFC 5389).
+//!
+//! **IPv6-first, IPv4-fallback (dig_ecosystem hard rule):** all three defaults bind the IPv6
+//! unspecified address `[::]` rather than the IPv4 wildcard `0.0.0.0`. Each bind site
+//! (`server.rs`, `health.rs`, `stun.rs`) clears `IPV6_V6ONLY` on the resulting socket via
+//! `socket2`, so the one `[::]` socket stays **dual-stack**: it accepts native IPv6 connections
+//! and IPv4 (via IPv4-mapped IPv6) connections on the same listener. A custom `--listen`/
+//! `--health-listen`/`--stun-listen` value is used verbatim (an operator who passes an explicit
+//! IPv4 address gets IPv4-only, as requested).
 //!
 //! Limits ([`max_connections`](RelayServerConfig::max_connections)) and the keepalive
 //! [`idle_timeout`](RelayServerConfig::idle_timeout) let a single relay be sized to its instance:
@@ -40,11 +48,12 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Validated relay server configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayServerConfig {
-    /// Address the relay WebSocket listener binds (default `0.0.0.0:9450`).
+    /// Address the relay WebSocket listener binds (default `[::]:9450`, dual-stack).
     pub listen: SocketAddr,
-    /// Address the HTTP `/health` listener binds (default `0.0.0.0:9451`).
+    /// Address the HTTP `/health` listener binds (default `[::]:9451`, dual-stack).
     pub health_listen: SocketAddr,
-    /// Address the STUN (RFC 5389) UDP listener binds (default `0.0.0.0:3478`, the IANA STUN port).
+    /// Address the STUN (RFC 5389) UDP listener binds (default `[::]:3478`, the IANA STUN port,
+    /// dual-stack).
     pub stun_listen: SocketAddr,
     /// Maximum concurrent relay connections; new connections past this are refused.
     pub max_connections: usize,
@@ -54,10 +63,15 @@ pub struct RelayServerConfig {
 
 impl Default for RelayServerConfig {
     fn default() -> Self {
+        // IPv6-first, IPv4-fallback (dig_ecosystem hard rule): bind the unspecified IPv6 address
+        // `[::]` rather than the IPv4 wildcard `0.0.0.0`. The TCP/UDP bind sites (server.rs,
+        // health.rs, stun.rs) then clear IPV6_V6ONLY on the resulting socket so this single `[::]`
+        // listener stays DUAL-STACK — it keeps accepting IPv4 (and IPv4-mapped) peers exactly as
+        // before, it just also accepts native IPv6 ones.
         RelayServerConfig {
-            listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_RELAY_PORT)),
-            health_listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_HEALTH_PORT)),
-            stun_listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_STUN_PORT)),
+            listen: SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, DEFAULT_RELAY_PORT)),
+            health_listen: SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, DEFAULT_HEALTH_PORT)),
+            stun_listen: SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, DEFAULT_STUN_PORT)),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         }
@@ -101,6 +115,40 @@ mod tests {
         assert!(
             c.stun_listen.ip().is_unspecified(),
             "STUN binds all interfaces by default"
+        );
+    }
+
+    /// IPv6-first, IPv4-fallback (dig_ecosystem hard rule + SPEC.md "Listener binding"): every
+    /// listener's default bind address must be the IPv6 unspecified address `[::]`, not the IPv4
+    /// wildcard `0.0.0.0`. Dual-stack (`IPV6_V6ONLY=false`, set at bind time in server.rs/health.rs/
+    /// stun.rs) then lets the one `[::]` socket still accept IPv4-mapped peers, so this is additive
+    /// to reachability, never a regression for IPv4-only clients.
+    #[test]
+    fn defaults_are_ipv6_unspecified_not_ipv4_wildcard() {
+        let c = RelayServerConfig::default();
+        assert!(
+            c.listen.is_ipv6(),
+            "relay WS listener must default to IPv6 [::], not 0.0.0.0"
+        );
+        assert_eq!(
+            c.listen.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        );
+        assert!(
+            c.health_listen.is_ipv6(),
+            "health listener must default to IPv6 [::]"
+        );
+        assert_eq!(
+            c.health_listen.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        );
+        assert!(
+            c.stun_listen.is_ipv6(),
+            "STUN listener must default to IPv6 [::]"
+        );
+        assert_eq!(
+            c.stun_listen.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
         );
     }
 

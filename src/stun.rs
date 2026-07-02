@@ -17,14 +17,14 @@
 //! Layering mirrors the rest of the crate: the codec ([`parse_binding_request`],
 //! [`build_binding_response`]) is PURE and fully unit-tested; [`run`] is the thin UDP serve loop that
 //! wires the codec to a socket. The STUN listener binds its own UDP port ([`crate::config`]
-//! `stun_listen`, default `0.0.0.0:3478` = the IANA-assigned STUN port, matching the DIG node
-//! peer-network protocol) alongside the WebSocket (9450) and health (9451) listeners.
+//! `stun_listen`, default `[::]:3478` = the IANA-assigned STUN port, matching the DIG node
+//! peer-network protocol) alongside the WebSocket (9450) and health (9451) listeners, dual-stack
+//! (see [`crate::net`]) so it answers both IPv6 and IPv4 Binding Requests on the one socket.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::net::UdpSocket;
-
+use crate::net::bind_udp_dual_stack;
 use crate::server::RelayState;
 
 /// The STUN magic cookie (RFC 5389 §6): a fixed 32-bit value in bytes 4..8 of every STUN message.
@@ -255,7 +255,9 @@ pub fn find_xor_mapped_address(message: &[u8]) -> Option<&[u8]> {
 /// A datagram that is not a valid Binding Request is dropped without a reply (a STUN server must
 /// never answer a non-STUN packet, and a stateless server ignores requests it doesn't handle).
 pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
-    let socket = UdpSocket::bind(state.config.stun_listen).await?;
+    // IPv6-first, IPv4-fallback: dual-stack bind (see `crate::net`) so the default `[::]` STUN
+    // socket answers both native-IPv6 and IPv4 Binding Requests on the one UDP port.
+    let socket = bind_udp_dual_stack(state.config.stun_listen)?;
     tracing::info!(addr = %state.config.stun_listen, "dig-relay STUN listening (RFC 5389/UDP)");
     // Max STUN message we accept. Requests are tiny; a full MTU-sized buffer is generous.
     let mut buf = [0u8; 1500];

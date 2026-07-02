@@ -13,16 +13,18 @@
 //! [`wire::PexMessage`]). See `DESIGN.md` for why this is the protocol-grade fit (and why NOT libp2p).
 //!
 //! Layering: [`wire`] is the vendored relay wire types plus the RLY-008 PEX message; [`config`] is
-//! pure validated configuration; [`registry`] is the in-memory peer registry plus pure routing
-//! decisions; [`pex`] embeds the `dig-pex` `PexEngine` for the introducer PEX binding (registry
-//! mirroring, per-network scoping, and the introducer-only discard rule); [`server`] is the
-//! WebSocket accept loop, the per-connection task, the pure `RelayMessage` dispatcher, and the PEX
-//! housekeeping tick; [`stun`] is the RFC 5389 STUN Binding responder (UDP) that tells a node its
-//! reflexive address; [`health`] is the load-balancer HTTP probe; [`service`] installs/controls the
-//! relay as an OS service (run-your-own-relay) and [`win_service`] is the Windows SCM dispatcher.
+//! pure validated configuration; [`net`] is the shared IPv6-first/IPv4-fallback dual-stack socket
+//! bind helper every listener binds through; [`registry`] is the in-memory peer registry plus pure
+//! routing decisions; [`pex`] embeds the `dig-pex` `PexEngine` for the introducer PEX binding
+//! (registry mirroring, per-network scoping, and the introducer-only discard rule); [`server`] is
+//! the WebSocket accept loop, the per-connection task, the pure `RelayMessage` dispatcher, and the
+//! PEX housekeeping tick; [`stun`] is the RFC 5389 STUN Binding responder (UDP) that tells a node
+//! its reflexive address; [`health`] is the load-balancer HTTP probe; [`service`] installs/controls
+//! the relay as an OS service (run-your-own-relay) and [`win_service`] is the Windows SCM dispatcher.
 
 pub mod config;
 pub mod health;
+pub mod net;
 pub mod pex;
 pub mod registry;
 pub mod server;
