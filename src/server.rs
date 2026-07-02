@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::config::RelayServerConfig;
 use crate::net::bind_tcp_dual_stack;
 use crate::pex::PexRelay;
-use crate::registry::Registry;
+use crate::registry::{RegisterOutcome, Registry};
 use crate::wire::{PexMessage, RelayMessage, RelayPeerInfo};
 
 /// How often the PEX housekeeping timer drives [`PexRelay::tick`] (SPEC §6, Appendix A step 4). The
@@ -40,6 +40,9 @@ pub mod errcode {
     pub const PEER_NOT_FOUND: u32 = 3;
     /// The relay is at its connection cap (RLY-001 register refused).
     pub const CAPACITY: u32 = 4;
+    /// A `Register` named a `peer_id` already held by a LIVE connection — refused so an
+    /// unauthenticated client cannot evict + impersonate an existing peer (SECURITY_AUDIT_P2P #1).
+    pub const ID_IN_USE: u32 = 5;
 }
 
 /// Shared relay state: the registry plus a connected-peer counter for `/health`.
@@ -603,17 +606,39 @@ async fn register_peer(
     // `RelayPeerInfo::new` stamps connected_at/last_seen with the current unix time.
     let info = RelayPeerInfo::new(peer_id.clone(), network_id.clone(), protocol_version);
 
-    // If a stale connection held this id, replace it (and let its task notice the channel close).
-    if let Some(prior) = reg.register(
+    // Anti-hijack (SECURITY_AUDIT_P2P dig-relay #1): the registry refuses to evict a LIVE peer that
+    // already holds this id. A genuine reconnect (dead prior channel) is reclaimed; a fresh id is a
+    // new registration that bumps the connected count.
+    match reg.register(
         peer_id.clone(),
         network_id.clone(),
         info.clone(),
         out_tx.clone(),
     ) {
-        tracing::debug!(%peer_id, "replaced a prior registration for the same id");
-        drop(prior); // closes the prior outbound channel → its writer task exits
-    } else {
-        state.connected.fetch_add(1, Ordering::Relaxed);
+        RegisterOutcome::Registered => {
+            state.connected.fetch_add(1, Ordering::Relaxed);
+        }
+        RegisterOutcome::Reconnected => {
+            // A dead slot was swapped for a live one — the count is unchanged.
+            tracing::debug!(%peer_id, "reconnect reclaimed a dead prior registration for the same id");
+        }
+        RegisterOutcome::Occupied => {
+            // A live peer holds this id: refuse rather than let an unauthenticated client evict +
+            // impersonate it. The session stays unregistered; the incumbent is untouched.
+            let connected_peers = reg.len();
+            drop(reg);
+            tracing::warn!(%peer_id, %peer_addr, "refusing register: peer_id already held by a live peer (anti-hijack)");
+            let _ = out_tx.send(RelayMessage::RegisterAck {
+                success: false,
+                message: "peer_id already registered by a live connection".to_string(),
+                connected_peers,
+            });
+            let _ = out_tx.send(RelayMessage::Error {
+                code: errcode::ID_IN_USE,
+                message: "peer_id already registered by a live connection".to_string(),
+            });
+            return false;
+        }
     }
 
     let connected_peers = reg.len();
@@ -1062,11 +1087,15 @@ mod tests {
         ));
     }
 
+    /// Anti-hijack (SECURITY_AUDIT_P2P dig-relay #1): a second `register_peer` for a `peer_id` whose
+    /// incumbent connection is still LIVE is REFUSED (failing ack + `ID_IN_USE` error), the session
+    /// stays unregistered, the count does not change, and the incumbent's sender is NOT replaced — so
+    /// an unauthenticated client cannot evict + impersonate an existing peer's rendezvous.
     #[tokio::test]
-    async fn register_peer_replacing_same_id_does_not_double_count() {
-        // A reconnect under an existing id replaces the prior record WITHOUT incrementing the count.
+    async fn register_peer_refuses_to_evict_a_live_incumbent() {
         let state = RelayState::new(RelayServerConfig::default());
-        let (tx1, _rx1) = mpsc::unbounded_channel();
+        // First peer registers with a LIVE outbound channel (rx1 held).
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
         let mut s1 = Session::default();
         assert!(
             register_peer(
@@ -1082,6 +1111,92 @@ mod tests {
             .await
         );
         assert_eq!(state.connected.load(Ordering::Relaxed), 1);
+        // Drain the incumbent's own RegisterAck so we can later prove its channel still routes.
+        assert!(matches!(
+            drain(&mut rx1)[0],
+            RelayMessage::RegisterAck { success: true, .. }
+        ));
+
+        // A hijack attempt under the same id while the incumbent is live.
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let mut s2 = Session::default();
+        let ok = register_peer(
+            &state,
+            &mut s2,
+            "p".into(),
+            "net".into(),
+            1,
+            test_addr(),
+            &tx2,
+            &pex_sink(),
+        )
+        .await;
+        assert!(!ok, "a duplicate-id register against a live peer must fail");
+        assert!(
+            s2.peer_id.is_none(),
+            "the hijacker's session stays unregistered"
+        );
+        assert_eq!(
+            state.connected.load(Ordering::Relaxed),
+            1,
+            "the refused register must not change the count"
+        );
+        assert_eq!(state.registry.lock().await.len(), 1);
+
+        // The hijacker gets a failing ack + the ID_IN_USE error.
+        let msgs = drain(&mut rx2);
+        assert!(matches!(
+            msgs[0],
+            RelayMessage::RegisterAck { success: false, .. }
+        ));
+        assert!(matches!(
+            msgs[1],
+            RelayMessage::Error {
+                code: errcode::ID_IN_USE,
+                ..
+            }
+        ));
+
+        // The incumbent still owns the id: a forward to "p" reaches tx1, never tx2.
+        state
+            .registry
+            .lock()
+            .await
+            .sender_in_network("p", "net")
+            .expect("incumbent keeps its slot")
+            .send(RelayMessage::Ping { timestamp: 1 })
+            .unwrap();
+        assert_eq!(
+            drain(&mut rx1).len(),
+            1,
+            "the incumbent still receives routed traffic"
+        );
+        assert!(drain(&mut rx2).is_empty(), "the hijacker receives nothing");
+    }
+
+    /// A genuine reconnect: when the prior connection's channel is CLOSED (its task tore down), the
+    /// same id may be reclaimed WITHOUT double-counting.
+    #[tokio::test]
+    async fn register_peer_reconnect_reclaims_a_dead_incumbent_without_double_count() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (tx1, rx1) = mpsc::unbounded_channel();
+        let mut s1 = Session::default();
+        assert!(
+            register_peer(
+                &state,
+                &mut s1,
+                "p".into(),
+                "net".into(),
+                1,
+                test_addr(),
+                &tx1,
+                &pex_sink()
+            )
+            .await
+        );
+        assert_eq!(state.connected.load(Ordering::Relaxed), 1);
+        // The prior connection dies: its receiver drops → tx1 is closed.
+        drop(rx1);
 
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         let mut s2 = Session::default();
@@ -1096,15 +1211,15 @@ mod tests {
                 &tx2,
                 &pex_sink()
             )
-            .await
+            .await,
+            "a reconnect over a dead prior connection must succeed"
         );
         assert_eq!(
             state.connected.load(Ordering::Relaxed),
             1,
-            "replacing the same id must not double-count"
+            "reclaiming a dead slot must not double-count"
         );
         assert_eq!(state.registry.lock().await.len(), 1);
-        // The new connection still gets a success ack.
         assert!(matches!(
             drain(&mut rx2)[0],
             RelayMessage::RegisterAck { success: true, .. }
