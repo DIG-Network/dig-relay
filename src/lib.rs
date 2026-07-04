@@ -19,8 +19,11 @@
 //! (registry mirroring, per-network scoping, and the introducer-only discard rule); [`server`] is
 //! the WebSocket accept loop, the per-connection task, the pure `RelayMessage` dispatcher, and the
 //! PEX housekeeping tick; [`stun`] is the RFC 5389 STUN Binding responder (UDP) that tells a node
-//! its reflexive address; [`health`] is the load-balancer HTTP probe; [`service`] installs/controls
-//! the relay as an OS service (run-your-own-relay) and [`win_service`] is the Windows SCM dispatcher.
+//! its reflexive address; [`health`] is the load-balancer HTTP probe; [`tls`] is the OPTIONAL mTLS
+//! termination for the relay listener (`RelayServerConfig::tls_cert_path`/`tls_key_path`) that
+//! proves `Register` proof-of-possession of the claimed `peer_id` (SPEC.md §3.2/§8); [`service`]
+//! installs/controls the relay as an OS service (run-your-own-relay) and [`win_service`] is the
+//! Windows SCM dispatcher.
 
 pub mod config;
 pub mod health;
@@ -30,6 +33,7 @@ pub mod registry;
 pub mod server;
 pub mod service;
 pub mod stun;
+pub mod tls;
 pub mod wire;
 
 #[cfg(windows)]
@@ -53,7 +57,34 @@ pub async fn serve_with_shutdown(
     config
         .validate()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let state = RelayState::new(config);
+
+    // Optional mTLS termination (SPEC.md §3.2/§8): when both paths are configured, load the
+    // relay's own TLS identity and build the client-cert-mandatory server config once at startup.
+    // `validate()` above already rejected exactly-one-of-the-two-set, so here it's all-or-nothing.
+    let tls = match (&config.tls_cert_path, &config.tls_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_pem = std::fs::read(cert_path).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("dig-relay: could not read tls_cert_path {cert_path:?}: {e}"),
+                )
+            })?;
+            let key_pem = std::fs::read(key_path).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("dig-relay: could not read tls_key_path {key_path:?}: {e}"),
+                )
+            })?;
+            let (chain, key) = tls::load_pem_identity(&cert_pem, &key_pem)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let server_config = tls::build_server_config(chain, key)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            tracing::info!("dig-relay: mTLS enabled on the relay listener (client cert required)");
+            Some(server_config)
+        }
+        _ => None,
+    };
+    let state = RelayState::new_with_tls(config, tls);
 
     let relay = server::run(state.clone());
     let health = health::run(state.clone());

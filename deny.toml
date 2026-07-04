@@ -53,6 +53,9 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "GPL-2.0-only",
+    # `ring`/`rustls-webpki`/`untrusted` (mTLS listener, `src/tls.rs` — issue #5 proof-of-possession)
+    # are OpenSSL-derivative-licensed under ISC, a permissive OSI-approved/FSF-free license.
+    "ISC",
 ]
 confidence-threshold = 0.8
 

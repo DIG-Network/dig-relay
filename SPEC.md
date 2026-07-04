@@ -85,13 +85,13 @@ byte-identically into `src/wire.rs` (pinned by `tests/wire_conformance.rs`). Mes
 | RLY-006 Keepalive | `Ping`/`Pong` | Bidirectional liveness; an idle connection past `idle_timeout` is reaped. |
 | RLY-007 Hole-punch coordination | `HolePunchRequest{peer_id,target_peer_id,external_addr}` → `HolePunchCoordinate{peer_id,external_addr}` (to target) → `HolePunchResult` | Exchanges each side's STUN-derived reflexive address so both peers can attempt a simultaneous-open hole punch; the relay carries no application data for this path. |
 | RLY-008 Peer Exchange (PEX) | `pex_handshake` / `pex_snapshot` / `pex_delta` / `pex_error` | Purely additive introducer PUSH binding (§4). |
-| Errors | `Error{code,message}` | Stable envelope: `1=NOT_REGISTERED`, `2=BAD_MESSAGE`, `3=PEER_NOT_FOUND`, `4=CAPACITY`, `5=ID_IN_USE`. |
+| Errors | `Error{code,message}` | Stable envelope: `1=NOT_REGISTERED`, `2=BAD_MESSAGE`, `3=PEER_NOT_FOUND`, `4=CAPACITY`, `5=ID_IN_USE`, `6=IDENTITY_MISMATCH` (§3.2). |
 
 A message before RLY-001 registration (other than `Register` itself) is answered with
 `Error{code:1}`. Full message shapes are frozen by `tests/wire_conformance.rs`; a shape change here
 requires a matching change in `dig-gossip` in the same unit of work (see `SYSTEM.md`).
 
-### 3.2 Registration identity — peer-ID occupancy (normative)
+### 3.2 Registration identity — peer-ID occupancy + proof-of-possession (normative)
 
 A `peer_id` is the hex `SHA-256(TLS SPKI DER)` of the node's identity key (matching `dig-gossip`).
 The relay MUST NOT let a `Register` for a `peer_id` that is **already held by a live connection**
@@ -104,19 +104,37 @@ that reclaim replaces the dead record without changing `connected_peers`.
 This closes an unauthenticated peer-ID hijack: without it, any client could register a `peer_id`
 belonging to a live peer, evict it, and thereafter receive every message routed to that id. It does
 NOT by itself prove the registrant owns the identity key `peer_id` commits to — that
-proof-of-possession is the node-class transport requirement below and is enforced end-to-end once the
-signed-`Register` / mTLS binding lands ecosystem-wide.
+proof-of-possession is provided by the OPTIONAL mTLS listener below.
 
-**Proof-of-possession (planned, coordinated).** The DIG ecosystem mandates that a node-class client
-prove possession of its identity key when registering (`peer_id == SHA-256(client-cert SPKI DER)`
-under mTLS, or a signed `Register` over a relay nonce). In the canonical `relay.dig.net` deployment
-TLS is terminated at the load balancer (§8), so the relay container cannot see a client certificate;
-binding `peer_id` to a proof therefore requires either an mTLS-terminating gateway or a signed-
-`Register` wire extension mirrored byte-for-byte in `dig-gossip`'s `relay_types.rs`. Until that
-coordinated cross-repo change ships, the live-incumbent refusal above is the enforced protection and
-payloads remain end-to-end authenticated by the gossip layer (§8). Adding the proof-of-possession
-field is a purely-additive `Register` extension (a new optional field + a new `Error` code); it MUST
-be introduced in the same unit of work across `dig-relay` and `dig-gossip`.
+**Proof-of-possession via mTLS (implemented, opt-in).** When the relay is configured with
+`tls_cert_path`/`tls_key_path` (§7), it terminates TLS itself on the relay listener (`wss://`
+instead of `ws://`) and REQUIRES every connecting client to present a TLS client certificate
+(`src/tls.rs`). The relay does not validate a certificate chain — DIG peer certificates are
+self-signed and the *public key itself* is the identity, matching `dig-nat`/`dig-gossip`'s
+`peer_id = SHA-256(TLS SPKI DER)` model — it only requires a well-formed, parseable X.509 leaf. The
+TLS handshake itself is the proof of possession: TLS client authentication requires the client to
+cryptographically sign the handshake transcript with the private key matching its certificate, which
+rustls verifies during the handshake; a client cannot complete the connection without holding that
+key. After the handshake, the relay derives `peer_id` from the certificate the client actually
+presented (`extract_client_peer_id`) and REQUIRES the `Register` message's claimed `peer_id` to equal
+it — a mismatch is REFUSED with `RegisterAck{success:false}` + `Error{code:6, IDENTITY_MISMATCH}`
+before the registry is touched at all (this check runs even before the capacity check, §3.0). A
+connection presenting no client certificate never reaches the `RelayMessage` wire — mandatory client
+auth fails the TLS handshake itself.
+
+This design requires **no `Register` wire change and no `dig-gossip` coordination**: the proof lives
+entirely at the TLS transport layer, and the wire's pre-existing `peer_id` field is simply checked
+against the transport identity rather than trusted blindly. `Error` code `6` is a purely-additive
+addition to the existing numeric error taxonomy (§3), not a shape change.
+
+**When mTLS is not configured (default).** The relay speaks plain `ws://`, matching the canonical
+`relay.dig.net` deployment where TLS is terminated at the load balancer (§8) and the relay process
+cannot see a client certificate. On that listener, identity remains unauthenticated at the transport
+layer and the live-incumbent refusal above is the only protection; payloads remain end-to-end
+authenticated by the gossip layer (§8) regardless. Enabling mTLS end-to-end for the canonical
+deployment requires the load balancer to pass TLS through rather than terminate it (an infra change,
+tracked separately — see `DESIGN.md` / the superproject's private `infra/dig-relay/`), or running a
+private relay (`dig-relay install`/`start`) with `--tls-cert`/`--tls-key` set directly.
 
 ### 3.0 Resource bounds (normative)
 
@@ -231,23 +249,36 @@ collide with the relay WebSocket.
 | `outbound_queue_capacity` | 1024 | MUST be ≥ 1 (per-connection queue bound, §3.0) |
 | `max_message_bytes` | 262144 | MUST be ≥ 1 (inbound frame size bound, §3.0) |
 | `register_timeout` | 10 s | MUST be > 0 (register deadline, §3.0) |
+| `tls_cert_path` | `None` | Optional; MUST be set together with `tls_key_path` (§3.2/§8) |
+| `tls_key_path` | `None` | Optional; MUST be set together with `tls_cert_path` (§3.2/§8) |
 
 `validate()` rejects `max_connections == 0`, a zero `idle_timeout`, a zero `outbound_queue_capacity`,
-a zero `max_message_bytes`, and a zero `register_timeout` with a stable error string. Config may be
-built from CLI flags (`main.rs`, `clap`) or environment variables consumed by the service installer
-(`DIG_RELAY_LISTEN`, `DIG_RELAY_HEALTH_LISTEN`, `DIG_RELAY_STUN_LISTEN`, `DIG_RELAY_MAX_CONNECTIONS`,
-`DIG_RELAY_STUN_PER_IP_RPS`, `DIG_RELAY_STUN_GLOBAL_RPS`, `DIG_RELAY_OUTBOUND_QUEUE_CAPACITY`,
-`DIG_RELAY_MAX_MESSAGE_BYTES`, `DIG_RELAY_REGISTER_TIMEOUT_SECS` — see
+a zero `max_message_bytes`, a zero `register_timeout`, and exactly one of `tls_cert_path`/
+`tls_key_path` being set, with a stable error string. Config may be built from CLI flags (`main.rs`,
+`clap` — `--tls-cert`/`--tls-key` alongside the others) or environment variables consumed by the
+service installer (`DIG_RELAY_LISTEN`, `DIG_RELAY_HEALTH_LISTEN`, `DIG_RELAY_STUN_LISTEN`,
+`DIG_RELAY_MAX_CONNECTIONS`, `DIG_RELAY_STUN_PER_IP_RPS`, `DIG_RELAY_STUN_GLOBAL_RPS`,
+`DIG_RELAY_OUTBOUND_QUEUE_CAPACITY`, `DIG_RELAY_MAX_MESSAGE_BYTES`,
+`DIG_RELAY_REGISTER_TIMEOUT_SECS`, `DIG_RELAY_TLS_CERT_PATH`, `DIG_RELAY_TLS_KEY_PATH` — see
 `src/service.rs::config_from_env`), so an installed OS service serves identically to a manually-run
 `dig-relay serve` with the same flags.
 
 ## 8. Transport security
 
-The relay speaks plain `ws://`/UDP internally; TLS (`wss://`) is terminated at the load balancer in
-the canonical `relay.dig.net` deployment. `RelayMessage` payloads carry gossip data that is itself
-authenticated end-to-end by the gossip layer (peers verify each other via the Chia TLS-SPKI
-`peer_id` and consensus BLS keys) — the relay is an untrusted forwarder that routes by `peer_id`
-without needing to inspect or trust payload contents.
+By DEFAULT the relay speaks plain `ws://`/UDP internally; TLS (`wss://`) is terminated at the load
+balancer in the canonical `relay.dig.net` deployment. `RelayMessage` payloads carry gossip data that
+is itself authenticated end-to-end by the gossip layer (peers verify each other via the Chia
+TLS-SPKI `peer_id` and consensus BLS keys) — the relay is an untrusted forwarder that routes by
+`peer_id` without needing to inspect or trust payload contents.
+
+**Optional mTLS termination (`src/tls.rs`).** When `tls_cert_path`/`tls_key_path` are configured
+(§7), the relay terminates TLS itself on the relay listener using `rustls` (pure Rust — reliable
+client-certificate capture on every OS, unlike OS-native TLS backends) and REQUIRES a client
+certificate on every connection (`AnyClientCertVerifier::client_auth_mandatory`); §3.2 is the
+normative registration-identity contract this enables. The relay's own TLS identity
+(`tls_cert_path`/`tls_key_path`) may itself be a throwaway self-signed certificate — it authenticates
+the SERVER side of the channel only and is unrelated to any `peer_id`. The STUN (UDP) and `/health`
+listeners are UNAFFECTED by this setting; only the relay WebSocket listener terminates TLS.
 
 ## 9. Operational contract
 
@@ -274,5 +305,10 @@ without needing to inspect or trust payload contents.
   disconnect notification) over real WebSocket connections.
 - `src/net.rs`'s unit tests prove the dual-stack bind (§2.1): an `[::]`-bound TCP listener/UDP socket
   accepts an IPv4 loopback client/datagram on the same port, and an explicit IPv4 bind is unaffected.
+- `tests/mtls.rs` proves the mTLS proof-of-possession contract (§3.2) end-to-end over real TCP
+  sockets: a client registering the `peer_id` its own certificate commits to is accepted; a client
+  registering a different (spoofed) `peer_id` is refused with `IDENTITY_MISMATCH`; a connection with
+  no client certificate never reaches the `RelayMessage` wire; `/health` stays plain HTTP regardless.
+  `src/tls.rs`'s own unit tests cover the handshake/identity-derivation plumbing directly.
 
 A change to any behavior in this document MUST update this SPEC in the same unit of work.

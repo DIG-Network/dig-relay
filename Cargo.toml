@@ -1,6 +1,6 @@
 [package]
 name = "dig-relay"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Relay — NAT-traversal rendezvous + circuit relay so DIG Nodes establish peer connections across NAT."
@@ -25,9 +25,27 @@ path = "src/main.rs"
 # serde + std, so vendoring them is small, robust, and kept locked by a serde-shape conformance
 # test (`tests/wire_conformance.rs`). SYSTEM.md records the change-impact edge so the two stay synced.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
-# Plain ws:// WebSocket framing (TLS is terminated at the AWS load balancer; see DESIGN.md).
+# Plain ws:// WebSocket framing by default (TLS is terminated at the AWS load balancer in the
+# canonical relay.dig.net deployment; see DESIGN.md). `tokio_tungstenite::accept_async`/
+# `client_async` are transport-generic, so the OPTIONAL mTLS listener (`src/tls.rs`, config
+# `tls_cert_path`/`tls_key_path`) wraps the raw `TcpStream` in a `tokio_rustls` stream BEFORE
+# handing it to tungstenite — no tungstenite TLS feature needed.
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Optional mTLS termination on the relay's own listener (SPEC.md §3.2/§8): when an operator
+# configures `tls_cert_path`/`tls_key_path`, the relay itself terminates TLS and REQUIRES a client
+# certificate, deriving `peer_id = SHA-256(TLS SPKI DER)` from it (matching `dig-nat`/`dig-gossip`'s
+# identity model — CLAUDE.md §5.2/§5.3). Pure-Rust rustls (not native-tls) so peer-cert capture is
+# reliable on every OS (native-tls hides the client leaf on Windows/macOS — see dig-gossip's
+# `connection/listener.rs` module docs), matching the versions already used by `dig-nat`/`dig-rpc`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# PEM parsing via rustls-pki-types' own `PemObject` trait (not the separate `rustls-pemfile` crate,
+# which is unmaintained as of RUSTSEC-2025-0134 and just wraps this same code) — already a
+# transitive dependency of rustls; declared directly because we call its API.
+rustls-pki-types = "1"
+x509-parser = "0.16"
+sha2 = "0.10"
 # Tiny HTTP /health endpoint for the load balancer target-group check.
 axum = "0.7"
 clap = { version = "4", features = ["derive"] }
@@ -60,6 +78,10 @@ windows-service = "0.7"
 # End-to-end integration test: drive two simulated peers (WebSocket clients) whose direct
 # path is blocked and assert they exchange a message THROUGH the running relay.
 tokio-tungstenite = "0.24"
+# Generate throwaway self-signed certs in-memory for the mTLS test suite (`tests/mtls.rs` +
+# `src/tls.rs` unit tests) — DIG peer certs are self-signed by design (no CA), so this is the
+# exact shape a real DIG node identity takes. Version matches `dig-nat`'s dev-dependency.
+rcgen = "0.13"
 
 [profile.release]
 overflow-checks = true

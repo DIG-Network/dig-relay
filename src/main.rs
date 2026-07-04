@@ -3,8 +3,11 @@
 //! Serves the DIG relay protocol (RLY-001..RLY-007) over WebSocket so DIG Nodes behind NAT can
 //! register, discover peers, coordinate hole-punching, and fall back to relayed transport. The
 //! canonical deployment is `relay.dig.net`; nodes may also run their own (installable via the DIG
-//! installer, which delegates to the `install`/`start` subcommands below). TLS is terminated at the
-//! load balancer in production (DESIGN.md), so the process speaks plain `ws://` internally.
+//! installer, which delegates to the `install`/`start` subcommands below). By default TLS is
+//! terminated at the load balancer in production (DESIGN.md), so the process speaks plain `ws://`
+//! internally. Passing `--tls-cert`/`--tls-key` switches the relay to terminating mTLS itself,
+//! REQUIRING a client certificate and binding `Register`'s `peer_id` to it (proof-of-possession —
+//! SPEC.md §3.2/§8).
 //!
 //! Subcommands: `serve` (default) · `install`/`uninstall` (register as an OS service) ·
 //! `start`/`stop`/`status` (control it) · `run-service` (Windows SCM entrypoint, not run by hand).
@@ -66,6 +69,15 @@ struct Cli {
     /// Seconds an accepted connection has to Register before being dropped (default 10).
     #[arg(long, value_name = "SECS", global = true)]
     register_timeout_secs: Option<u64>,
+    /// Path to the relay's own TLS certificate (PEM). Set together with --tls-key to make the relay
+    /// terminate mTLS itself: every client MUST present a certificate, and a `Register`'s `peer_id`
+    /// must match the one derived from it (proof-of-possession, SPEC.md §3.2/§8). Unset (default):
+    /// the relay speaks plain ws:// (TLS terminated upstream, e.g. the relay.dig.net load balancer).
+    #[arg(long, value_name = "PATH", global = true)]
+    tls_cert: Option<std::path::PathBuf>,
+    /// Path to the relay's own TLS private key (PEM), paired with --tls-cert.
+    #[arg(long, value_name = "PATH", global = true)]
+    tls_key: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -126,6 +138,12 @@ fn apply_overrides(mut config: RelayServerConfig, cli: &Cli) -> RelayServerConfi
     }
     if let Some(s) = cli.register_timeout_secs {
         config.register_timeout = Duration::from_secs(s);
+    }
+    if let Some(p) = cli.tls_cert.clone() {
+        config.tls_cert_path = Some(p);
+    }
+    if let Some(p) = cli.tls_key.clone() {
+        config.tls_key_path = Some(p);
     }
     config
 }
@@ -365,6 +383,36 @@ mod tests {
         assert_eq!(out.outbound_queue_capacity, 256);
         assert_eq!(out.max_message_bytes, 4096);
         assert_eq!(out.register_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn apply_overrides_applies_tls_cert_and_key_paths() {
+        let base = RelayServerConfig::default();
+        let cli = parse(&[
+            "serve",
+            "--tls-cert",
+            "/etc/dig-relay/cert.pem",
+            "--tls-key",
+            "/etc/dig-relay/key.pem",
+        ]);
+        let out = apply_overrides(base, &cli);
+        assert_eq!(
+            out.tls_cert_path,
+            Some(std::path::PathBuf::from("/etc/dig-relay/cert.pem"))
+        );
+        assert_eq!(
+            out.tls_key_path,
+            Some(std::path::PathBuf::from("/etc/dig-relay/key.pem"))
+        );
+    }
+
+    #[test]
+    fn apply_overrides_leaves_tls_paths_unset_when_no_flags() {
+        let base = RelayServerConfig::default();
+        let cli = parse(&["serve"]);
+        let out = apply_overrides(base, &cli);
+        assert!(out.tls_cert_path.is_none());
+        assert!(out.tls_key_path.is_none());
     }
 
     #[test]

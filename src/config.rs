@@ -101,6 +101,17 @@ pub struct RelayServerConfig {
     pub max_message_bytes: usize,
     /// Time an accepted connection has to complete RLY-001 `Register` before it is dropped.
     pub register_timeout: Duration,
+    /// Optional path to the relay's OWN TLS certificate (PEM). When set together with
+    /// [`tls_key_path`](Self::tls_key_path), the relay terminates TLS itself on [`listen`](Self::listen)
+    /// and REQUIRES every client to present a certificate (mTLS) — `src/tls.rs` derives
+    /// `peer_id = SHA-256(TLS SPKI DER)` from it and `src/server.rs::register_peer` requires the
+    /// `Register` message's claimed `peer_id` to match (SPEC.md §3.2/§8, proof-of-possession).
+    /// `None` (the default) keeps the relay speaking plain `ws://`, matching the canonical
+    /// `relay.dig.net` deployment where TLS is terminated at the load balancer.
+    pub tls_cert_path: Option<std::path::PathBuf>,
+    /// Optional path to the relay's OWN TLS private key (PEM), paired with
+    /// [`tls_cert_path`](Self::tls_cert_path).
+    pub tls_key_path: Option<std::path::PathBuf>,
 }
 
 impl Default for RelayServerConfig {
@@ -121,6 +132,8 @@ impl Default for RelayServerConfig {
             outbound_queue_capacity: DEFAULT_OUTBOUND_QUEUE_CAPACITY,
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             register_timeout: Duration::from_secs(DEFAULT_REGISTER_TIMEOUT_SECS),
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }
@@ -145,6 +158,9 @@ impl RelayServerConfig {
         }
         if self.register_timeout.is_zero() {
             return Err("register_timeout must be > 0".to_string());
+        }
+        if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            return Err("tls_cert_path and tls_key_path must be set together".to_string());
         }
         Ok(())
     }
@@ -272,6 +288,42 @@ mod tests {
             ..Default::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn tls_paths_default_to_unset_and_are_valid() {
+        let c = RelayServerConfig::default();
+        assert!(c.tls_cert_path.is_none());
+        assert!(c.tls_key_path.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn tls_cert_path_without_key_path_is_rejected() {
+        let c = RelayServerConfig {
+            tls_cert_path: Some("cert.pem".into()),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn tls_key_path_without_cert_path_is_rejected() {
+        let c = RelayServerConfig {
+            tls_key_path: Some("key.pem".into()),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn tls_cert_path_and_key_path_together_is_valid() {
+        let c = RelayServerConfig {
+            tls_cert_path: Some("cert.pem".into()),
+            tls_key_path: Some("key.pem".into()),
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
     }
 
     /// The DoS-hardening defaults (SECURITY_AUDIT_P2P dig-relay #3/#4/#5) are all present and sane out
