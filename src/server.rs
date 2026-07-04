@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -43,6 +44,11 @@ pub mod errcode {
     /// A `Register` named a `peer_id` already held by a LIVE connection — refused so an
     /// unauthenticated client cannot evict + impersonate an existing peer (SECURITY_AUDIT_P2P #1).
     pub const ID_IN_USE: u32 = 5;
+    /// mTLS is active on this listener and the `Register`'s claimed `peer_id` does NOT match the
+    /// `peer_id` derived from the client certificate actually used for this TLS session — refused so
+    /// a peer cannot register an id it does not hold the key for (proof-of-possession, SPEC.md
+    /// §3.2/§8, super-repo issue `DIG-Network/dig_ecosystem#5`).
+    pub const IDENTITY_MISMATCH: u32 = 6;
 }
 
 /// Shared relay state: the registry plus a connected-peer counter for `/health`.
@@ -65,11 +71,25 @@ pub struct RelayState {
     pub started: SystemTime,
     /// Validated config.
     pub config: RelayServerConfig,
+    /// The relay's mTLS server config (`src/tls.rs`), built once at startup from
+    /// [`RelayServerConfig::tls_cert_path`]/`tls_key_path`. `None` keeps the listener plain `ws://`
+    /// (the default — SPEC.md §3.2/§8).
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl RelayState {
-    /// Build shared state from a validated config.
+    /// Build shared state from a validated config, with mTLS disabled (plain `ws://`). Most tests
+    /// use this; TLS-specific tests use [`RelayState::new_with_tls`].
     pub fn new(config: RelayServerConfig) -> Arc<Self> {
+        RelayState::new_with_tls(config, None)
+    }
+
+    /// Build shared state from a validated config and an OPTIONAL pre-built mTLS server config
+    /// (`Some` enables client-cert-mandatory TLS termination on the relay listener — SPEC.md §3.2/§8).
+    pub fn new_with_tls(
+        config: RelayServerConfig,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) -> Arc<Self> {
         Arc::new(RelayState {
             registry: Mutex::new(Registry::new()),
             pex: Mutex::new(PexRelay::new()),
@@ -77,6 +97,7 @@ impl RelayState {
             open_connections: AtomicU64::new(0),
             started: SystemTime::now(),
             config,
+            tls,
         })
     }
 
@@ -351,6 +372,13 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
     // to the matching connection's PEX channel. Runs for the lifetime of the accept loop.
     tokio::spawn(pex_housekeeping(state.clone()));
 
+    // Optional mTLS termination (SPEC.md §3.2/§8, `src/tls.rs`): when configured, every accepted TCP
+    // connection is first wrapped in a client-cert-mandatory TLS handshake; the `peer_id` derived
+    // from the certificate the client actually used is threaded into `handle_connection` so
+    // `register_peer` can require the `Register` message's claimed `peer_id` to match it
+    // (proof-of-possession). `None` keeps the listener plain `ws://`, unchanged from before.
+    let tls_acceptor = state.tls.clone().map(tokio_rustls::TlsAcceptor::from);
+
     loop {
         let (stream, peer_addr) = match listener.accept().await {
             Ok(v) => v,
@@ -360,11 +388,35 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
             }
         };
         let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(state, stream, peer_addr).await {
-                tracing::debug!(error = %e, %peer_addr, "connection ended");
+        match tls_acceptor.clone() {
+            Some(acceptor) => {
+                tokio::spawn(async move {
+                    let tls_stream = match acceptor.accept(stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            // A client with no certificate (mandatory client auth), an unparseable
+                            // certificate, or any other TLS failure never reaches the RelayMessage
+                            // wire at all — rejected at the transport layer.
+                            tracing::debug!(error = %e, %peer_addr, "mTLS handshake failed");
+                            return;
+                        }
+                    };
+                    let verified_peer_id = crate::tls::extract_client_peer_id(&tls_stream);
+                    if let Err(e) =
+                        handle_connection(state, tls_stream, peer_addr, verified_peer_id).await
+                    {
+                        tracing::debug!(error = %e, %peer_addr, "connection ended");
+                    }
+                });
             }
-        });
+            None => {
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(state, stream, peer_addr, None).await {
+                        tracing::debug!(error = %e, %peer_addr, "connection ended");
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -385,11 +437,22 @@ async fn pex_housekeeping(state: Arc<RelayState>) {
 /// close. A dedicated writer task drains the peer's outbound channel onto the socket so messages
 /// forwarded by OTHER connections are delivered concurrently with this connection's own replies.
 /// PEX frames (RLY-008) ride a parallel outbound channel merged by the same writer.
-async fn handle_connection(
+///
+/// Generic over the transport (`S`) so the SAME dispatch/registration logic serves both the plain
+/// `ws://` path (`S = tokio::net::TcpStream`) and the optional mTLS path
+/// (`S = tokio_rustls::server::TlsStream<tokio::net::TcpStream>`, SPEC.md §3.2/§8) with no
+/// duplicated code. `verified_peer_id` is `Some(id)` when mTLS derived an identity from the
+/// client's certificate for this connection (`crate::tls::extract_client_peer_id`); `register_peer`
+/// requires the `Register` message's claimed `peer_id` to equal it.
+async fn handle_connection<S>(
     state: Arc<RelayState>,
-    stream: tokio::net::TcpStream,
+    stream: S,
     peer_addr: std::net::SocketAddr,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    verified_peer_id: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Connection cap (SECURITY_AUDIT_P2P dig-relay #5): count OPEN sockets, not just registered peers,
     // so a flood of connect-but-never-register sockets can't bypass the cap. The guard increments the
     // open-connection counter here and decrements it on ANY exit path (RAII), so the count can never
@@ -532,6 +595,7 @@ async fn handle_connection(
                     peer_addr,
                     &out_tx,
                     &pex_tx,
+                    verified_peer_id.as_deref(),
                 )
                 .await
                 {
@@ -641,6 +705,17 @@ async fn handle_pex_frame(
 /// entry (`via: introducer`, its observed reflexive `peer_addr`, `relay-only`), and its PEX sender is
 /// retained for tick-driven deltas. Mirroring happens for EVERY registration — a legacy node that
 /// never speaks PEX is still a real peer other nodes must learn about.
+///
+/// # Proof-of-possession (SPEC.md §3.2/§8, `DIG-Network/dig_ecosystem#5`)
+///
+/// `verified_peer_id` is `Some(id)` when the connection came in over the relay's mTLS listener
+/// (`crate::tls::extract_client_peer_id`) — `id` is derived from the certificate the client actually
+/// presented for THIS TLS session, which it could only do by holding the matching private key. When
+/// set, the claimed `peer_id` MUST equal it; a mismatch is refused BEFORE touching the registry
+/// (failing `register_ack` + `errcode::IDENTITY_MISMATCH`), exactly like the capacity/anti-hijack
+/// refusals below. `None` (plain `ws://`, the default) skips this check — identity is unauthenticated
+/// on that listener, same as before this feature (the registry's live-incumbent refusal in
+/// `src/registry.rs` is the only protection there).
 #[allow(clippy::too_many_arguments)]
 async fn register_peer(
     state: &Arc<RelayState>,
@@ -651,8 +726,33 @@ async fn register_peer(
     peer_addr: std::net::SocketAddr,
     out_tx: &mpsc::Sender<RelayMessage>,
     pex_tx: &mpsc::Sender<PexMessage>,
+    verified_peer_id: Option<&str>,
 ) -> bool {
     let mut reg = state.registry.lock().await;
+
+    if let Some(verified) = verified_peer_id {
+        if verified != peer_id {
+            let connected_peers = reg.len();
+            drop(reg);
+            tracing::warn!(
+                claimed = %peer_id,
+                %verified,
+                %peer_addr,
+                "refusing register: claimed peer_id does not match the mTLS client certificate"
+            );
+            let _ = out_tx.try_send(RelayMessage::RegisterAck {
+                success: false,
+                message: "peer_id does not match the mTLS client certificate presented".to_string(),
+                connected_peers,
+            });
+            let _ = out_tx.try_send(RelayMessage::Error {
+                code: errcode::IDENTITY_MISMATCH,
+                message: "peer_id does not match the mTLS client certificate presented".to_string(),
+            });
+            return false;
+        }
+    }
+
     if reg.len() >= state.config.max_connections {
         let _ = out_tx.try_send(RelayMessage::RegisterAck {
             success: false,
@@ -1110,6 +1210,7 @@ mod tests {
             test_addr(),
             &tx,
             &pex_sink(),
+            None,
         )
         .await;
         assert!(ok);
@@ -1159,6 +1260,7 @@ mod tests {
             test_addr(),
             &tx,
             &pex_sink(),
+            None,
         )
         .await;
         assert!(!ok, "register must fail at capacity");
@@ -1198,7 +1300,8 @@ mod tests {
                 1,
                 test_addr(),
                 &tx1,
-                &pex_sink()
+                &pex_sink(),
+                None,
             )
             .await
         );
@@ -1221,6 +1324,7 @@ mod tests {
             test_addr(),
             &tx2,
             &pex_sink(),
+            None,
         )
         .await;
         assert!(!ok, "a duplicate-id register against a live peer must fail");
@@ -1282,7 +1386,8 @@ mod tests {
                 1,
                 test_addr(),
                 &tx1,
-                &pex_sink()
+                &pex_sink(),
+                None,
             )
             .await
         );
@@ -1301,7 +1406,8 @@ mod tests {
                 1,
                 test_addr(),
                 &tx2,
-                &pex_sink()
+                &pex_sink(),
+                None,
             )
             .await,
             "a reconnect over a dead prior connection must succeed"
@@ -1672,10 +1778,127 @@ mod tests {
             addr,
             &out_tx,
             &pex_tx,
+            None,
         )
         .await;
         assert!(ok, "registration should succeed");
         (session, out_rx, pex_tx, pex_rx)
+    }
+
+    // ---- Proof-of-possession (mTLS `verified_peer_id`, SPEC.md §3.2/§8, issue #5) ----
+    //
+    // These exercise `register_peer`'s identity check directly (no real TLS socket needed — the
+    // dedicated end-to-end mTLS handshake is covered by `tests/mtls.rs` and `src/tls.rs`'s own
+    // handshake tests). `verified_peer_id` stands in for whatever `crate::tls::extract_client_peer_id`
+    // derived from the actual certificate used for the connection.
+
+    #[tokio::test]
+    async fn register_peer_accepts_a_claimed_id_matching_the_verified_certificate_identity() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut session = Session::default();
+
+        let ok = register_peer(
+            &state,
+            &mut session,
+            "abc123".into(),
+            "net".into(),
+            1,
+            test_addr(),
+            &tx,
+            &pex_sink(),
+            Some("abc123"),
+        )
+        .await;
+        assert!(ok, "a claimed id matching the mTLS identity must register");
+        assert_eq!(session.peer_id.as_deref(), Some("abc123"));
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [RelayMessage::RegisterAck { success: true, .. }]
+        ));
+    }
+
+    /// The core proof-of-possession guarantee (issue #5 acceptance criterion): a `Register` claiming
+    /// a `peer_id` OTHER than the one derived from the mTLS certificate actually used for the
+    /// connection is REFUSED — a peer cannot register an id it does not hold the key for — even
+    /// though that exact id is otherwise unused in the registry (this is not the anti-hijack/
+    /// `ID_IN_USE` path; it is a fresh identity-mismatch rejection).
+    #[tokio::test]
+    async fn register_peer_rejects_a_claimed_id_that_does_not_match_the_verified_certificate_identity(
+    ) {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut session = Session::default();
+
+        let ok = register_peer(
+            &state,
+            &mut session,
+            "spoofed-id".into(),
+            "net".into(),
+            1,
+            test_addr(),
+            &tx,
+            &pex_sink(),
+            Some("the-real-cert-derived-id"),
+        )
+        .await;
+        assert!(!ok, "a peer_id/certificate mismatch must be refused");
+        assert!(session.peer_id.is_none(), "session stays unregistered");
+        assert_eq!(
+            state.connected.load(Ordering::Relaxed),
+            0,
+            "no bump on a rejected registration"
+        );
+        assert!(state.registry.try_lock().unwrap().is_empty());
+
+        let msgs = drain(&mut rx);
+        assert!(matches!(
+            msgs[0],
+            RelayMessage::RegisterAck { success: false, .. }
+        ));
+        assert!(matches!(
+            msgs[1],
+            RelayMessage::Error {
+                code: errcode::IDENTITY_MISMATCH,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn register_peer_identity_check_runs_before_the_capacity_check() {
+        // Even at capacity, a mismatched claimed id must fail with IDENTITY_MISMATCH, not CAPACITY —
+        // proving the identity check is not merely a side effect of the ordinary registration path.
+        let state = RelayState::new(RelayServerConfig {
+            max_connections: 0,
+            ..Default::default()
+        });
+        // max_connections: 0 fails RelayServerConfig::validate() in production, but register_peer
+        // itself doesn't call validate() — using it here isolates the ordering without needing a
+        // real full registry.
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut session = Session::default();
+
+        let ok = register_peer(
+            &state,
+            &mut session,
+            "spoofed".into(),
+            "net".into(),
+            1,
+            test_addr(),
+            &tx,
+            &pex_sink(),
+            Some("real-id"),
+        )
+        .await;
+        assert!(!ok);
+        assert!(matches!(
+            drain(&mut rx)[1],
+            RelayMessage::Error {
+                code: errcode::IDENTITY_MISMATCH,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

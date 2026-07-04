@@ -85,6 +85,26 @@ fn is_elevated() -> bool {
     true
 }
 
+/// The `DIG_RELAY_TLS_CERT_PATH`/`DIG_RELAY_TLS_KEY_PATH` env pairs for an installed service's
+/// environment (SPEC.md §3.2/§8) — PURE, so [`install`]'s optional mTLS threading is unit-testable
+/// without touching a real OS service manager. Empty when either path is unset (a plain `ws://`
+/// relay's installed env is unchanged from before this feature).
+fn tls_environment_pairs(config: &RelayServerConfig) -> Vec<(String, String)> {
+    match (&config.tls_cert_path, &config.tls_key_path) {
+        (Some(cert), Some(key)) => vec![
+            (
+                "DIG_RELAY_TLS_CERT_PATH".to_string(),
+                cert.display().to_string(),
+            ),
+            (
+                "DIG_RELAY_TLS_KEY_PATH".to_string(),
+                key.display().to_string(),
+            ),
+        ],
+        _ => vec![],
+    }
+}
+
 /// Install the relay as an auto-starting OS service that runs `dig-relay serve` on the configured
 /// listen addrs. The listen/health addrs are passed as env so the service serves identically.
 pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
@@ -99,7 +119,7 @@ pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
     let (mgr, user_level) = manager()?;
     let program = current_exe()?;
 
-    let environment = vec![
+    let mut environment = vec![
         ("DIG_RELAY_LISTEN".to_string(), config.listen.to_string()),
         (
             "DIG_RELAY_HEALTH_LISTEN".to_string(),
@@ -114,6 +134,7 @@ pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
             config.max_connections.to_string(),
         ),
     ];
+    environment.extend(tls_environment_pairs(config));
 
     // The SCM-launched program must speak the Windows service protocol, so on Windows the installed
     // service runs the hidden `run-service` entrypoint; systemd/launchd exec `serve` directly.
@@ -327,6 +348,12 @@ pub fn config_from_env() -> RelayServerConfig {
     {
         config.register_timeout = std::time::Duration::from_secs(s);
     }
+    if let Ok(p) = std::env::var("DIG_RELAY_TLS_CERT_PATH") {
+        config.tls_cert_path = Some(std::path::PathBuf::from(p));
+    }
+    if let Ok(p) = std::env::var("DIG_RELAY_TLS_KEY_PATH") {
+        config.tls_key_path = Some(std::path::PathBuf::from(p));
+    }
     config
 }
 
@@ -342,7 +369,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// The env vars `config_from_env` reads, cleared so a test starts from a known state.
-    const RELAY_ENV: [&str; 9] = [
+    const RELAY_ENV: [&str; 11] = [
         "DIG_RELAY_LISTEN",
         "DIG_RELAY_HEALTH_LISTEN",
         "DIG_RELAY_STUN_LISTEN",
@@ -352,6 +379,8 @@ mod tests {
         "DIG_RELAY_OUTBOUND_QUEUE_CAPACITY",
         "DIG_RELAY_MAX_MESSAGE_BYTES",
         "DIG_RELAY_REGISTER_TIMEOUT_SECS",
+        "DIG_RELAY_TLS_CERT_PATH",
+        "DIG_RELAY_TLS_KEY_PATH",
     ];
     fn clear_relay_env() {
         for k in RELAY_ENV {
@@ -558,6 +587,8 @@ mod tests {
         std::env::set_var("DIG_RELAY_OUTBOUND_QUEUE_CAPACITY", "256");
         std::env::set_var("DIG_RELAY_MAX_MESSAGE_BYTES", "4096");
         std::env::set_var("DIG_RELAY_REGISTER_TIMEOUT_SECS", "3");
+        std::env::set_var("DIG_RELAY_TLS_CERT_PATH", "/etc/dig-relay/cert.pem");
+        std::env::set_var("DIG_RELAY_TLS_KEY_PATH", "/etc/dig-relay/key.pem");
         let c = config_from_env();
         clear_relay_env();
         assert_eq!(c.listen, "127.0.0.1:7000".parse().unwrap());
@@ -569,8 +600,44 @@ mod tests {
         assert_eq!(c.outbound_queue_capacity, 256);
         assert_eq!(c.max_message_bytes, 4096);
         assert_eq!(c.register_timeout, std::time::Duration::from_secs(3));
+        assert_eq!(
+            c.tls_cert_path,
+            Some(std::path::PathBuf::from("/etc/dig-relay/cert.pem"))
+        );
+        assert_eq!(
+            c.tls_key_path,
+            Some(std::path::PathBuf::from("/etc/dig-relay/key.pem"))
+        );
         // idle_timeout is not env-driven → stays default.
         assert_eq!(c.idle_timeout, RelayServerConfig::default().idle_timeout);
+    }
+
+    #[test]
+    fn tls_environment_pairs_is_empty_when_tls_is_not_configured() {
+        assert!(tls_environment_pairs(&RelayServerConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn tls_environment_pairs_carries_both_paths_when_configured() {
+        let config = RelayServerConfig {
+            tls_cert_path: Some(std::path::PathBuf::from("/etc/dig-relay/cert.pem")),
+            tls_key_path: Some(std::path::PathBuf::from("/etc/dig-relay/key.pem")),
+            ..Default::default()
+        };
+        let pairs = tls_environment_pairs(&config);
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "DIG_RELAY_TLS_CERT_PATH".to_string(),
+                    "/etc/dig-relay/cert.pem".to_string()
+                ),
+                (
+                    "DIG_RELAY_TLS_KEY_PATH".to_string(),
+                    "/etc/dig-relay/key.pem".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]

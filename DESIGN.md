@@ -245,13 +245,25 @@ the bind address is IPv6. See `src/net.rs` for the implementation and its unit t
 
 ## TLS
 
-The relay WebSocket is `wss://` in production, but TLS is **terminated at the AWS load balancer**
-(ACM cert on the NLB/ALB) so the container speaks plain `ws://` internally — the smallest, cheapest
-container. For run-your-own-relay without a load balancer, a future flag can enable in-process rustls
-(out of scope for the first server; documented as a follow-up). The `RelayMessage` payloads carry
-gossip data that is itself authenticated end-to-end by the gossip layer (peers verify each other via
-the Chia TLS-SPKI `PeerId` and the consensus BLS keys), so the relay is an **untrusted forwarder** — it
-never needs to inspect or trust payloads, only route them by `peer_id`.
+The relay WebSocket is `wss://` in production, but by DEFAULT TLS is **terminated at the AWS load
+balancer** (ACM cert on the NLB/ALB) so the container speaks plain `ws://` internally — the
+smallest, cheapest container. The `RelayMessage` payloads carry gossip data that is itself
+authenticated end-to-end by the gossip layer (peers verify each other via the Chia TLS-SPKI
+`PeerId` and the consensus BLS keys), so the relay is an **untrusted forwarder** — it never needs to
+inspect or trust payloads, only route them by `peer_id`.
+
+For run-your-own-relay without a load balancer (or any deployment wanting the relay itself to
+enforce identity), `--tls-cert`/`--tls-key` (`RelayServerConfig::tls_cert_path`/`tls_key_path`)
+switches the relay to terminating **mTLS** itself, in-process, via `rustls` (`src/tls.rs`) — pure
+Rust, so client-certificate capture is reliable on every OS, unlike the OS-native TLS backends
+`dig-gossip`'s inbound listener has to work around on Windows/macOS. Every connecting client MUST
+then present a certificate, and the relay binds `Register`'s claimed `peer_id` to the one derived
+from that certificate (SPEC.md §3.2) — this is the proof-of-possession super-repo issue
+`DIG-Network/dig_ecosystem#5` asked for, and it needed no `dig-gossip` wire coordination because the
+proof lives entirely at the TLS transport layer (the handshake itself), not in an extra `Register`
+field. Enabling this end-to-end for the canonical `relay.dig.net` deployment additionally requires
+reconfiguring the load balancer to pass TLS through rather than terminate it — an infra change,
+tracked separately in the superproject's private `infra/dig-relay/` (not in this repo).
 
 ## Why this is cheap + scalable on AWS
 

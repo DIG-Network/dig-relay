@@ -74,14 +74,20 @@ impl Registry {
     ///
     /// # Security — peer-ID hijack protection (SECURITY_AUDIT_P2P dig-relay #1)
     ///
-    /// The relay does not (yet) prove that a registrant owns the identity key its `peer_id` commits
-    /// to (the node-class mTLS transport / signed-`Register` proof-of-possession is a coordinated
-    /// cross-repo follow-up — see `SPEC.md` §3.2). Until identity is bound, a plain replace-on-collide
-    /// would let ANY unauthenticated client register a `peer_id` already held by a live peer, evict
+    /// This registry itself does not verify that a registrant owns the identity key its `peer_id`
+    /// commits to — that proof-of-possession is enforced one layer up, in `src/server.rs`'s
+    /// `register_peer`, when the connection came in over the relay's OPTIONAL mTLS listener
+    /// (`src/tls.rs`, `RelayServerConfig::tls_cert_path`/`tls_key_path` — see `SPEC.md` §3.2/§8): the
+    /// claimed `peer_id` must equal the one derived from the client certificate actually used for the
+    /// TLS session, or the registration never reaches this method at all. On the DEFAULT plain `ws://`
+    /// listener (mTLS not configured — the canonical `relay.dig.net` deployment, where TLS is
+    /// terminated at the load balancer), identity remains unauthenticated, and a plain
+    /// replace-on-collide would let ANY client register a `peer_id` already held by a live peer, evict
     /// the incumbent, and thereafter receive every message routed to that id — a full
     /// rendezvous-hijack and availability primitive. This method therefore treats a `peer_id` whose
     /// incumbent channel is still OPEN as occupied and REFUSES the registration
-    /// ([`RegisterOutcome::Occupied`]); the live peer keeps its slot and its rendezvous.
+    /// ([`RegisterOutcome::Occupied`]); the live peer keeps its slot and its rendezvous. This anti-
+    /// hijack rule applies on BOTH listeners (mTLS or not) as a second, independent line of defense.
     ///
     /// A genuine reconnect is still honoured: when the incumbent's outbound channel is already CLOSED
     /// (its connection task has torn down — `tx.is_closed()`), the stale record is reclaimed and

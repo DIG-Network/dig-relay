@@ -78,7 +78,9 @@ docker run -p 9450:9450 -p 9451:9451 -p 3478:3478/udp dig-relay
 ```
 
 TLS is terminated at the load balancer in the canonical deployment, so the container speaks plain
-`ws://`.
+`ws://` by default. Pass `--tls-cert`/`--tls-key` (PEM files) to make the relay terminate **mTLS**
+itself instead: every client must present a certificate, and a `Register`'s claimed `peer_id` must
+match the one derived from it (proof-of-possession — see `SPEC.md` §3.2/§8).
 
 ## Releases
 
