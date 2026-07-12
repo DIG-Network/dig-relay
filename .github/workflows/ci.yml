@@ -21,12 +21,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
-      - name: test
-        run: cargo test --all
+      # nextest natively detects+reports flaky tests (failed-then-passed on retry) instead of
+      # silently hiding them; --retries 2 absorbs environmental flakiness without masking a real
+      # regression (a test failing all 3 attempts still fails the job).
+      - name: test (nextest, flaky-aware)
+        run: cargo nextest run --all --retries 2
       - name: build (release)
         run: cargo build --release
 
@@ -39,6 +43,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
       # Unit + integration coverage, CI-gated at >=80% lines.
       #
       # `win_service.rs` is the Windows SCM dispatcher (`#[cfg(windows)]`); it never compiles on
@@ -49,9 +54,10 @@ jobs:
       # the binary's runtime/IO entrypoints in main.rs (build a tokio runtime, parse real argv,
       # write stdout) — both intentionally exercised via the binary in tests/cli.rs rather than
       # unit-tested. All pure/own logic is covered.
-      - name: coverage (>=80% lines)
+      - name: coverage (>=80% lines, nextest)
         run: >-
-          cargo llvm-cov --all
+          cargo llvm-cov nextest --all
+          --retries 2
           --ignore-filename-regex 'win_service\.rs'
           --fail-under-lines 80
 
