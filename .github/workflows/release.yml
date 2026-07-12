@@ -23,6 +23,12 @@ name: Release dig-relay
 # appears.
 #
 # A push to main also builds (no publish) so a broken build is caught before tagging.
+#
+# The gate below is fmt+clippy+build only — it does NOT re-run the test suite. The PR's `ci.yml`
+# already gated tests (nextest, flaky-retried) on the exact merged tree before this ref existed;
+# re-running the full suite again at deploy time is redundant and is itself a flake-exposure
+# surface that has previously blocked a release for a non-reproducing failure (#488). Deploy is
+# build + package + publish only.
 
 on:
   push:
@@ -42,9 +48,10 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  # Gate: fmt + clippy + tests once on Linux. A tag that fails the gate never produces binaries.
+  # Gate: fmt + clippy once on Linux (fast, deterministic, non-flaky). A tag that fails the gate
+  # never produces binaries. Tests are NOT re-run here — see the note above the `on:` block.
   check:
-    name: fmt + clippy + test
+    name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +73,6 @@ jobs:
           restore-keys: ${{ runner.os }}-relay-check-
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
 
   build:
     name: build (${{ matrix.out_name }})
