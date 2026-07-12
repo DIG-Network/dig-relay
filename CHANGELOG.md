@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.4.1] - 2026-07-12
+
+### Bug Fixes
+- **deps:** Re-resolve DIG git deps to rewritten (co-author/signed) revs
+
+### CI
+- Add flaky-test management (#489) (#2)
+
 ## [0.4.0] - 2026-07-04
 
 ### Features
