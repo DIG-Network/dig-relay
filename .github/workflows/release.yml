@@ -1,143 +1,63 @@
-name: Release dig-relay
-
-# On a version tag (v*), build the self-contained `dig-relay` server binary for every supported
-# OS/arch and attach them to a GitHub Release. Mirrors the tag-driven, per-OS matrix pattern of
-# dig-node's release workflow so the DIG installer's thin-shim resolves dig-relay binaries with no
-# special-casing.
+# STABLE binary release. On a `vX.Y.Z` tag (cut by the nightly-release orchestrator's stable job
+# — nightly-release.yml — either from the midnight cron detecting a version bump or from a manual
+# `workflow_dispatch`), this workflow builds the `dig-relay` server binary for every OS/arch (via
+# the reusable build workflow) and publishes them to a STABLE GitHub Release: `prerelease: false`,
+# marked `latest`. The changelog is already inside the tag (the orchestrator committed it before
+# tagging), so the release notes carry the shipped changelog.
 #
-# ASSET NAMING — each binary is published as `dig-relay-<ver>-<os>-<arch>[.exe]`, the CANONICAL name
-# the dig-installer thin-shim expects (its dig-relay Repo stem is `dig-relay`; matched by
-# dig-installer/src/asset.rs::select_asset against the os_arch slugs
-# {windows-x64, linux-x64, macos-arm64, macos-x64}).
-#
-# Per OS/arch:
-#   * windows-x64   (x86_64-pc-windows-msvc,   windows-latest)
-#   * linux-x64     (x86_64-unknown-linux-gnu, ubuntu-latest)
-#   * macos-arm64   (aarch64-apple-darwin,     macos-14)
-#   * macos-x64     (x86_64-apple-darwin,      macos-14, cross-compiled on Apple silicon)
-#
-# Unlike dig-node, dig-relay's dependency graph is pure-Rust TLS (rustls via the gossip layer is not
-# pulled in here; the server speaks plain ws:// and TLS is terminated at the load balancer), so there
-# is NO openssl-sys in any target's graph — a linux-arm64 cross-compile would be clean. We still omit
-# it for now to match the installer's x64-only Linux matrix; add it when an arm64-Linux consumer
-# appears.
-#
-# A push to main also builds (no publish) so a broken build is caught before tagging.
-#
-# The gate below is fmt+clippy+build only — it does NOT re-run the test suite. The PR's `ci.yml`
-# already gated tests (nextest, flaky-retried) on the exact merged tree before this ref existed;
-# re-running the full suite again at deploy time is redundant and is itself a flake-exposure
-# surface that has previously blocked a release for a non-reproducing failure (#488). Deploy is
-# build + package + publish only.
+# This is intentionally tag-ONLY: merges to main no longer build or release here (dig_ecosystem
+# #590 batches releases to the nightly cron + manual dispatch). Pre-merge coverage comes from
+# ci.yml (fmt/clippy/test/coverage on every PR); daily main-HEAD build coverage comes from the
+# nightly channel. A `workflow_dispatch` is kept as a manual "does main still build?" canary — it
+# builds but does not publish (publish is gated on a tag ref).
+name: Release (stable)
 
 on:
   push:
     tags:
       - "v*"
-    branches: [main]
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/release.yml"
   workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
-  # Gate: fmt + clippy once on Linux (fast, deterministic, non-flaky). A tag that fails the gate
-  # never produces binaries. Tests are NOT re-run here — see the note above the `on:` block.
-  check:
-    name: fmt + clippy
+  # Resolve the version string the artifacts are stamped with: `X.Y.Z` from a `vX.Y.Z` tag, or a
+  # `g<shortsha>` build id for the manual canary (which never publishes).
+  meta:
+    name: Resolve version
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install Rust (stable + components)
+      - id: v
+        shell: bash
         run: |
-          rustup toolchain install stable --component rustfmt --component clippy
-          rustup default stable
-          rustc --version
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-relay-check-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-relay-check-
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=g$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
 
+  # Build every OS/arch through the shared reusable workflow — the same build the nightly channel
+  # uses, so the two release paths can never diverge on how a binary is produced.
   build:
-    name: build (${{ matrix.out_name }})
-    needs: check
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin: dig-relay.exe
-            out_name: windows-x64.exe
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin: dig-relay
-            out_name: linux-x64
-          - os: macos-14 # Apple silicon (arm64)
-            target: aarch64-apple-darwin
-            bin: dig-relay
-            out_name: macos-arm64
-          - os: macos-14 # Apple silicon — cross-compiles the Intel binary
-            target: x86_64-apple-darwin
-            bin: dig-relay
-            out_name: macos-x64
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Install Rust + target
-        shell: bash
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-          rustup target add ${{ matrix.target }}
-          rustc --version
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-relay-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-relay-build-${{ matrix.target }}-
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-relay
-      - name: Stage artifact
-        shell: bash
-        run: |
-          VER="${GITHUB_REF_NAME#v}"
-          [ "$GITHUB_REF_TYPE" = "tag" ] || VER="g$(git rev-parse --short HEAD)"
-          mkdir -p dist
-          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
-          test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
-          # `out_name` already carries the .exe on Windows; unix has no extension.
-          cp "$SRC" "dist/dig-relay-${VER}-${{ matrix.out_name }}"
-          ls -la dist
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dig-relay-${{ matrix.out_name }}
-          path: dist/*
-          if-no-files-found: error
+    name: Build
+    needs: meta
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      version: ${{ needs.meta.outputs.version }}
+      # Empty ref => build the tag/commit this run is on.
+      ref: ""
 
+  # Publish ONLY for a real tag — the manual-dispatch canary builds but stops here.
   publish:
     name: Publish GitHub Release
     needs: build
@@ -155,9 +75,14 @@ jobs:
           mkdir -p release
           find artifacts -type f -exec cp {} release/ \;
           ls -la release
-      - name: Create / update the release and attach binaries
+      - name: Create / update the STABLE release and attach binaries
         uses: softprops/action-gh-release@v2
         with:
+          # `prerelease: false` + `make_latest: true`: a stable release is the one that moves
+          # `latest`. Nightlies (nightly-release.yml) are always prerelease + never latest, so a
+          # nightly can never masquerade as this stable download.
+          prerelease: false
+          make_latest: "true"
           files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: true
