@@ -311,4 +311,101 @@ listeners are UNAFFECTED by this setting; only the relay WebSocket listener term
   no client certificate never reaches the `RelayMessage` wire; `/health` stays plain HTTP regardless.
   `src/tls.rs`'s own unit tests cover the handshake/identity-derivation plumbing directly.
 
+## 11. Release pipeline — nightly cron + manual dispatch
+
+How the `dig-relay` binary is built and released. The shape is copied from the ecosystem's
+reference nightlies implementation (`dig-updater`); the ops runbook is `runbooks/release.md`.
+
+Releases are **batched to a nightly cron plus manual dispatch** — NOT cut on every merge to `main`.
+Two channels ship from one orchestrator (`.github/workflows/nightly-release.yml`):
+
+### 11.1 Trigger
+
+The orchestrator triggers ONLY on:
+
+- `schedule: cron '0 0 * * *'` — **midnight UTC** (GitHub Actions cron is always UTC; a top-of-hour
+  cron MAY be delayed under load — acceptable, since both channels are idempotent), and
+- `workflow_dispatch` with two inputs: `channel` (`both` | `stable` | `nightly`, default `both`) and
+  `force` (boolean, default `false`).
+
+It MUST NOT trigger on `push` to `main`. A schedule run exercises BOTH channels; a dispatch runs the
+selected channel(s).
+
+**60-day auto-disable caveat.** GitHub auto-disables a `schedule:` trigger after 60 days with no
+repo activity on a public repo, with no auto-re-enable — and since this cron is the ONLY automatic
+release trigger, a quiet repo can silently stop releasing with no error surfaced anywhere. Detect
+it with `gh api repos/DIG-Network/dig-relay/actions/workflows/nightly-release.yml --jq .state` (a
+value of `disabled_inactivity` means it was auto-disabled) and recover with `gh workflow enable
+nightly-release.yml` (see `runbooks/release.md`). Any repo activity resets the 60-day counter.
+
+### 11.2 Stable channel
+
+Cuts a semver `vX.Y.Z` **stable** release when — and only when — the version in `Cargo.toml`
+(`[package].version`) has advanced beyond the newest existing `vX.Y.Z` tag. The
+**skip-if-already-tagged** check IS the version-changed check: an unchanged version means the tag
+already exists, so the run is a no-op. Cutting a release means: `git-cliff` regenerates
+`CHANGELOG.md` from the Conventional-Commit history, commits it to `main` as `chore(release):
+vX.Y.Z`, tags THAT commit `vX.Y.Z` (so the changelog is inside the tag), and pushes commit + tag
+with `RELEASE_TOKEN`. The pushed `v*` tag fires `release.yml`, which builds every OS/arch and
+publishes a GitHub Release with `prerelease: false` + `make_latest: true` — the stable release is
+the ONLY one that moves `latest`.
+
+`force: true` on a manual dispatch bypasses the skip-if-tagged guard and re-cuts the current version
+(moving the existing tag onto a fresh changelog commit — `main` is never force-pushed). This is the
+manual "re-release this version" escape hatch (e.g. after a failed build).
+
+**Force is guarded against mutating a published release (supply-chain invariant).** A force re-cut
+MUST be refused — with a non-zero exit and a clear error — when BOTH: (a) a PUBLISHED (non-draft)
+GitHub Release already exists at the version's `vX.Y.Z` tag, AND (b) that tag currently points at a
+commit DIFFERENT from the commit this run would build. Moving a published release's tag to different
+code would silently replace its shipped binaries with unreviewed code under the same version number.
+Force MAY proceed when either condition is false: a same-commit re-cut (the tag already points at
+the commit being built — a legitimate "the build failed, re-fire `release.yml`" retry) or a tag with
+no published release yet (repairing a bare/failed tag). A version that genuinely needs new code
+released MUST bump `Cargo.toml`, not force-move an existing tag. (Force-moving a tag breaks git
+tag-immutability for that version; the shipped release artifacts remain the integrity anchor.)
+
+### 11.3 Nightly channel
+
+Every night (and on demand) builds `main` HEAD for every OS/arch and publishes a GitHub
+**pre-release** — so a fresh nightly always exists regardless of a version bump. It:
+
+- **Synthesizes the version at build time** (nothing is committed): `X.Y.Z-nightly.YYYYMMDD.<shortsha>`
+  from the current `Cargo.toml` version + UTC date + `git rev-parse --short HEAD`. As a semver
+  prerelease it sorts BELOW the plain `X.Y.Z`, so a nightly never outranks the stable release.
+- Publishes under a **dated tag `nightly-YYYYMMDD`** AND force-moves a **rolling `nightly` tag** to
+  the same build, with `prerelease: true` and **never** `latest`. Both carry this run's binaries.
+  Idempotent: a same-day re-run refreshes today's dated release + the rolling pointer.
+- **Retention:** keeps the newest **14** dated nightlies plus the rolling `nightly`, pruning older
+  dated pre-releases AND their `nightly-YYYYMMDD` tags together (`gh release delete --cleanup-tag`).
+  `v*` stable tags/releases and the rolling `nightly` are NEVER pruned.
+
+Neither `nightly-*` nor `nightly` matches `release.yml`'s `v*` trigger, so the nightly channel never
+fires the stable build; the nightly job builds and publishes directly.
+
+### 11.4 Reusable build
+
+The cross-OS binary build lives once in `.github/workflows/build-binaries.yml` (`on: workflow_call`,
+inputs `version` + `ref`). Both `release.yml` (stable) and the nightly channel call it, so the two
+paths can never diverge on HOW a binary is produced. It builds the `dig-relay` binary for
+`windows-x64`, `linux-x64`, `macos-arm64`, and `macos-x64`, stamping the caller's `version` into
+each artifact filename (`dig-relay-<ver>-<os-arch>[.exe]`).
+
+### 11.5 RELEASE_TOKEN posture (both channels)
+
+Releasing uses the `RELEASE_TOKEN` org PAT, not the default `GITHUB_TOKEN`: a tag pushed by
+`GITHUB_TOKEN` does not trigger downstream workflows (GitHub anti-recursion) and `GITHUB_TOKEN`
+cannot push a changelog commit past branch protection. If `RELEASE_TOKEN` is absent, EVERY channel
+NO-OPS with a clear `::warning::` — never a half-release. A `concurrency: nightly-release` group
+(cancel-in-progress `false`) serializes runs so an overlapping cron + dispatch cannot race.
+
+### 11.6 Pre-merge build coverage caveat
+
+`ci.yml` runs the full fmt/clippy/test/coverage gate on every PR, but only on `ubuntu-latest` — it
+does NOT build the Windows or macOS targets. A cross-platform build break on `main` is therefore
+first surfaced by the nightly channel (which builds all four targets from `main` HEAD every night),
+not by PR CI. This is an accepted trade-off (the pure-Rust/rustls graph rarely breaks per-OS), and
+the nightly channel bounds the detection lag to ~24h; widening `ci.yml` to a cross-OS build matrix
+is a future hardening.
+
 A change to any behavior in this document MUST update this SPEC in the same unit of work.
