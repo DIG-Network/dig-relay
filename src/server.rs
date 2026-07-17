@@ -576,6 +576,16 @@ where
         if let RelayMessage::GetPeers { network_id } = &msg {
             let filter = network_id.clone().or_else(|| session.network_id.clone());
             let peers = state.registry.lock().await.peers(filter.as_deref());
+            // RLY-005 observability (issue #862/P2P): log each peer-list request + how many peers
+            // were returned. A `get_peers` that returns only the requester (or none) is the tell-tale
+            // that no OTHER peer holds a live registration at query time — the exact signal that
+            // distinguishes a persistent-reservation network from ephemeral register-and-drop clients.
+            tracing::info!(
+                requester = session.peer_id.as_deref().unwrap_or("<unregistered>"),
+                network = filter.as_deref().unwrap_or("<all>"),
+                returned = peers.len(),
+                "RLY-005 get_peers: returning peer list"
+            );
             let _ = out_tx.try_send(RelayMessage::Peers { peers });
             continue;
         }
@@ -809,6 +819,21 @@ async fn register_peer(
     let targets = reg.broadcast_targets(&peer_id, &network_id, &[]);
     drop(reg);
 
+    // RLY-001 observability (issue #862/P2P): log every successful registration at INFO so the
+    // live relay's registrations are operationally visible (the empty-CloudWatch gap this closes —
+    // a successful register previously emitted NOTHING, only refusals warned). The observed
+    // reflexive `peer_addr` is the source address the relay saw, invaluable for diagnosing whether
+    // a node is registering EPHEMERALLY (register-then-immediately-disconnect) vs. holding a
+    // persistent reservation.
+    tracing::info!(
+        %peer_id,
+        %network_id,
+        %peer_addr,
+        protocol_version,
+        connected_peers,
+        "RLY-001 register: peer registered"
+    );
+
     let _ = out_tx.try_send(RelayMessage::RegisterAck {
         success: true,
         message: "registered".to_string(),
@@ -892,8 +917,13 @@ async fn deregister(state: &Arc<RelayState>, session: &Session) {
     let mut reg = state.registry.lock().await;
     if reg.unregister(peer_id).is_some() {
         state.connected.fetch_sub(1, Ordering::Relaxed);
+        let remaining = reg.len();
         let targets = reg.broadcast_targets(peer_id, network_id, &[]);
         drop(reg);
+        // RLY observability (issue #862/P2P): log the departure + remaining count. Paired with the
+        // register log above, a rapid register→deregister of the same peer_id exposes an ephemeral
+        // (non-persistent) reservation client at a glance.
+        tracing::info!(%peer_id, %network_id, remaining, "peer deregistered");
         for (_, tx) in targets {
             let _ = tx.try_send(RelayMessage::PeerDisconnected {
                 peer_id: peer_id.clone(),
