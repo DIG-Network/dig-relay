@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.6.0] - 2026-07-18
+
+### Features
+- **dig-relay:** B1 dialable-address emit + B2 forwarder hardening (#924) (#6)
+
 ## [0.5.0] - 2026-07-18
 
 ### Features
