@@ -21,15 +21,15 @@ bindable:
 
 | Listener | Transport | Default address | Config field / CLI flag | Purpose |
 |---|---|---|---|---|
-| Relay WebSocket | TCP | `[::]:9450` | `listen` / `--listen` | `RelayMessage`/PEX wire (§3) |
+| Relay WebSocket + dashboard | TCP | `[::]:9450` | `listen` / `--listen` | `RelayMessage`/PEX wire (§3) AND the peer-stats dashboard (§6.1) — a WebSocket upgrade is the wire, any other `GET` is the dashboard |
 | Health | TCP (HTTP) | `[::]:9451` | `health_listen` / `--health-listen` | Load-balancer target-group check |
-| Dashboard | TCP (HTTP) | `[::]:80` | `dashboard_listen` / `--dashboard-listen` | Peer-stats overview (§6.1) |
+| HTTP→HTTPS redirect | TCP (HTTP) | `[::]:80` | `dashboard_listen` / `--dashboard-listen` | 301 every plain-HTTP request to `https://` (§6.1) |
 | STUN | UDP | `[::]:3478` | `stun_listen` / `--stun-listen` | RFC 5389 Binding responder |
 
 Port 9450 matches `dig_gossip::constants::DEFAULT_RELAY_PORT`. Port 3478 is the IANA-assigned STUN
-port. Port 80 is the well-known HTTP port, so `http://relay.dig.net/` resolves to the dashboard. Each
-HTTP surface has its own listener/port so an NLB's HTTP health probe can never collide with relay,
-STUN, or dashboard traffic.
+port. The relay serves content ONLY over HTTPS/WSS: the dashboard shares the wire listener (TLS is
+terminated upstream at the load balancer, so `https://relay.dig.net/` and `wss://relay.dig.net/` both
+arrive on the wire port), and port 80 exists solely to redirect plain HTTP to the secure origin.
 
 ### 2.1 Listener binding — IPv6-first, IPv4-fallback (normative)
 
@@ -266,18 +266,27 @@ served on its own listener so an NLB's HTTP health check can never collide with 
 
 ## 6.1 Dashboard (peer-stats overview)
 
-A READ-ONLY HTTP dashboard is served on `dashboard_listen` (§2, default `[::]:80`) so
-`http://relay.dig.net/` resolves to a live operations overview. It exposes exactly two routes and is
-built entirely from the relay's EXISTING in-memory state (the peer registry + cheap atomic counters);
-it never touches the `RelayMessage` wire and never mutates state. Because it is observational and
-binds a privileged port, its listener is NON-FATAL: if it cannot bind (e.g. `:80` on an unprivileged
-self-hosted relay), the relay logs a warning and keeps serving the wire/health/STUN listeners
-normally (point `--dashboard-listen` at a high port to enable it there).
+A READ-ONLY dashboard is served over HTTPS at `https://relay.dig.net/` — the relay supports only
+HTTPS/WSS, so the dashboard is served on the WIRE listener itself (`listen`, §2): TLS is terminated
+upstream at the load balancer, so both a WebSocket-upgrade request (the `RelayMessage` wire) and an
+ordinary browser `GET` (the dashboard) arrive on the same port. The relay reads each connection's HTTP
+request head and routes on it — a `Connection: Upgrade` + `Upgrade: websocket` request is handed to
+the wire handshake byte-for-byte unchanged; any other request is served the dashboard. The dashboard
+is built entirely from the relay's EXISTING in-memory state (the peer registry + cheap atomic
+counters); it never mutates state and never disturbs the wire.
+
+Plain HTTP is redirect-only: the `dashboard_listen` port (default `[::]:80`) responds to every request
+with `301 Moved Permanently → https://<host><path>` (using the request's `Host`). Because it binds a
+privileged port, this redirect listener is NON-FATAL: if it cannot bind (e.g. `:80` on an unprivileged
+self-hosted relay), the relay logs a warning and keeps serving the wire/health/STUN listeners normally
+(point `--dashboard-listen` at a high port to enable it there). The dashboard itself is always
+available on the wire port regardless.
 
 - `GET /` → an HTML overview page (auto-refreshing ~every 5 s) that fetches `/stats.json` and renders
   it, handling the loading / error / empty / success states.
 - `GET /stats.json` → the SAME data machine-readable. Stable snake_case field names + a
   `schema_version` (currently `1`) an integrator MAY pin; new fields are additive and do NOT bump it.
+- `GET /mascot.png` → the DIG Network robot mascot (branding), served immutably.
 
 `/stats.json` body:
 

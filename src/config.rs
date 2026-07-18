@@ -88,8 +88,9 @@ pub struct RelayServerConfig {
     pub listen: SocketAddr,
     /// Address the HTTP `/health` listener binds (default `[::]:9451`, dual-stack).
     pub health_listen: SocketAddr,
-    /// Address the HTTP peer-stats **dashboard** listener binds (default `[::]:80`, dual-stack). Serves
-    /// `GET /` (an HTML overview) + `GET /stats.json` (the same data machine-readable).
+    /// Address the plain-HTTP **redirect** listener binds (default `[::]:80`, dual-stack). The relay
+    /// serves content only over HTTPS/WSS, so this port `301`s every request to `https://<host><path>`;
+    /// the dashboard itself (`GET /`, `/stats.json`, `/mascot.png`) is served over TLS on `listen`.
     pub dashboard_listen: SocketAddr,
     /// Address the STUN (RFC 5389) UDP listener binds (default `[::]:3478`, the IANA STUN port,
     /// dual-stack).
