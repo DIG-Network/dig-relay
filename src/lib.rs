@@ -20,13 +20,15 @@
 //! (registry mirroring, per-network scoping, and the introducer-only discard rule); [`server`] is
 //! the WebSocket accept loop, the per-connection task, the pure `RelayMessage` dispatcher, and the
 //! PEX housekeeping tick; [`stun`] is the RFC 5389 STUN Binding responder (UDP) that tells a node
-//! its reflexive address; [`health`] is the load-balancer HTTP probe; [`tls`] is the OPTIONAL mTLS
+//! its reflexive address; [`health`] is the load-balancer HTTP probe; [`dashboard`] is the public
+//! read-only peer-stats HTTP dashboard (`GET /` + `GET /stats.json`, default `[::]:80`); [`tls`] is the OPTIONAL mTLS
 //! termination for the relay listener (`RelayServerConfig::tls_cert_path`/`tls_key_path`) that
 //! proves `Register` proof-of-possession of the claimed `peer_id` (SPEC.md §3.2/§8); [`service`]
 //! installs/controls the relay as an OS service (run-your-own-relay) and [`win_service`] is the
 //! Windows SCM dispatcher.
 
 pub mod config;
+pub mod dashboard;
 pub mod dial;
 pub mod health;
 pub mod net;
@@ -88,11 +90,26 @@ pub async fn serve_with_shutdown(
     };
     let state = RelayState::new_with_tls(config, tls);
 
+    // The peer-stats dashboard is a purely-observational HTTP surface on a privileged port (default
+    // `:80`). It must NEVER be able to tear down the relay's peer wire — and on an unprivileged host
+    // it may not be able to bind `:80` at all — so it runs as a background task whose failure is a
+    // logged warning, not a fatal serve error (unlike the wire/health/STUN listeners below). On the
+    // canonical Fargate deployment `:80` binds cleanly; a self-hosted relay lacking the privilege
+    // keeps serving the wire and can point `--dashboard-listen` at a high port.
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            if let Err(e) = dashboard::run(state).await {
+                tracing::warn!(error = %e, "dig-relay dashboard listener stopped (relay wire unaffected)");
+            }
+        }
+    });
+
     let relay = server::run(state.clone());
     let health = health::run(state.clone());
     let stun = stun::run(state.clone());
 
-    // Whichever listener exits first (or the shutdown signal) ends serving.
+    // Whichever core listener exits first (or the shutdown signal) ends serving.
     tokio::select! {
         r = relay => r,
         h = health => h,
@@ -117,6 +134,9 @@ mod tests {
         let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let health_addr = health.local_addr().unwrap();
         drop(health);
+        let dashboard = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dashboard_addr = dashboard.local_addr().unwrap();
+        drop(dashboard);
         let stun = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let stun_addr = stun.local_addr().unwrap();
         drop(stun);
@@ -124,6 +144,7 @@ mod tests {
         let config = RelayServerConfig {
             listen: relay_addr,
             health_listen: health_addr,
+            dashboard_listen: dashboard_addr,
             stun_listen: stun_addr,
             ..Default::default()
         };
@@ -153,6 +174,9 @@ mod tests {
         let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let health_addr = health.local_addr().unwrap();
         drop(health);
+        let dashboard = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dashboard_addr = dashboard.local_addr().unwrap();
+        drop(dashboard);
         let stun = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let stun_addr = stun.local_addr().unwrap();
         drop(stun);
@@ -160,7 +184,8 @@ mod tests {
         let config = RelayServerConfig {
             listen: busy_addr, // already bound above (still held) → relay bind fails
             health_listen: health_addr,
-            stun_listen: stun_addr, // free → only the relay bind is the intended failure
+            dashboard_listen: dashboard_addr, // free → only the relay bind is the intended failure
+            stun_listen: stun_addr,           // free → only the relay bind is the intended failure
             ..Default::default()
         };
         let out = serve_with_shutdown(config, std::future::pending::<()>()).await;

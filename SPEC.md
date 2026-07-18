@@ -16,18 +16,20 @@ service subcommands (`SERVICE_LABEL = net.dignetwork.dig-relay`).
 
 ## 2. Listeners
 
-The relay exposes exactly three listeners, each independently configurable and independently
+The relay exposes exactly four listeners, each independently configurable and independently
 bindable:
 
 | Listener | Transport | Default address | Config field / CLI flag | Purpose |
 |---|---|---|---|---|
 | Relay WebSocket | TCP | `[::]:9450` | `listen` / `--listen` | `RelayMessage`/PEX wire (§3) |
 | Health | TCP (HTTP) | `[::]:9451` | `health_listen` / `--health-listen` | Load-balancer target-group check |
+| Dashboard | TCP (HTTP) | `[::]:80` | `dashboard_listen` / `--dashboard-listen` | Peer-stats overview (§6.1) |
 | STUN | UDP | `[::]:3478` | `stun_listen` / `--stun-listen` | RFC 5389 Binding responder |
 
 Port 9450 matches `dig_gossip::constants::DEFAULT_RELAY_PORT`. Port 3478 is the IANA-assigned STUN
-port. The health port is kept off the relay/STUN ports so an NLB's HTTP health probe can never
-collide with relay or STUN traffic.
+port. Port 80 is the well-known HTTP port, so `http://relay.dig.net/` resolves to the dashboard. Each
+HTTP surface has its own listener/port so an NLB's HTTP health probe can never collide with relay,
+STUN, or dashboard traffic.
 
 ### 2.1 Listener binding — IPv6-first, IPv4-fallback (normative)
 
@@ -259,9 +261,62 @@ small bounded multiple of the 20-byte minimal request, so the reflector is never
 { "status": "ok", "connected_peers": <u64>, "uptime_secs": <u64>, "version": "<CARGO_PKG_VERSION>" }
 ```
 
-`connected_peers` is the live registry count; `uptime_secs` is wall-clock since process start. This
-is the only HTTP surface; it is served on a separate listener so an NLB's HTTP health check can never
-collide with the relay WebSocket.
+`connected_peers` is the live registry count; `uptime_secs` is wall-clock since process start. It is
+served on its own listener so an NLB's HTTP health check can never collide with the relay WebSocket.
+
+## 6.1 Dashboard (peer-stats overview)
+
+A READ-ONLY HTTP dashboard is served on `dashboard_listen` (§2, default `[::]:80`) so
+`http://relay.dig.net/` resolves to a live operations overview. It exposes exactly two routes and is
+built entirely from the relay's EXISTING in-memory state (the peer registry + cheap atomic counters);
+it never touches the `RelayMessage` wire and never mutates state. Because it is observational and
+binds a privileged port, its listener is NON-FATAL: if it cannot bind (e.g. `:80` on an unprivileged
+self-hosted relay), the relay logs a warning and keeps serving the wire/health/STUN listeners
+normally (point `--dashboard-listen` at a high port to enable it there).
+
+- `GET /` → an HTML overview page (auto-refreshing ~every 5 s) that fetches `/stats.json` and renders
+  it, handling the loading / error / empty / success states.
+- `GET /stats.json` → the SAME data machine-readable. Stable snake_case field names + a
+  `schema_version` (currently `1`) an integrator MAY pin; new fields are additive and do NOT bump it.
+
+`/stats.json` body:
+
+```json
+{
+  "schema_version": 1,
+  "status": "ok",
+  "version": "<CARGO_PKG_VERSION>",
+  "uptime_secs": <u64>,
+  "active_reservations": <usize>,
+  "connected_peers": <u64>,
+  "open_connections": <u64>,
+  "stun_requests": <u64>,
+  "hole_punch_requests": <u64>,
+  "hole_punch_successes": <u64>,
+  "hole_punch_failures": <u64>,
+  "bytes_relayed": <u64>,
+  "networks": [ { "network_id": "<string>", "peers": <usize> } ],
+  "peers": [ {
+    "peer_id": "<string>", "network_id": "<string>",
+    "via": "direct" | "relay", "address_family": "v6" | "v4" | "none",
+    "protocol_version": <u32>, "connected_at": <u64>, "connected_secs": <u64>
+  } ]
+}
+```
+
+- `active_reservations` = live registry count (== `connected_peers`); `open_connections` includes
+  accepted-but-unregistered sockets. `networks` aggregates the reservation count per `network_id`.
+- Per-peer `via` is `direct` when the relay resolved a dialable address for the peer (§2.9), else
+  `relay`; `address_family` is that address's family, or `none` when no dialable address is known.
+- The counters (`stun_requests`, `hole_punch_*`, `bytes_relayed`) are cheap monotonic gauges the relay
+  maintains as it serves STUN (§5), forwards `HolePunchRequest`/`HolePunchResult` (§3, RLY-007), and
+  relays `RelayGossipMessage`/`Broadcast` payloads. They are observational; a restart resets them.
+
+**Privacy (normative):** aggregate counts are always exposed. Per-peer rows expose the `peer_id` (a
+public SHA-256 identity hash, not PII) and only the ADDRESS FAMILY of each peer — never a full IP, so
+the dashboard does not publish the network's dialable topology. By default `peer_id` is TRUNCATED to a
+short prefix; the query `?full=1` returns the un-truncated `peer_id`. No key material or payload is
+ever exposed (the relay is an untrusted forwarder and holds none).
 
 ## 7. Configuration
 
@@ -271,6 +326,7 @@ collide with the relay WebSocket.
 |---|---|---|
 | `listen` | `[::]:9450` | any `SocketAddr` |
 | `health_listen` | `[::]:9451` | any `SocketAddr` |
+| `dashboard_listen` | `[::]:80` | any `SocketAddr` |
 | `stun_listen` | `[::]:3478` | any `SocketAddr` |
 | `max_connections` | 4096 | MUST be ≥ 1 |
 | `idle_timeout` | 120 s | MUST be > 0 |
@@ -286,7 +342,8 @@ collide with the relay WebSocket.
 a zero `max_message_bytes`, a zero `register_timeout`, and exactly one of `tls_cert_path`/
 `tls_key_path` being set, with a stable error string. Config may be built from CLI flags (`main.rs`,
 `clap` — `--tls-cert`/`--tls-key` alongside the others) or environment variables consumed by the
-service installer (`DIG_RELAY_LISTEN`, `DIG_RELAY_HEALTH_LISTEN`, `DIG_RELAY_STUN_LISTEN`,
+service installer (`DIG_RELAY_LISTEN`, `DIG_RELAY_HEALTH_LISTEN`, `DIG_RELAY_DASHBOARD_LISTEN`,
+`DIG_RELAY_STUN_LISTEN`,
 `DIG_RELAY_MAX_CONNECTIONS`, `DIG_RELAY_STUN_PER_IP_RPS`, `DIG_RELAY_STUN_GLOBAL_RPS`,
 `DIG_RELAY_OUTBOUND_QUEUE_CAPACITY`, `DIG_RELAY_MAX_MESSAGE_BYTES`,
 `DIG_RELAY_REGISTER_TIMEOUT_SECS`, `DIG_RELAY_TLS_CERT_PATH`, `DIG_RELAY_TLS_KEY_PATH` — see

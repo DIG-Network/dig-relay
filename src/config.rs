@@ -30,6 +30,12 @@ pub const DEFAULT_RELAY_PORT: u16 = 9450;
 /// the load balancer's HTTP health check never collides with relay traffic on an NLB.
 pub const DEFAULT_HEALTH_PORT: u16 = 9451;
 
+/// The default HTTP port for the public peer-stats **dashboard** — port **80** (the well-known HTTP
+/// port), so `http://relay.dig.net/` resolves to a live operations overview of the relay's peer
+/// reservations + connections. Kept off the relay/health/STUN ports (a distinct NLB listener → this
+/// dashboard target port); it is a READ-ONLY HTTP surface and never touches the `RelayMessage` wire.
+pub const DEFAULT_DASHBOARD_PORT: u16 = 80;
+
 /// The default STUN (RFC 5389) UDP port: **3478**, the IANA-assigned STUN port, matching the DIG
 /// node peer-network protocol (STUN served at `relay.dig.net:3478`). A NAT'd DIG Node sends a
 /// Binding Request here to learn its public reflexive `IP:port` before advertising a
@@ -82,6 +88,9 @@ pub struct RelayServerConfig {
     pub listen: SocketAddr,
     /// Address the HTTP `/health` listener binds (default `[::]:9451`, dual-stack).
     pub health_listen: SocketAddr,
+    /// Address the HTTP peer-stats **dashboard** listener binds (default `[::]:80`, dual-stack). Serves
+    /// `GET /` (an HTML overview) + `GET /stats.json` (the same data machine-readable).
+    pub dashboard_listen: SocketAddr,
     /// Address the STUN (RFC 5389) UDP listener binds (default `[::]:3478`, the IANA STUN port,
     /// dual-stack).
     pub stun_listen: SocketAddr,
@@ -124,6 +133,10 @@ impl Default for RelayServerConfig {
         RelayServerConfig {
             listen: SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, DEFAULT_RELAY_PORT)),
             health_listen: SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, DEFAULT_HEALTH_PORT)),
+            dashboard_listen: SocketAddr::from((
+                std::net::Ipv6Addr::UNSPECIFIED,
+                DEFAULT_DASHBOARD_PORT,
+            )),
             stun_listen: SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, DEFAULT_STUN_PORT)),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
@@ -179,6 +192,11 @@ mod tests {
             "must match dig_gossip DEFAULT_RELAY_PORT"
         );
         assert_eq!(c.health_listen.port(), 9451);
+        assert_eq!(
+            c.dashboard_listen.port(),
+            80,
+            "dashboard = well-known HTTP port 80"
+        );
         assert_eq!(c.stun_listen.port(), 3478, "STUN = IANA STUN port 3478");
         assert!(
             c.listen.ip().is_unspecified(),
@@ -212,6 +230,14 @@ mod tests {
         );
         assert_eq!(
             c.health_listen.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        );
+        assert!(
+            c.dashboard_listen.is_ipv6(),
+            "dashboard listener must default to IPv6 [::]"
+        );
+        assert_eq!(
+            c.dashboard_listen.ip(),
             std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
         );
         assert!(
