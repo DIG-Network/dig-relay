@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
-use axum::response::Html;
+use axum::http::header;
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,11 @@ pub const STATS_SCHEMA_VERSION: u32 = 1;
 
 /// How many leading characters of a `peer_id` a truncated (default, non-`?full`) row shows.
 const PEER_ID_PREFIX_LEN: usize = 12;
+
+/// The DIG Network robot mascot (the same `minion-dighub.png` hub.dig.net wears), compiled into the
+/// binary so the dashboard is fully self-contained — no CDN, no external asset fetch, works offline.
+/// Served immutably at `GET /mascot.png`.
+const MASCOT_PNG: &[u8] = include_bytes!("../assets/minion-dighub.png");
 
 /// A point-in-time read of the relay's cheap atomic counters — decoupled from [`RelayState`] so the
 /// snapshot builder is pure and fully unit-testable without a live server.
@@ -263,12 +269,25 @@ async fn index() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
 
-/// Serve the dashboard (`GET /` + `GET /stats.json`) until the listener errors. Binds
-/// `state.config.dashboard_listen` dual-stack (IPv6-first, IPv4-fallback — see [`crate::net`]).
+/// `GET /mascot.png` — the DIG Network robot mascot, served from the [`MASCOT_PNG`] embedded in the
+/// binary with a long immutable cache (the asset never changes within a build).
+async fn mascot() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        MASCOT_PNG,
+    )
+}
+
+/// Serve the dashboard (`GET /` + `GET /stats.json` + `GET /mascot.png`) until the listener errors.
+/// Binds `state.config.dashboard_listen` dual-stack (IPv6-first, IPv4-fallback — see [`crate::net`]).
 pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/stats.json", get(stats))
+        .route("/mascot.png", get(mascot))
         .with_state(state.clone());
     let listener = bind_tcp_dual_stack(state.config.dashboard_listen)?;
     tracing::info!(addr = %state.config.dashboard_listen, "dig-relay dashboard listening (HTTP)");
@@ -282,25 +301,37 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DIG Relay — peer stats</title>
+<title>DIG Network Relay — peer stats</title>
+<link rel="icon" type="image/png" href="/mascot.png">
 <style>
   :root {
-    --bg: #0a0e17; --panel: #121826; --border: #223047; --text: #e6edf7;
-    --muted: #8b98ad; --accent: #4ade80; --warn: #fbbf24; --error: #f87171;
+    /* DIG Network brand: the mascot's purple + teal on the dark network palette. */
+    --bg: #0b0713; --panel: #171125; --border: #2c2140; --text: #ece7f7;
+    --muted: #a394bd; --accent: #b14aed; --accent2: #2dd4bf;
+    --warn: #f5a623; --error: #f87171;
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
+    margin: 0;
+    background:
+      radial-gradient(1200px 500px at 80% -10%, rgba(177,74,237,.12), transparent 60%),
+      var(--bg);
+    color: var(--text);
     font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     padding: 2rem 1.25rem 3rem;
   }
   main { max-width: 960px; margin: 0 auto; }
-  header { display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
+  header { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.75rem; }
+  header .logo { width: 56px; height: 56px; flex: none; filter: drop-shadow(0 4px 14px rgba(177,74,237,.4)); }
+  .titles { display: flex; flex-direction: column; gap: .1rem; }
+  .brand { font-size: .8rem; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
   h1 { font-size: 1.5rem; margin: 0; letter-spacing: -.01em; }
   h1 .dig { color: var(--accent); }
-  .ver { color: var(--muted); font-size: .85rem; }
+  .ver { color: var(--muted); font-size: .85rem; margin-left: auto; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .75rem; margin-bottom: 1.75rem; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 1rem 1.1rem; }
+  .card { position: relative; overflow: hidden; }
+  .card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: linear-gradient(var(--accent), var(--accent2)); }
   .card .n { font-size: 1.75rem; font-weight: 650; }
   .card .l { color: var(--muted); font-size: .8rem; margin-top: .15rem; }
   h2 { font-size: 1rem; color: var(--muted); font-weight: 600; margin: 0 0 .6rem; text-transform: uppercase; letter-spacing: .05em; }
@@ -310,7 +341,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   tr:last-child td { border-bottom: none; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .pill { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .78rem; }
-  .pill.direct { background: rgba(74,222,128,.15); color: var(--accent); }
+  .pill.direct { background: rgba(45,212,191,.15); color: var(--accent2); }
   .pill.relay { background: rgba(139,152,173,.15); color: var(--muted); }
   .state { padding: 2.5rem 1rem; text-align: center; color: var(--muted); }
   .state.error { color: var(--error); }
@@ -321,7 +352,12 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <body>
 <main>
   <header>
-    <h1><span class="dig">DIG</span> Relay</h1>
+    <img class="logo" src="/mascot.png" width="56" height="56"
+         alt="The DIG Network robot mascot">
+    <div class="titles">
+      <span class="brand">DIG Network</span>
+      <h1><span class="dig">DIG</span> Relay</h1>
+    </div>
     <span class="ver" id="version"></span>
   </header>
 
@@ -330,8 +366,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   </div>
 
   <footer>
-    Auto-refreshes every 5s · <a href="/stats.json">stats.json</a> ·
-    Aggregate by default; add <code>?full=1</code> for full peer ids.
+    Part of the <a href="https://dig.net">DIG Network</a> ·
+    <a href="https://hub.dig.net">DIGHub</a> ·
+    <a href="/stats.json">stats.json</a><br>
+    Auto-refreshes every 5s · aggregate by default; add <code>?full=1</code> for full peer ids.
   </footer>
 </main>
 
@@ -622,5 +660,36 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("No peers connected yet")); // empty
         assert!(DASHBOARD_HTML.contains("Connected peers")); // success
         assert!(DASHBOARD_HTML.contains("setInterval(refresh, 5000)")); // ~5s auto-refresh
+    }
+
+    #[test]
+    fn embedded_mascot_is_a_real_png() {
+        // The DIG robot mascot is compiled into the binary so the dashboard is self-contained
+        // (no external asset fetch, no CDN). It must be the real PNG, not an empty placeholder.
+        assert!(!MASCOT_PNG.is_empty(), "mascot must be embedded");
+        assert_eq!(
+            &MASCOT_PNG[..8],
+            b"\x89PNG\r\n\x1a\n",
+            "mascot must carry the PNG magic header"
+        );
+    }
+
+    #[test]
+    fn page_is_dig_network_branded_with_the_mascot() {
+        // The dashboard wears the DIG Network brand: the robot mascot, the DIG wordmark, and links
+        // back to the network's front doors (dig.net + hub.dig.net).
+        assert!(DASHBOARD_HTML.contains("/mascot.png"), "shows the mascot");
+        assert!(
+            DASHBOARD_HTML.contains("DIG Network"),
+            "carries the DIG Network wordmark"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("https://dig.net"),
+            "links to dig.net"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("https://hub.dig.net"),
+            "links to hub.dig.net"
+        );
     }
 }
