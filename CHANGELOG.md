@@ -4,15 +4,18 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.7.0] - 2026-07-18
+
+### Features
+- **dig-relay:** Peer-stats dashboard on :80 (#1012) (#8)
+
+### CI
+- **deploy:** Add Fargate deploy to relay.dig.net on release (#7)
+
 ## [0.6.0] - 2026-07-18
 
 ### Features
 - **dig-relay:** B1 dialable-address emit + B2 forwarder hardening (#924) (#6)
-
-## [0.7.0] - 2026-07-18
-
-### Features
-- **dashboard:** Public peer-stats + connections overview on `:80` — `GET /` (HTML, DIG dark theme, ~5s auto-refresh) + `GET /stats.json` (machine-readable). Aggregate-by-default privacy (truncated peer ids, address family only; `?full=1` for full ids). Reuses the registry + cheap STUN/hole-punch/bytes-relayed counters (#1012)
 
 ## [0.5.0] - 2026-07-18
 
