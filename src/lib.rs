@@ -172,7 +172,7 @@ mod tests {
             listen: busy_addr, // already bound above (still held) → relay bind fails
             health_listen: health_addr,
             dashboard_listen: dashboard_addr, // free → only the relay bind is the intended failure
-            stun_listen: stun_addr, // free → only the relay bind is the intended failure
+            stun_listen: stun_addr,           // free → only the relay bind is the intended failure
             ..Default::default()
         };
         let out = serve_with_shutdown(config, std::future::pending::<()>()).await;

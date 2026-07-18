@@ -192,7 +192,11 @@ mod tests {
             "must match dig_gossip DEFAULT_RELAY_PORT"
         );
         assert_eq!(c.health_listen.port(), 9451);
-        assert_eq!(c.dashboard_listen.port(), 80, "dashboard = well-known HTTP port 80");
+        assert_eq!(
+            c.dashboard_listen.port(),
+            80,
+            "dashboard = well-known HTTP port 80"
+        );
         assert_eq!(c.stun_listen.port(), 3478, "STUN = IANA STUN port 3478");
         assert!(
             c.listen.ip().is_unspecified(),

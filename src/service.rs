@@ -126,6 +126,10 @@ pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
             config.health_listen.to_string(),
         ),
         (
+            "DIG_RELAY_DASHBOARD_LISTEN".to_string(),
+            config.dashboard_listen.to_string(),
+        ),
+        (
             "DIG_RELAY_STUN_LISTEN".to_string(),
             config.stun_listen.to_string(),
         ),
@@ -306,6 +310,12 @@ pub fn config_from_env() -> RelayServerConfig {
     {
         config.health_listen = a;
     }
+    if let Some(a) = std::env::var("DIG_RELAY_DASHBOARD_LISTEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.dashboard_listen = a;
+    }
     if let Some(a) = std::env::var("DIG_RELAY_STUN_LISTEN")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -369,9 +379,10 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// The env vars `config_from_env` reads, cleared so a test starts from a known state.
-    const RELAY_ENV: [&str; 11] = [
+    const RELAY_ENV: [&str; 12] = [
         "DIG_RELAY_LISTEN",
         "DIG_RELAY_HEALTH_LISTEN",
+        "DIG_RELAY_DASHBOARD_LISTEN",
         "DIG_RELAY_STUN_LISTEN",
         "DIG_RELAY_MAX_CONNECTIONS",
         "DIG_RELAY_STUN_PER_IP_RPS",
@@ -580,6 +591,7 @@ mod tests {
         clear_relay_env();
         std::env::set_var("DIG_RELAY_LISTEN", "127.0.0.1:7000");
         std::env::set_var("DIG_RELAY_HEALTH_LISTEN", "127.0.0.1:7001");
+        std::env::set_var("DIG_RELAY_DASHBOARD_LISTEN", "127.0.0.1:7003");
         std::env::set_var("DIG_RELAY_STUN_LISTEN", "127.0.0.1:7002");
         std::env::set_var("DIG_RELAY_MAX_CONNECTIONS", "12");
         std::env::set_var("DIG_RELAY_STUN_PER_IP_RPS", "9");
@@ -593,6 +605,7 @@ mod tests {
         clear_relay_env();
         assert_eq!(c.listen, "127.0.0.1:7000".parse().unwrap());
         assert_eq!(c.health_listen, "127.0.0.1:7001".parse().unwrap());
+        assert_eq!(c.dashboard_listen, "127.0.0.1:7003".parse().unwrap());
         assert_eq!(c.stun_listen, "127.0.0.1:7002".parse().unwrap());
         assert_eq!(c.max_connections, 12);
         assert_eq!(c.stun_per_ip_responses_per_sec, 9);

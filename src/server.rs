@@ -1240,6 +1240,54 @@ mod tests {
         }
     }
 
+    /// The dashboard traffic counters (#1012): `record_relayed` folds each inbound frame into the
+    /// right gauge — relayed bytes for gossip/broadcast payloads, hole-punch request/success/failure
+    /// tallies — and leaves every other kind untouched.
+    #[test]
+    fn record_relayed_folds_each_kind_into_the_right_counter() {
+        let st = RelayState::new(RelayServerConfig::default());
+
+        st.record_relayed(&RelayMessage::RelayGossipMessage {
+            from: "a".into(),
+            to: "b".into(),
+            payload: vec![0u8; 10],
+            seq: 1,
+        });
+        st.record_relayed(&RelayMessage::Broadcast {
+            from: "a".into(),
+            payload: vec![0u8; 5],
+            exclude: vec![],
+        });
+        assert_eq!(
+            st.bytes_relayed.load(Ordering::Relaxed),
+            15,
+            "10 + 5 payload bytes"
+        );
+
+        st.record_relayed(&RelayMessage::HolePunchRequest {
+            peer_id: "a".into(),
+            target_peer_id: "b".into(),
+            external_addr: "127.0.0.1:1".parse().unwrap(),
+        });
+        assert_eq!(st.hole_punch_requests.load(Ordering::Relaxed), 1);
+
+        st.record_relayed(&RelayMessage::HolePunchResult {
+            peer_id: "b".into(),
+            success: true,
+        });
+        st.record_relayed(&RelayMessage::HolePunchResult {
+            peer_id: "b".into(),
+            success: false,
+        });
+        assert_eq!(st.hole_punch_successes.load(Ordering::Relaxed), 1);
+        assert_eq!(st.hole_punch_failures.load(Ordering::Relaxed), 1);
+
+        // A non-traffic frame moves nothing.
+        st.record_relayed(&RelayMessage::Ping { timestamp: 1 });
+        assert_eq!(st.bytes_relayed.load(Ordering::Relaxed), 15);
+        assert_eq!(st.hole_punch_requests.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn relay_state_new_starts_empty_with_zero_uptime() {
         let st = RelayState::new(RelayServerConfig::default());

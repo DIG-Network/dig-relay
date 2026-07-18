@@ -153,7 +153,10 @@ pub fn build_snapshot(
         .map(|(network_id, peers)| NetworkRow { network_id, peers })
         .collect();
 
-    let mut peer_rows: Vec<PeerRow> = peers.into_iter().map(|p| peer_row(p, now_secs, full)).collect();
+    let mut peer_rows: Vec<PeerRow> = peers
+        .into_iter()
+        .map(|p| peer_row(p, now_secs, full))
+        .collect();
     peer_rows.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
 
     StatsSnapshot {
@@ -185,7 +188,11 @@ fn peer_row(info: RelayPeerInfo, now_secs: u64, full: bool) -> PeerRow {
             truncate_peer_id(&info.peer_id)
         },
         network_id: info.network_id,
-        via: if dialable.is_some() { "direct" } else { "relay" },
+        via: if dialable.is_some() {
+            "direct"
+        } else {
+            "relay"
+        },
         address_family: address_family(dialable),
         protocol_version: info.protocol_version,
         connected_at: info.connected_at,
@@ -235,7 +242,10 @@ fn now_secs() -> u64 {
 
 /// `GET /stats.json` — the machine-readable snapshot. Locks the registry briefly to clone the peer
 /// list, reads the counters, then builds the snapshot with the pure [`build_snapshot`].
-async fn stats(State(state): State<Arc<RelayState>>, Query(q): Query<DashboardQuery>) -> Json<StatsSnapshot> {
+async fn stats(
+    State(state): State<Arc<RelayState>>,
+    Query(q): Query<DashboardQuery>,
+) -> Json<StatsSnapshot> {
     let peers = state.registry.lock().await.peers(None);
     let snapshot = build_snapshot(
         peers,
@@ -465,8 +475,14 @@ mod tests {
         assert_eq!(
             snap.networks,
             vec![
-                NetworkRow { network_id: "mainnet".into(), peers: 2 },
-                NetworkRow { network_id: "testnet".into(), peers: 1 },
+                NetworkRow {
+                    network_id: "mainnet".into(),
+                    peers: 2
+                },
+                NetworkRow {
+                    network_id: "testnet".into(),
+                    peers: 1
+                },
             ],
             "networks are aggregated and sorted by id"
         );
@@ -497,8 +513,15 @@ mod tests {
 
     #[test]
     fn ipv6_address_family_is_reported_as_v6() {
-        let v6: SocketAddr = SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9444));
-        let snap = build_snapshot(vec![peer_at("p", "n", 0, Some(v6))], Counters::default(), 0, 0, true);
+        let v6: SocketAddr =
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9444));
+        let snap = build_snapshot(
+            vec![peer_at("p", "n", 0, Some(v6))],
+            Counters::default(),
+            0,
+            0,
+            true,
+        );
         assert_eq!(snap.peers[0].address_family, "v6");
     }
 
@@ -526,29 +549,62 @@ mod tests {
     #[test]
     fn a_short_peer_id_is_not_truncated() {
         let snap = build_snapshot(vec![peer("short", "n")], Counters::default(), 0, 0, false);
-        assert_eq!(snap.peers[0].peer_id, "short", "no ellipsis for an already-short id");
+        assert_eq!(
+            snap.peers[0].peer_id, "short",
+            "no ellipsis for an already-short id"
+        );
     }
 
     #[test]
     fn stats_json_uses_stable_snake_case_field_names() {
-        let snap = build_snapshot(vec![peer_at("p", "n", 0, None)], Counters::default(), 1, 2, false);
+        let snap = build_snapshot(
+            vec![peer_at("p", "n", 0, None)],
+            Counters::default(),
+            1,
+            2,
+            false,
+        );
         let v = serde_json::to_value(&snap).unwrap();
         for key in [
-            "schema_version", "status", "version", "uptime_secs", "active_reservations",
-            "connected_peers", "open_connections", "stun_requests", "hole_punch_requests",
-            "hole_punch_successes", "hole_punch_failures", "bytes_relayed", "networks", "peers",
+            "schema_version",
+            "status",
+            "version",
+            "uptime_secs",
+            "active_reservations",
+            "connected_peers",
+            "open_connections",
+            "stun_requests",
+            "hole_punch_requests",
+            "hole_punch_successes",
+            "hole_punch_failures",
+            "bytes_relayed",
+            "networks",
+            "peers",
         ] {
             assert!(v.get(key).is_some(), "stats.json must expose `{key}`");
         }
         let row = &v["peers"][0];
-        for key in ["peer_id", "network_id", "via", "address_family", "protocol_version", "connected_at", "connected_secs"] {
+        for key in [
+            "peer_id",
+            "network_id",
+            "via",
+            "address_family",
+            "protocol_version",
+            "connected_at",
+            "connected_secs",
+        ] {
             assert!(row.get(key).is_some(), "peer row must expose `{key}`");
         }
     }
 
     #[test]
     fn query_wants_full_only_for_truthy_values() {
-        let full = |s: Option<&str>| DashboardQuery { full: s.map(str::to_string) }.wants_full();
+        let full = |s: Option<&str>| {
+            DashboardQuery {
+                full: s.map(str::to_string),
+            }
+            .wants_full()
+        };
         assert!(full(Some("1")));
         assert!(full(Some("true")));
         assert!(full(Some("yes")));
