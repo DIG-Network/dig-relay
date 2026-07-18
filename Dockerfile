@@ -17,6 +17,9 @@ WORKDIR /src
 COPY Cargo.toml ./
 COPY src ./src
 COPY tests ./tests
+# The dashboard embeds the DIG mascot via include_bytes!("../assets/…") — the asset dir must be
+# present in the build context or the compile fails ("couldn't read assets/minion-dighub.png").
+COPY assets ./assets
 RUN cargo build --release --bin dig-relay
 
 # ---- runtime stage ----
@@ -28,5 +31,9 @@ COPY --from=build /src/target/release/dig-relay /usr/local/bin/dig-relay
 USER digrelay
 EXPOSE 9450 9451
 EXPOSE 3478/udp
+# The peer-stats dashboard defaults to :80, which this non-root (uid 10001) user cannot bind; run it
+# on an unprivileged port and front it at :80 in the orchestrator, e.g.
+# `dig-relay serve --dashboard-listen [::]:8080` (relay.dig.net maps NLB :80 → container :8080).
+EXPOSE 8080
 # Bind all interfaces inside the container; the orchestrator maps/fronts the ports.
 ENTRYPOINT ["/usr/local/bin/dig-relay"]
