@@ -50,7 +50,7 @@ pub fn resolve_dialable(advertised: &[SocketAddr], reflexive: IpAddr) -> Vec<Soc
 /// judgement consistent with every other DIG peer crate — notably an IPv4-mapped IPv6 candidate
 /// (`::ffff:a.b.c.d`) is treated as IPv4, since it is IPv4 reachability wearing an IPv6 costume.
 fn order_ipv6_first(candidates: &mut [SocketAddr]) {
-    candidates.sort_by_key(|addr| Family::of(addr));
+    candidates.sort_by_key(Family::of);
 }
 
 /// Resolve a single advertised candidate to the address the relay may safely emit for it.
@@ -261,10 +261,10 @@ mod tests {
         // (`::ffff:a.b.c.d`) is IPv4 reachability, so Family::of ranks it AFTER native IPv6 — a
         // distinction the old `!is_ipv6()` key got wrong (it treated the mapped form as IPv6).
         let mut candidates = vec![
-            addr("203.0.113.1:9445"),               // V4
-            addr("[2001:db8::a]:9445"),             // V6
-            addr("[::ffff:198.51.100.7]:9445"),     // V4 (mapped) — must NOT sort as V6
-            addr("[2001:db8::b]:9446"),             // V6
+            addr("203.0.113.1:9445"),           // V4
+            addr("[2001:db8::a]:9445"),         // V6
+            addr("[::ffff:198.51.100.7]:9445"), // V4 (mapped) — must NOT sort as V6
+            addr("[2001:db8::b]:9446"),         // V6
         ];
         order_ipv6_first(&mut candidates);
         assert_eq!(
