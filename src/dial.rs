@@ -8,6 +8,7 @@
 //! advertised port → a real `reflexive_IP:port` another node can direct-dial over the existing mTLS
 //! path, which the relay hands out as `RelayPeerInfo::addresses` (RLY-005 `Peers`/`PeerConnected`).
 
+use dig_ip::Family;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 /// Upper bound on the dialable candidates the relay emits per registration. A registration's
@@ -39,10 +40,17 @@ pub fn resolve_dialable(advertised: &[SocketAddr], reflexive: IpAddr) -> Vec<Soc
         .filter(|addr| seen.insert(*addr))
         .take(MAX_DIALABLE_CANDIDATES)
         .collect();
-    // IPv6-first (§5.2): a stable sort keeps IPv6 candidates ahead of IPv4 while preserving the
-    // relative order within each family, so a dialer races IPv6 first (happy-eyeballs).
-    resolved.sort_by_key(|addr| !addr.is_ipv6());
+    order_ipv6_first(&mut resolved);
     resolved
+}
+
+/// Order candidates IPv6-first (§5.2) using the ecosystem's canonical [`dig_ip::Family`] keying, so a
+/// dialer races IPv6 before IPv4 (happy-eyeballs). A stable sort preserves each family's internal
+/// discovery order. Using [`Family::of`] rather than a hand-rolled `is_ipv6()` key keeps the family
+/// judgement consistent with every other DIG peer crate — notably an IPv4-mapped IPv6 candidate
+/// (`::ffff:a.b.c.d`) is treated as IPv4, since it is IPv4 reachability wearing an IPv6 costume.
+fn order_ipv6_first(candidates: &mut [SocketAddr]) {
+    candidates.sort_by_key(|addr| Family::of(addr));
 }
 
 /// Resolve a single advertised candidate to the address the relay may safely emit for it.
@@ -244,5 +252,29 @@ mod tests {
     #[test]
     fn empty_advertised_yields_empty() {
         assert!(resolve_dialable(&[], ip("203.0.113.7")).is_empty());
+    }
+
+    #[test]
+    fn order_ipv6_first_places_every_v6_before_every_v4_via_dig_ip_family() {
+        // The canonical dig_ip::Family keying (§5.2): every IPv6 candidate precedes every IPv4 one,
+        // with each family's internal order preserved (stable sort). An IPv4-mapped IPv6 address
+        // (`::ffff:a.b.c.d`) is IPv4 reachability, so Family::of ranks it AFTER native IPv6 — a
+        // distinction the old `!is_ipv6()` key got wrong (it treated the mapped form as IPv6).
+        let mut candidates = vec![
+            addr("203.0.113.1:9445"),               // V4
+            addr("[2001:db8::a]:9445"),             // V6
+            addr("[::ffff:198.51.100.7]:9445"),     // V4 (mapped) — must NOT sort as V6
+            addr("[2001:db8::b]:9446"),             // V6
+        ];
+        order_ipv6_first(&mut candidates);
+        assert_eq!(
+            candidates,
+            vec![
+                addr("[2001:db8::a]:9445"),
+                addr("[2001:db8::b]:9446"),
+                addr("203.0.113.1:9445"),
+                addr("[::ffff:198.51.100.7]:9445"),
+            ],
+        );
     }
 }

@@ -68,6 +68,12 @@ dig-pex = { git = "https://github.com/DIG-Network/dig-pex" }
 # `tokio` takes it over, so the one `[::]` listener stays dual-stack (see `src/net.rs`). Already a
 # transitive dependency via tokio; declared directly because we call its API.
 socket2 = "0.6"
+# The DIG ecosystem's canonical address-family / IPv6-first primitive (CLAUDE.md §5.2). The relay is
+# the introducer/signaller, not a dialer, so it only consumes the leaf `Family` keying to order the
+# reflexive-resolved candidates it emits — sharing one family judgement (incl. IPv4-mapped-IPv6
+# canonicalization) with every other peer crate instead of hand-rolling `is_ipv6()`. Permissively
+# licensed (Apache-2.0 OR MIT), so a leaf dep in this GPL-2.0 crate is fine.
+dig-ip = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 # Windows Service Control Protocol dispatcher: a service-manager-registered service must itself
