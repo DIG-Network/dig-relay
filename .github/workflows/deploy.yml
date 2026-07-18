@@ -1,0 +1,95 @@
+# Fargate deploy for the canonical relay.dig.net.
+#
+# The stable binary release (release.yml) publishes per-OS binaries so anyone can run their own
+# relay; THIS workflow additionally ships the same tagged commit to the canonical relay.dig.net
+# ECS/Fargate service, so the hosted relay never drifts behind a stable release (dig_ecosystem
+# #985 — a stale relay lacks resolve_dialable and peer introductions carry no dialable address).
+#
+# Flow (on a `vX.Y.Z` tag, or a manual dispatch): build the container from THIS commit, push it to
+# ECR tagged with the git SHA (matching the deployed-image convention), clone the live task
+# definition onto the new image, and roll the service — waiting for the deployment to stabilise.
+#
+# Auth is keyless GitHub OIDC into the least-privilege `dig-relay-ci-deploy` IAM role (ECR push +
+# ecs register/update on the dig-relay service + PassRole for the task-exec role only).
+
+name: Deploy (relay.dig.net)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-relay
+  cancel-in-progress: false
+
+# Least privilege: OIDC token to assume the AWS role + read the repo. No write scopes.
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: dig-relay
+  ECS_CLUSTER: dig-relay
+  ECS_SERVICE: dig-relay
+  ECS_TASK_FAMILY: dig-relay
+  CONTAINER_NAME: dig-relay
+
+jobs:
+  deploy:
+    name: Build image and roll the service
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::873139760123:role/dig-relay-ci-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tag the image with the full git SHA — the same convention the deployed task definition uses,
+      # so an image tag always names the exact source it was built from.
+      - name: Build and push image
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # Clone the CURRENTLY-DEPLOYED task definition and swap only the image, so infra settings
+      # (cpu/memory/roles/ports/log config) are preserved without being duplicated in this repo.
+      - name: Render new task definition
+        id: taskdef
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_FAMILY" \
+            --query 'taskDefinition' --output json > taskdef.json
+          echo "path=taskdef.json" >> "$GITHUB_OUTPUT"
+
+      - name: Fill in new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ steps.taskdef.outputs.path }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build.outputs.image }}
+
+      - name: Deploy to ECS and wait for stability
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
