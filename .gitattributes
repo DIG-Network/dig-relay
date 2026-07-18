@@ -1,0 +1,3 @@
+# Normalize line endings so a CRLF checkout can never inflate a diff (ties #935).
+* text=auto eol=lf
+*.rs text eol=lf

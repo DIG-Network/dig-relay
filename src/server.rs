@@ -1875,6 +1875,46 @@ mod tests {
         );
     }
 
+    /// B1 anti-reflection (#926, security HIGH): a peer advertising a globally-routable host it does
+    /// NOT own (a victim's public address) must never be handed to other peers verbatim, or the relay
+    /// would fan out connection-attempts at the victim. The unverifiable third-party host is dropped
+    /// and only the safe reflexive substitution (which points back at the registrant) is emitted.
+    #[tokio::test]
+    async fn register_drops_a_public_address_that_does_not_match_the_reflexive_source() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let mut session = Session::default();
+        let reflexive: SocketAddr = "198.51.100.9:55000".parse().unwrap(); // attacker's real source
+        let victim: SocketAddr = "203.0.113.200:9445".parse().unwrap(); // a public addr it doesn't own
+
+        assert!(
+            register_peer(
+                &state,
+                &mut session,
+                "attacker".into(),
+                "net".into(),
+                1,
+                &[victim],
+                reflexive,
+                &tx,
+                &pex_sink(),
+                None,
+            )
+            .await
+        );
+
+        let peers = state.registry.lock().await.peers(Some("net"));
+        assert!(
+            !peers[0].addresses.contains(&victim),
+            "the unverifiable third-party public address must not be emitted (reflection vector)"
+        );
+        assert_eq!(
+            peers[0].addresses,
+            vec!["198.51.100.9:9445".parse::<SocketAddr>().unwrap()],
+            "only the safe reflexive_IP:advertised_port substitution is emitted"
+        );
+    }
+
     /// B1 legacy fallback: a peer that advertises no listen candidates (a pre-#924 node) gets an
     /// empty `addresses` list — it keeps today's identity-only relayed reachability, no regression.
     #[tokio::test]

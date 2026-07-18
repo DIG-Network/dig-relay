@@ -81,9 +81,18 @@ listener. A node therefore advertises its gossip LISTEN candidate(s) in `Registe
 - if the advertised host is **not globally routable** (unspecified, loopback, IPv4 private/link-local,
   or IPv6 unique-local `fc00::/7`/link-local `fe80::/10`, including IPv4-mapped forms) → substitute the
   observed reflexive IP and keep the advertised PORT → a real `reflexive_IP:port`;
-- if the advertised host is **already public** (e.g. an EC2 peer) → pass it through unchanged.
+- if the advertised host is **globally routable**, it is kept verbatim ONLY when it verifiably belongs
+  to the peer's own observed source — the advertised IPv4 equals the reflexive IP, or the advertised
+  IPv6 shares the reflexive `/64` prefix (one prefix covers a peer's privacy/temporary addresses).
+  Otherwise the advertised host is an unverifiable third party (an attacker advertising a victim's
+  public address to make the relay fan out connection-attempts at it — a reflection vector): the relay
+  **MUST NOT emit that address**. It is dropped and replaced by the safe `reflexive_IP:advertised_port`
+  substitution, which can only point back at the registrant's own source. The relay therefore never
+  emits a public address that is not tied to the peer's own observed source.
 
-Results are IPv6-first and de-duplicated. A peer that advertises no `listen_addrs` (a pre-#924 node)
+The emitted candidate set is **capped at 8** so one registration cannot make the relay publish an
+unbounded address list. Results are IPv6-first and de-duplicated. A peer that advertises no
+`listen_addrs` (a pre-#924 node)
 gets an empty `addresses` list and falls back to identity-only relayed reachability. A dialer treats
 each entry as a Direct candidate and races them IPv6-first (happy-eyeballs, §2.1); a bogus candidate
 merely fails to connect — the mTLS handshake still binds the dialed endpoint to the expected
