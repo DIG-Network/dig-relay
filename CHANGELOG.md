@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.5.0] - 2026-07-18
+
+### Features
+- **observability:** Log RLY-001 register + RLY-005 get_peers at INFO (#5)
+
 ## [0.4.3] - 2026-07-15
 
 ### CI
