@@ -449,6 +449,12 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
                     tracing::trace!(%src, "STUN response suppressed by rate limit");
                     continue;
                 }
+                // Count answered Binding Requests for the peer-stats dashboard (a rising value confirms
+                // NAT'd nodes are learning their reflexive address here). Counted only for responses
+                // actually sent — a rate-limited/dropped request never reflects, so it never counts.
+                state
+                    .stun_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let response = build_binding_response(&req.transaction_id, src);
                 if let Err(e) = socket.send_to(&response, src).await {
                     tracing::debug!(error = %e, %src, "STUN response send failed");

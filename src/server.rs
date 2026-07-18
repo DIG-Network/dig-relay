@@ -67,6 +67,20 @@ pub struct RelayState {
     /// dig-relay #5). Incremented right after the WebSocket upgrade, decremented when the connection
     /// task exits (via an RAII guard so it can never leak).
     pub open_connections: AtomicU64,
+    /// Total STUN Binding Requests answered since start (RFC 5389, `src/stun.rs`). A cheap monotonic
+    /// counter surfaced on the peer-stats dashboard — a rising value confirms NAT'd nodes are reaching
+    /// the relay's reflexive-address service, invaluable for debugging the connect leg.
+    pub stun_requests: AtomicU64,
+    /// Total `HolePunchRequest`s received + forwarded as a `HolePunchCoordinate` (RLY-007).
+    pub hole_punch_requests: AtomicU64,
+    /// Total `HolePunchResult`s reporting `success: true` (a direct path was established).
+    pub hole_punch_successes: AtomicU64,
+    /// Total `HolePunchResult`s reporting `success: false` (hole-punch failed → relayed fallback).
+    pub hole_punch_failures: AtomicU64,
+    /// Total payload bytes accepted for relaying (the summed `payload` length of every inbound
+    /// `RelayGossipMessage` + `Broadcast`). Counts bytes RECEIVED for forwarding, once per inbound
+    /// frame regardless of fan-out — a cheap gauge of relayed-fallback traffic volume.
+    pub bytes_relayed: AtomicU64,
     /// Process start time, for `/health` uptime.
     pub started: SystemTime,
     /// Validated config.
@@ -95,6 +109,11 @@ impl RelayState {
             pex: Mutex::new(PexRelay::new()),
             connected: AtomicU64::new(0),
             open_connections: AtomicU64::new(0),
+            stun_requests: AtomicU64::new(0),
+            hole_punch_requests: AtomicU64::new(0),
+            hole_punch_successes: AtomicU64::new(0),
+            hole_punch_failures: AtomicU64::new(0),
+            bytes_relayed: AtomicU64::new(0),
             started: SystemTime::now(),
             config,
             tls,
@@ -104,6 +123,35 @@ impl RelayState {
     /// Seconds since process start (saturating).
     pub fn uptime_secs(&self) -> u64 {
         self.started.elapsed().map(|d| d.as_secs()).unwrap_or(0)
+    }
+
+    /// Fold one inbound [`RelayMessage`] into the dashboard traffic counters. Called for every parsed
+    /// RLY frame; only relayed-traffic and NAT-traversal kinds move a counter, everything else is a
+    /// no-op. Cheap (a `match` + a `Relaxed` atomic add) so it never slows the hot path.
+    ///
+    /// The counters are observational gauges: `HolePunchRequest`/`Result` are counted as they arrive
+    /// (an attempt/outcome the requester reported), and relayed bytes are the `payload` length of each
+    /// inbound `RelayGossipMessage`/`Broadcast` — counted once per frame, independent of fan-out.
+    pub fn record_relayed(&self, msg: &RelayMessage) {
+        match msg {
+            RelayMessage::RelayGossipMessage { payload, .. }
+            | RelayMessage::Broadcast { payload, .. } => {
+                self.bytes_relayed
+                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            }
+            RelayMessage::HolePunchRequest { .. } => {
+                self.hole_punch_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            RelayMessage::HolePunchResult { success, .. } => {
+                let counter = if *success {
+                    &self.hole_punch_successes
+                } else {
+                    &self.hole_punch_failures
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -577,6 +625,10 @@ where
                 continue;
             }
         };
+
+        // Observational dashboard counters (relayed bytes + hole-punch attempts/outcomes). A cheap
+        // no-op for every other kind; done once per parsed frame, before any routing.
+        state.record_relayed(&msg);
 
         // GetPeers is handled here (needs a registry read the pure dispatcher can't do).
         if let RelayMessage::GetPeers { network_id } = &msg {

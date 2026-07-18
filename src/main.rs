@@ -45,6 +45,9 @@ struct Cli {
     /// Address the HTTP /health listener binds (default [::]:9451, dual-stack IPv6+IPv4).
     #[arg(long, value_name = "ADDR", global = true)]
     health_listen: Option<SocketAddr>,
+    /// Address the HTTP peer-stats dashboard listener binds (default [::]:80, dual-stack IPv6+IPv4).
+    #[arg(long, value_name = "ADDR", global = true)]
+    dashboard_listen: Option<SocketAddr>,
     /// Address the STUN (RFC 5389) UDP listener binds (default [::]:3478, dual-stack IPv6+IPv4).
     #[arg(long, value_name = "ADDR", global = true)]
     stun_listen: Option<SocketAddr>,
@@ -114,6 +117,9 @@ fn apply_overrides(mut config: RelayServerConfig, cli: &Cli) -> RelayServerConfi
     }
     if let Some(a) = cli.health_listen {
         config.health_listen = a;
+    }
+    if let Some(a) = cli.dashboard_listen {
+        config.dashboard_listen = a;
     }
     if let Some(a) = cli.stun_listen {
         config.stun_listen = a;
@@ -355,6 +361,8 @@ mod tests {
             "127.0.0.1:8000",
             "--health-listen",
             "127.0.0.1:8001",
+            "--dashboard-listen",
+            "127.0.0.1:8080",
             "--stun-listen",
             "127.0.0.1:8002",
             "--max-connections",
@@ -375,6 +383,7 @@ mod tests {
         let out = apply_overrides(base, &cli);
         assert_eq!(out.listen, "127.0.0.1:8000".parse().unwrap());
         assert_eq!(out.health_listen, "127.0.0.1:8001".parse().unwrap());
+        assert_eq!(out.dashboard_listen, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(out.stun_listen, "127.0.0.1:8002".parse().unwrap());
         assert_eq!(out.max_connections, 10);
         assert_eq!(out.idle_timeout, Duration::from_secs(5));
