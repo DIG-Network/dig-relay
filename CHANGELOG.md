@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.9.0] - 2026-07-18
+
+### Features
+- **dashboard:** Serve dashboard over HTTPS/WSS + redirect http→https (#11)
+
 ## [0.8.1] - 2026-07-18
 
 ### Bug Fixes
