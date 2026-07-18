@@ -21,11 +21,27 @@ fn register_shape() {
         peer_id: "a".into(),
         network_id: "DIG_MAINNET".into(),
         protocol_version: 1,
+        listen_addrs: vec![],
     });
     assert_eq!(v["type"], "register");
     assert_eq!(v["peer_id"], "a");
     assert_eq!(v["network_id"], "DIG_MAINNET");
     assert_eq!(v["protocol_version"], 1);
+    // B1 (#924): empty `listen_addrs` is omitted from the wire (`skip_serializing_if`), so a legacy
+    // node's register frame is byte-identical to before (NC-6 soft-fork).
+    assert!(
+        v.get("listen_addrs").is_none(),
+        "empty listen_addrs must be omitted from the wire (NC-6 soft-fork)"
+    );
+
+    // A node advertising listen candidates carries them as a flat `listen_addrs` array.
+    let v = json(&RelayMessage::Register {
+        peer_id: "a".into(),
+        network_id: "DIG_MAINNET".into(),
+        protocol_version: 1,
+        listen_addrs: vec!["[::]:9445".parse().unwrap()],
+    });
+    assert_eq!(v["listen_addrs"][0], "[::]:9445");
 }
 
 #[test]
@@ -86,6 +102,19 @@ fn get_peers_and_peers_shape() {
     assert_eq!(v["peers"][0]["protocol_version"], 1);
     assert!(v["peers"][0]["connected_at"].is_u64());
     assert!(v["peers"][0]["last_seen"].is_u64());
+    // B1 (#924): the additive `addresses` field is omitted from the wire when empty
+    // (`skip_serializing_if`), so a peer with no resolved dialable candidates serializes exactly as
+    // before — old readers see an unchanged shape.
+    assert!(
+        v["peers"][0].get("addresses").is_none(),
+        "empty addresses must be omitted from the wire (NC-6 soft-fork)"
+    );
+
+    // A peer WITH resolved dialable candidates carries them as a flat `addresses` array.
+    let mut info = RelayPeerInfo::new("b".into(), "DIG_MAINNET".into(), 1);
+    info.addresses = vec!["203.0.113.7:9445".parse().unwrap()];
+    let v = json(&RelayMessage::Peers { peers: vec![info] });
+    assert_eq!(v["peers"][0]["addresses"][0], "203.0.113.7:9445");
 }
 
 #[test]

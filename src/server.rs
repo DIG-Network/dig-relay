@@ -161,6 +161,10 @@ pub enum Action {
         peer_id: String,
         network_id: String,
         protocol_version: u32,
+        /// The node's advertised gossip listen candidates (RLY-001 `listen_addrs`, B1). The relay
+        /// combines these with the observed reflexive source IP to publish dialable
+        /// `RelayPeerInfo::addresses` to other peers.
+        listen_addrs: Vec<std::net::SocketAddr>,
     },
     /// Forward `msg` to the single peer `to` (scoped to the sender's network).
     ForwardTo { to: String, msg: RelayMessage },
@@ -190,10 +194,12 @@ fn dispatch(session: &Session, msg: RelayMessage) -> Action {
             peer_id,
             network_id,
             protocol_version,
+            listen_addrs,
         } => Action::Register {
             peer_id,
             network_id,
             protocol_version,
+            listen_addrs,
         },
 
         _ if !registered => Action::Error {
@@ -595,6 +601,7 @@ where
                 peer_id,
                 network_id,
                 protocol_version,
+                listen_addrs,
             } => {
                 if !register_peer(
                     &state,
@@ -602,6 +609,7 @@ where
                     peer_id,
                     network_id,
                     protocol_version,
+                    &listen_addrs,
                     peer_addr,
                     &out_tx,
                     &pex_tx,
@@ -733,6 +741,7 @@ async fn register_peer(
     peer_id: String,
     network_id: String,
     protocol_version: u32,
+    listen_addrs: &[std::net::SocketAddr],
     peer_addr: std::net::SocketAddr,
     out_tx: &mpsc::Sender<RelayMessage>,
     pex_tx: &mpsc::Sender<PexMessage>,
@@ -776,8 +785,13 @@ async fn register_peer(
         return false;
     }
 
-    // `RelayPeerInfo::new` stamps connected_at/last_seen with the current unix time.
-    let info = RelayPeerInfo::new(peer_id.clone(), network_id.clone(), protocol_version);
+    // `RelayPeerInfo::new` stamps connected_at/last_seen with the current unix time. B1 (#924): fill
+    // in dialable candidate addresses by substituting the observed reflexive source IP (`peer_addr`)
+    // for any unroutable advertised listen host, keeping the advertised port — so other peers receive
+    // a real `reflexive_IP:port` they can direct-dial. A legacy peer that advertised nothing keeps the
+    // empty list and falls back to identity-only relayed reachability.
+    let mut info = RelayPeerInfo::new(peer_id.clone(), network_id.clone(), protocol_version);
+    info.addresses = crate::dial::resolve_dialable(listen_addrs, peer_addr.ip());
 
     // Anti-hijack (SECURITY_AUDIT_P2P dig-relay #1): the registry refuses to evict a LIVE peer that
     // already holds this id. A genuine reconnect (dead prior channel) is reclaimed; a fresh id is a
@@ -976,6 +990,7 @@ mod tests {
                 peer_id: "a".into(),
                 network_id: "net1".into(),
                 protocol_version: 1,
+                listen_addrs: vec![],
             },
         );
         assert!(matches!(act, Action::Register { .. }));
@@ -1237,6 +1252,7 @@ mod tests {
             "p".into(),
             "net".into(),
             1,
+            &[],
             test_addr(),
             &tx,
             &pex_sink(),
@@ -1287,6 +1303,7 @@ mod tests {
             "second".into(),
             "net".into(),
             1,
+            &[],
             test_addr(),
             &tx,
             &pex_sink(),
@@ -1328,6 +1345,7 @@ mod tests {
                 "p".into(),
                 "net".into(),
                 1,
+                &[],
                 test_addr(),
                 &tx1,
                 &pex_sink(),
@@ -1351,6 +1369,7 @@ mod tests {
             "p".into(),
             "net".into(),
             1,
+            &[],
             test_addr(),
             &tx2,
             &pex_sink(),
@@ -1414,6 +1433,7 @@ mod tests {
                 "p".into(),
                 "net".into(),
                 1,
+                &[],
                 test_addr(),
                 &tx1,
                 &pex_sink(),
@@ -1434,6 +1454,7 @@ mod tests {
                 "p".into(),
                 "net".into(),
                 1,
+                &[],
                 test_addr(),
                 &tx2,
                 &pex_sink(),
@@ -1805,6 +1826,7 @@ mod tests {
             peer_id.into(),
             network_id.into(),
             1,
+            &[],
             addr,
             &out_tx,
             &pex_tx,
@@ -1813,6 +1835,166 @@ mod tests {
         .await;
         assert!(ok, "registration should succeed");
         (session, out_rx, pex_tx, pex_rx)
+    }
+
+    // ---- B1: dialable-address emission (#924) ----
+
+    /// B1: on register, the relay resolves the peer's advertised (private/unspecified) listen
+    /// candidate into a dialable `reflexive_IP:advertised_port` using the observed reflexive source
+    /// IP, and stores it on the peer's `RelayPeerInfo` so `get_peers`/`PeerConnected` hand it to other
+    /// peers for a direct dial.
+    #[tokio::test]
+    async fn register_populates_dialable_addresses_from_reflexive_ip_and_advertised_port() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let mut session = Session::default();
+        let reflexive: SocketAddr = "203.0.113.7:55000".parse().unwrap(); // observed NAT source
+        let advertised: SocketAddr = "192.168.1.5:9445".parse().unwrap(); // node's private listener
+
+        assert!(
+            register_peer(
+                &state,
+                &mut session,
+                "p".into(),
+                "net".into(),
+                1,
+                &[advertised],
+                reflexive,
+                &tx,
+                &pex_sink(),
+                None,
+            )
+            .await
+        );
+
+        let peers = state.registry.lock().await.peers(Some("net"));
+        assert_eq!(
+            peers[0].addresses,
+            vec!["203.0.113.7:9445".parse::<SocketAddr>().unwrap()],
+            "the private listen host is replaced by the reflexive IP, keeping the advertised port"
+        );
+    }
+
+    /// B1 anti-reflection (#926, security HIGH): a peer advertising a globally-routable host it does
+    /// NOT own (a victim's public address) must never be handed to other peers verbatim, or the relay
+    /// would fan out connection-attempts at the victim. The unverifiable third-party host is dropped
+    /// and only the safe reflexive substitution (which points back at the registrant) is emitted.
+    #[tokio::test]
+    async fn register_drops_a_public_address_that_does_not_match_the_reflexive_source() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let mut session = Session::default();
+        let reflexive: SocketAddr = "198.51.100.9:55000".parse().unwrap(); // attacker's real source
+        let victim: SocketAddr = "203.0.113.200:9445".parse().unwrap(); // a public addr it doesn't own
+
+        assert!(
+            register_peer(
+                &state,
+                &mut session,
+                "attacker".into(),
+                "net".into(),
+                1,
+                &[victim],
+                reflexive,
+                &tx,
+                &pex_sink(),
+                None,
+            )
+            .await
+        );
+
+        let peers = state.registry.lock().await.peers(Some("net"));
+        assert!(
+            !peers[0].addresses.contains(&victim),
+            "the unverifiable third-party public address must not be emitted (reflection vector)"
+        );
+        assert_eq!(
+            peers[0].addresses,
+            vec!["198.51.100.9:9445".parse::<SocketAddr>().unwrap()],
+            "only the safe reflexive_IP:advertised_port substitution is emitted"
+        );
+    }
+
+    /// B1 legacy fallback: a peer that advertises no listen candidates (a pre-#924 node) gets an
+    /// empty `addresses` list — it keeps today's identity-only relayed reachability, no regression.
+    #[tokio::test]
+    async fn register_without_advertised_listen_addrs_leaves_addresses_empty() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let mut session = Session::default();
+        assert!(
+            register_peer(
+                &state,
+                &mut session,
+                "p".into(),
+                "net".into(),
+                1,
+                &[],
+                test_addr(),
+                &tx,
+                &pex_sink(),
+                None,
+            )
+            .await
+        );
+        let peers = state.registry.lock().await.peers(Some("net"));
+        assert!(
+            peers[0].addresses.is_empty(),
+            "no advertised candidates → no resolved dialable addresses"
+        );
+    }
+
+    // ---- B2: relayed-forwarder hardening (#924) ----
+
+    /// B2 network-scope: `forward_to` only reaches a peer on the SENDER's network. A peer registered
+    /// on a DIFFERENT network is not routable — the forward is refused with `PEER_NOT_FOUND`, never
+    /// crossing the network boundary (the relay forwards only between same-`network_id` peers).
+    #[tokio::test]
+    async fn forward_to_a_peer_on_another_network_is_refused() {
+        let state = RelayState::new(RelayServerConfig::default());
+        // "b" is registered on net2.
+        let (btx, mut brx) = mpsc::channel(64);
+        state.registry.lock().await.register(
+            "b".into(),
+            "net2".into(),
+            RelayPeerInfo::new("b".into(), "net2".into(), 1),
+            btx,
+        );
+        // The sender is on net1 and tries to forward to "b".
+        let (atx, mut arx) = mpsc::channel(64);
+        let session = Session {
+            peer_id: Some("me".into()),
+            network_id: Some("net1".into()),
+            ..Default::default()
+        };
+        forward_to(
+            &state,
+            &session,
+            "b",
+            RelayMessage::RelayGossipMessage {
+                from: "me".into(),
+                to: "b".into(),
+                payload: vec![1, 2, 3],
+                seq: 1,
+            },
+            &atx,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                drain(&mut arx)[0],
+                RelayMessage::Error {
+                    code: errcode::PEER_NOT_FOUND,
+                    ..
+                }
+            ),
+            "a cross-network forward must be refused, not delivered"
+        );
+        assert!(
+            drain(&mut brx).is_empty(),
+            "the other-network peer must receive nothing"
+        );
     }
 
     // ---- Proof-of-possession (mTLS `verified_peer_id`, SPEC.md §3.2/§8, issue #5) ----
@@ -1834,6 +2016,7 @@ mod tests {
             "abc123".into(),
             "net".into(),
             1,
+            &[],
             test_addr(),
             &tx,
             &pex_sink(),
@@ -1866,6 +2049,7 @@ mod tests {
             "spoofed-id".into(),
             "net".into(),
             1,
+            &[],
             test_addr(),
             &tx,
             &pex_sink(),
@@ -1915,6 +2099,7 @@ mod tests {
             "spoofed".into(),
             "net".into(),
             1,
+            &[],
             test_addr(),
             &tx,
             &pex_sink(),

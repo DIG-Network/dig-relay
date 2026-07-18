@@ -100,6 +100,7 @@ async fn two_nat_blocked_peers_exchange_through_the_relay() {
             peer_id: "peerB".into(),
             network_id: "DIG_MAINNET".into(),
             protocol_version: 1,
+            listen_addrs: vec![],
         },
     )
     .await;
@@ -118,6 +119,7 @@ async fn two_nat_blocked_peers_exchange_through_the_relay() {
             peer_id: "peerA".into(),
             network_id: "DIG_MAINNET".into(),
             protocol_version: 1,
+            listen_addrs: vec![],
         },
     )
     .await;
@@ -190,6 +192,7 @@ async fn forward_to_unknown_peer_returns_peer_not_found() {
             peer_id: "peerA".into(),
             network_id: "DIG_MAINNET".into(),
             protocol_version: 1,
+            listen_addrs: vec![],
         },
     )
     .await;

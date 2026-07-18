@@ -103,6 +103,7 @@ async fn register_ok(ws: &mut Ws, peer_id: &str, network_id: &str) {
             peer_id: peer_id.into(),
             network_id: network_id.into(),
             protocol_version: 1,
+            listen_addrs: vec![],
         },
     )
     .await;
@@ -153,6 +154,7 @@ async fn at_capacity_a_new_connection_is_refused_before_the_handshake() {
                     peer_id: "B".into(),
                     network_id: "net".into(),
                     protocol_version: 1,
+                    listen_addrs: vec![],
                 },
             )
             .await;
@@ -423,6 +425,7 @@ async fn a_second_live_connection_cannot_hijack_an_existing_peer_id() {
             peer_id: "victim".into(),
             network_id: "net".into(),
             protocol_version: 1,
+            listen_addrs: vec![],
         },
     )
     .await;
@@ -554,5 +557,88 @@ async fn an_unregistered_connection_is_reaped_after_the_register_timeout() {
     assert!(
         reaped,
         "an unregistered connection must be reaped after the register timeout"
+    );
+}
+
+/// B1 (#924): a NAT'd node advertising a private gossip listen candidate in `Register.listen_addrs`
+/// is handed back — to ANOTHER peer's `get_peers` — a DIALABLE address whose host is the relay-
+/// observed reflexive source IP and whose port is the advertised listen port. This is the direct-dial
+/// enabler: the querying peer learns a real `IP:port` it can connect to, not just an identity.
+#[tokio::test]
+async fn get_peers_returns_a_dialable_reflexive_address_for_a_nat_advertised_listener() {
+    let (url, _health) = start_relay(4096).await;
+
+    // A registers advertising a PRIVATE listen host (the usual NAT case); the relay must substitute
+    // the observed reflexive source IP (here loopback, since the client connects over 127.0.0.1) and
+    // keep the advertised port 9445.
+    let mut a = connect(&url).await;
+    send(
+        &mut a,
+        &RelayMessage::Register {
+            peer_id: "A".into(),
+            network_id: "net".into(),
+            protocol_version: 1,
+            listen_addrs: vec!["192.168.7.7:9445".parse().unwrap()],
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_msg(&mut a).await,
+        RelayMessage::RegisterAck { success: true, .. }
+    ));
+
+    // B registers, then queries the peer list and must see A with a resolved dialable address.
+    let mut b = connect(&url).await;
+    register_ok(&mut b, "B", "net").await;
+    send(&mut b, &RelayMessage::GetPeers { network_id: None }).await;
+
+    let peers = loop {
+        match next_msg(&mut b).await {
+            RelayMessage::Peers { peers } => break peers,
+            _ => continue, // skip the PeerConnected notification for A, etc.
+        }
+    };
+    let a_info = peers
+        .iter()
+        .find(|p| p.peer_id == "A")
+        .expect("B should see A in the peer list");
+    assert_eq!(
+        a_info.addresses,
+        vec!["127.0.0.1:9445".parse::<std::net::SocketAddr>().unwrap()],
+        "A's private listen host is replaced by its reflexive IP, keeping the advertised port"
+    );
+}
+
+/// B2 (#924): the relay caps the size of a single inbound WebSocket message. A frame larger than
+/// `max_message_bytes` is rejected at the protocol layer (the connection is torn down), so one
+/// connection cannot force the relay to buffer an unbounded reassembly (SECURITY_AUDIT_P2P #4).
+#[tokio::test]
+async fn an_oversized_frame_is_rejected_and_never_reassembled() {
+    let (url, _health) = start_relay_with(RelayServerConfig {
+        max_message_bytes: 4 * 1024, // tiny cap for the test
+        ..Default::default()
+    })
+    .await;
+
+    let mut a = connect(&url).await;
+    register_ok(&mut a, "A", "net").await;
+
+    // Send a frame well beyond the cap. tungstenite enforces max_message_size on the READ side, so
+    // the relay closes the connection rather than buffering the oversized payload.
+    let huge = Message::Text("x".repeat(64 * 1024));
+    let _ = a.send(huge).await; // may succeed locally; the relay rejects on read
+
+    // The connection must terminate (close/None/error) rather than the relay accepting the frame.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let closed = loop {
+        match tokio::time::timeout_at(deadline, a.next()).await {
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break true,
+            Ok(Some(Ok(_))) => continue,
+            Err(_) => break false,
+        }
+    };
+    assert!(
+        closed,
+        "an oversized frame must cause the relay to reject the connection, not reassemble it"
     );
 }

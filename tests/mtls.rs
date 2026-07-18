@@ -233,6 +233,7 @@ async fn a_client_registering_its_own_certificate_derived_peer_id_is_accepted() 
             peer_id: peer_id.clone(),
             network_id: "net".into(),
             protocol_version: 1,
+            listen_addrs: vec![],
         },
     )
     .await;
@@ -259,6 +260,7 @@ async fn a_client_registering_a_spoofed_peer_id_is_rejected_with_identity_mismat
             peer_id: "0".repeat(64), // spoofed: not this client's own cert-derived id
             network_id: "net".into(),
             protocol_version: 1,
+            listen_addrs: vec![],
         },
     )
     .await;

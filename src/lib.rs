@@ -14,8 +14,9 @@
 //!
 //! Layering: [`wire`] is the vendored relay wire types plus the RLY-008 PEX message; [`config`] is
 //! pure validated configuration; [`net`] is the shared IPv6-first/IPv4-fallback dual-stack socket
-//! bind helper every listener binds through; [`registry`] is the in-memory peer registry plus pure
-//! routing decisions; [`pex`] embeds the `dig-pex` `PexEngine` for the introducer PEX binding
+//! bind helper every listener binds through; [`dial`] is the pure B1 direct-dial candidate resolver
+//! (reflexive-IP substitution over advertised listen ports); [`registry`] is the in-memory peer
+//! registry plus pure routing decisions; [`pex`] embeds the `dig-pex` `PexEngine` for the introducer PEX binding
 //! (registry mirroring, per-network scoping, and the introducer-only discard rule); [`server`] is
 //! the WebSocket accept loop, the per-connection task, the pure `RelayMessage` dispatcher, and the
 //! PEX housekeeping tick; [`stun`] is the RFC 5389 STUN Binding responder (UDP) that tells a node
@@ -26,6 +27,7 @@
 //! Windows SCM dispatcher.
 
 pub mod config;
+pub mod dial;
 pub mod health;
 pub mod net;
 pub mod pex;

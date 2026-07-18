@@ -70,6 +70,36 @@ IPv4-mapped loopback is not universally supported by every OS/network stack.
 
 Reference: `src/service.rs::loopback_probe_addr` (pure) + `probe_health` (the I/O wrapper).
 
+### 2.9 Dialable-address resolution (B1, normative)
+
+On registration the relay observes the peer's reflexive source address (the remote address of its
+outbound WebSocket) — a public IP, but an ephemeral NAT source PORT, not the node's inbound gossip
+listener. A node therefore advertises its gossip LISTEN candidate(s) in `Register.listen_addrs`
+(IPv6-first, §2.1), where the useful part is the PORT (a dual-stack node binds the unspecified host
+`[::]`). The relay resolves each advertised candidate into a DIALABLE `RelayPeerInfo.addresses` entry:
+
+- if the advertised host is **not globally routable** (unspecified, loopback, IPv4 private/link-local,
+  or IPv6 unique-local `fc00::/7`/link-local `fe80::/10`, including IPv4-mapped forms) → substitute the
+  observed reflexive IP and keep the advertised PORT → a real `reflexive_IP:port`;
+- if the advertised host is **globally routable**, it is kept verbatim ONLY when it verifiably belongs
+  to the peer's own observed source — the advertised IPv4 equals the reflexive IP, or the advertised
+  IPv6 shares the reflexive `/64` prefix (one prefix covers a peer's privacy/temporary addresses).
+  Otherwise the advertised host is an unverifiable third party (an attacker advertising a victim's
+  public address to make the relay fan out connection-attempts at it — a reflection vector): the relay
+  **MUST NOT emit that address**. It is dropped and replaced by the safe `reflexive_IP:advertised_port`
+  substitution, which can only point back at the registrant's own source. The relay therefore never
+  emits a public address that is not tied to the peer's own observed source.
+
+The emitted candidate set is **capped at 8** so one registration cannot make the relay publish an
+unbounded address list. Results are IPv6-first and de-duplicated. A peer that advertises no
+`listen_addrs` (a pre-#924 node)
+gets an empty `addresses` list and falls back to identity-only relayed reachability. A dialer treats
+each entry as a Direct candidate and races them IPv6-first (happy-eyeballs, §2.1); a bogus candidate
+merely fails to connect — the mTLS handshake still binds the dialed endpoint to the expected
+`peer_id = SHA-256(TLS SPKI DER)` (§8), so the relay cannot cause a peer to be impersonated.
+
+Reference: `src/dial.rs::resolve_dialable` (pure) + `src/server.rs::register_peer` (population).
+
 ## 3. Wire protocol
 
 The relay implements the SERVER side of the `RelayMessage` wire (JSON, one message per WebSocket
@@ -78,10 +108,10 @@ byte-identically into `src/wire.rs` (pinned by `tests/wire_conformance.rs`). Mes
 
 | Requirement | Messages | Behavior |
 |---|---|---|
-| RLY-001 Registration | `Register` → `RegisterAck` | Registers `peer_id` + `network_id` + `protocol_version` in the in-memory registry; rejects a `network_id` mismatch; rejects a `peer_id` already held by a LIVE connection (§3.2); `RegisterAck{success, message, connected_peers}`. Holding this connection open is the node's reachability reservation. |
-| RLY-002 Targeted forward | `RelayGossipMessage{from,to,payload,seq}` | Forwards `payload` to the single registered peer `to` in the sender's network. |
+| RLY-001 Registration | `Register{peer_id,network_id,protocol_version,listen_addrs}` → `RegisterAck` | Registers `peer_id` + `network_id` + `protocol_version` in the in-memory registry; rejects a `network_id` mismatch; rejects a `peer_id` already held by a LIVE connection (§3.2); `RegisterAck{success, message, connected_peers}`. Holding this connection open is the node's reachability reservation. `listen_addrs` (optional, additive) advertises the node's gossip LISTEN candidate(s), IPv6-first — the relay uses each candidate's PORT with the observed reflexive source IP to publish dialable `RelayPeerInfo.addresses` (§2.9). An empty/absent `listen_addrs` is a pre-#924 node and yields no resolved addresses. |
+| RLY-002 Targeted forward | `RelayGossipMessage{from,to,payload,seq}` | Forwards `payload` to the single registered peer `to` in the sender's network; re-stamps `from` to the registered id (no sender spoofing); refuses a `to` on another network (`PEER_NOT_FOUND`). Bounded per-target outbound queue + oversized-frame rejection cap the relay's memory (§3.2). |
 | RLY-003 Broadcast | `Broadcast{from,payload,exclude}` | Fans `payload` out to every registered peer in the sender's network except `from` and any peer in `exclude`. |
-| RLY-005 Introducer | `GetPeers{network_id}` → `Peers{peers}` | Returns the relay's registered-peer list for a network; while registered, a node additionally receives `PeerConnected`/`PeerDisconnected` pushes for same-network peers. |
+| RLY-005 Introducer | `GetPeers{network_id}` → `Peers{peers}` | Returns the relay's registered-peer list for a network; while registered, a node additionally receives `PeerConnected`/`PeerDisconnected` pushes for same-network peers. Each `RelayPeerInfo` carries `addresses` — the relay-resolved dialable candidates (§2.9), IPv6-first — so a querying peer learns a real `IP:port` to direct-dial. |
 | RLY-006 Keepalive | `Ping`/`Pong` | Bidirectional liveness; an idle connection past `idle_timeout` is reaped. |
 | RLY-007 Hole-punch coordination | `HolePunchRequest{peer_id,target_peer_id,external_addr}` → `HolePunchCoordinate{peer_id,external_addr}` (to target) → `HolePunchResult` | Exchanges each side's STUN-derived reflexive address so both peers can attempt a simultaneous-open hole punch; the relay carries no application data for this path. |
 | RLY-008 Peer Exchange (PEX) | `pex_handshake` / `pex_snapshot` / `pex_delta` / `pex_error` | Purely additive introducer PUSH binding (§4). |

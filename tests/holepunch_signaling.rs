@@ -101,6 +101,7 @@ async fn connect_and_register(
             peer_id: peer_id.into(),
             network_id: "DIG_MAINNET".into(),
             protocol_version: 1,
+            listen_addrs: vec![],
         },
     )
     .await;
