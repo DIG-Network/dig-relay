@@ -93,7 +93,10 @@ listener. A node therefore advertises its gossip LISTEN candidate(s) in `Registe
   emits a public address that is not tied to the peer's own observed source.
 
 The emitted candidate set is **capped at 8** so one registration cannot make the relay publish an
-unbounded address list. Results are IPv6-first and de-duplicated. A peer that advertises no
+unbounded address list. Results are ordered IPv6-first (§2.1) via the ecosystem's canonical
+`dig_ip::Family` keying — the single source of truth for the address-family judgement shared with
+every DIG peer crate, so an IPv4-mapped IPv6 candidate (`::ffff:a.b.c.d`) is ranked as IPv4 — and
+de-duplicated. A peer that advertises no
 `listen_addrs` (a pre-#924 node)
 gets an empty `addresses` list and falls back to identity-only relayed reachability. A dialer treats
 each entry as a Direct candidate and races them IPv6-first (happy-eyeballs, §2.1); a bogus candidate
