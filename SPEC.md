@@ -269,7 +269,10 @@ served on its own listener so an NLB's HTTP health check can never collide with 
 A READ-ONLY HTTP dashboard is served on `dashboard_listen` (§2, default `[::]:80`) so
 `http://relay.dig.net/` resolves to a live operations overview. It exposes exactly two routes and is
 built entirely from the relay's EXISTING in-memory state (the peer registry + cheap atomic counters);
-it never touches the `RelayMessage` wire and never mutates state.
+it never touches the `RelayMessage` wire and never mutates state. Because it is observational and
+binds a privileged port, its listener is NON-FATAL: if it cannot bind (e.g. `:80` on an unprivileged
+self-hosted relay), the relay logs a warning and keeps serving the wire/health/STUN listeners
+normally (point `--dashboard-listen` at a high port to enable it there).
 
 - `GET /` → an HTML overview page (auto-refreshing ~every 5 s) that fetches `/stats.json` and renders
   it, handling the loading / error / empty / success states.

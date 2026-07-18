@@ -90,16 +90,29 @@ pub async fn serve_with_shutdown(
     };
     let state = RelayState::new_with_tls(config, tls);
 
+    // The peer-stats dashboard is a purely-observational HTTP surface on a privileged port (default
+    // `:80`). It must NEVER be able to tear down the relay's peer wire — and on an unprivileged host
+    // it may not be able to bind `:80` at all — so it runs as a background task whose failure is a
+    // logged warning, not a fatal serve error (unlike the wire/health/STUN listeners below). On the
+    // canonical Fargate deployment `:80` binds cleanly; a self-hosted relay lacking the privilege
+    // keeps serving the wire and can point `--dashboard-listen` at a high port.
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            if let Err(e) = dashboard::run(state).await {
+                tracing::warn!(error = %e, "dig-relay dashboard listener stopped (relay wire unaffected)");
+            }
+        }
+    });
+
     let relay = server::run(state.clone());
     let health = health::run(state.clone());
-    let dashboard = dashboard::run(state.clone());
     let stun = stun::run(state.clone());
 
-    // Whichever listener exits first (or the shutdown signal) ends serving.
+    // Whichever core listener exits first (or the shutdown signal) ends serving.
     tokio::select! {
         r = relay => r,
         h = health => h,
-        d = dashboard => d,
         s = stun => s,
         _ = shutdown => Ok(()),
     }
