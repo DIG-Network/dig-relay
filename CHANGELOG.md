@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.8.1] - 2026-07-18
+
+### Bug Fixes
+- **docker:** Copy assets/ into the build context for the embedded mascot (#10)
+
 ## [0.8.0] - 2026-07-18
 
 ### Features
