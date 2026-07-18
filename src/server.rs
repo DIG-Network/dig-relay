@@ -500,7 +500,7 @@ async fn pex_housekeeping(state: Arc<RelayState>) {
 /// requires the `Register` message's claimed `peer_id` to equal it.
 async fn handle_connection<S>(
     state: Arc<RelayState>,
-    stream: S,
+    mut stream: S,
     peer_addr: std::net::SocketAddr,
     verified_peer_id: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
@@ -517,6 +517,17 @@ where
     }
     let _open_guard = OpenConnectionGuard::acquire(&state);
 
+    // This one TLS-terminated port carries BOTH surfaces (dig_ecosystem #1041): peek the HTTP request
+    // head, and route on it. A WebSocket upgrade is a relay-wire peer — its request bytes are replayed
+    // to the handshake unchanged via `Prefixed`, so the wire path stays byte-for-byte the same. Any
+    // other request is a browser reaching the peer-stats dashboard over https://relay.dig.net/ — it is
+    // served here and the connection closes. (Plain http://:80 is a separate redirect listener.)
+    let (head, consumed) = crate::http_serve::read_request_head(&mut stream).await?;
+    if !head.is_websocket_upgrade {
+        crate::dashboard::serve_http(&state, &mut stream, &head).await?;
+        return Ok(());
+    }
+
     // Cap the WebSocket message/frame size at a small realistic bound (SECURITY_AUDIT_P2P dig-relay
     // #4). All relay control/gossip frames (register, ping, hole_punch, get_peers, RelayGossipMessage,
     // PEX) are tiny; tungstenite's 64 MiB default would let each connection force the server to buffer
@@ -528,6 +539,7 @@ where
         max_frame_size: Some(state.config.max_message_bytes),
         ..Default::default()
     };
+    let stream = crate::http_serve::Prefixed::new(consumed, stream);
     let ws = tokio_tungstenite::accept_async_with_config(stream, Some(ws_config)).await?;
     let (mut write, mut read) = ws.split();
 

@@ -31,6 +31,7 @@ pub mod config;
 pub mod dashboard;
 pub mod dial;
 pub mod health;
+pub mod http_serve;
 pub mod net;
 pub mod pex;
 pub mod registry;
@@ -90,17 +91,17 @@ pub async fn serve_with_shutdown(
     };
     let state = RelayState::new_with_tls(config, tls);
 
-    // The peer-stats dashboard is a purely-observational HTTP surface on a privileged port (default
-    // `:80`). It must NEVER be able to tear down the relay's peer wire — and on an unprivileged host
-    // it may not be able to bind `:80` at all — so it runs as a background task whose failure is a
-    // logged warning, not a fatal serve error (unlike the wire/health/STUN listeners below). On the
-    // canonical Fargate deployment `:80` binds cleanly; a self-hosted relay lacking the privilege
-    // keeps serving the wire and can point `--dashboard-listen` at a high port.
+    // The relay supports only HTTPS/WSS (dig_ecosystem #1041): the peer-stats dashboard is served
+    // over TLS on the wire listener itself (a browser `GET /` on `:443`; a WS upgrade is the peer
+    // wire), and THIS listener — the `--dashboard-listen` port (default `:80`) — only bounces plain
+    // HTTP to `https://`. It must NEVER be able to tear down the relay's peer wire, and an
+    // unprivileged host may not bind `:80`, so it runs as a background task whose failure is a logged
+    // warning, not a fatal serve error (unlike the wire/health/STUN listeners below).
     tokio::spawn({
-        let state = state.clone();
+        let redirect_listen = state.config.dashboard_listen;
         async move {
-            if let Err(e) = dashboard::run(state).await {
-                tracing::warn!(error = %e, "dig-relay dashboard listener stopped (relay wire unaffected)");
+            if let Err(e) = dashboard::run_redirect(redirect_listen).await {
+                tracing::warn!(error = %e, "dig-relay http→https redirect listener stopped (relay wire unaffected)");
             }
         }
     });

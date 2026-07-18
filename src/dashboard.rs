@@ -19,16 +19,11 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Query, State};
-use axum::http::header;
-use axum::response::{Html, IntoResponse};
-use axum::routing::get;
-use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
+use crate::http_serve::RequestHead;
 use crate::net::bind_tcp_dual_stack;
 use crate::server::RelayState;
 use crate::wire::RelayPeerInfo;
@@ -121,18 +116,13 @@ pub struct StatsSnapshot {
     pub peers: Vec<PeerRow>,
 }
 
-/// Query parameters for both routes: `?full=1` reveals full `peer_id`s (default: truncated).
-#[derive(Debug, Clone, Default, Deserialize)]
-struct DashboardQuery {
-    #[serde(default)]
-    full: Option<String>,
-}
-
-impl DashboardQuery {
-    /// Whether the caller opted into un-truncated `peer_id`s (`?full=1`/`true`/`yes`).
-    fn wants_full(&self) -> bool {
-        matches!(self.full.as_deref(), Some("1" | "true" | "yes"))
-    }
+/// Whether a request target opts into un-truncated `peer_id`s via `?full=1`/`true`/`yes` (default:
+/// truncated, the privacy default). Matches the query anywhere in the target so it works for both
+/// `/stats.json?full=1` and `/?full=1`.
+fn wants_full(target: &str) -> bool {
+    ["full=1", "full=true", "full=yes"]
+        .iter()
+        .any(|needle| target.contains(needle))
 }
 
 /// Build the dashboard snapshot from the relay's registry peers + a counters read. PURE (no I/O, no
@@ -246,52 +236,123 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// `GET /stats.json` — the machine-readable snapshot. Locks the registry briefly to clone the peer
-/// list, reads the counters, then builds the snapshot with the pure [`build_snapshot`].
-async fn stats(
-    State(state): State<Arc<RelayState>>,
-    Query(q): Query<DashboardQuery>,
-) -> Json<StatsSnapshot> {
+/// A ready-to-write dashboard HTTP response — a status, a content type, an optional `Cache-Control`,
+/// and the body bytes. Decoupled from any transport so [`route`] is pure/synchronous-to-reason-about
+/// and the same responses serve the `:443` wire listener (over the TLS-terminated socket) directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardResponse {
+    pub status: u16,
+    pub reason: &'static str,
+    pub content_type: &'static str,
+    pub cache_control: Option<&'static str>,
+    pub body: Vec<u8>,
+}
+
+/// Route a dashboard request path to its response: `/` → the HTML overview, `/stats.json` → the
+/// machine-readable snapshot, `/mascot.png` → the embedded mascot, anything else → 404. `snapshot` is
+/// the already-built stats (the caller reads the live registry so this stays free of I/O and locks).
+pub fn route(path: &str, snapshot: &StatsSnapshot) -> DashboardResponse {
+    match path {
+        "/" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "text/html; charset=utf-8",
+            cache_control: None,
+            body: DASHBOARD_HTML.as_bytes().to_vec(),
+        },
+        "/stats.json" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "application/json",
+            cache_control: Some("no-store"),
+            body: serde_json::to_vec(snapshot).unwrap_or_else(|_| b"{}".to_vec()),
+        },
+        "/mascot.png" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "image/png",
+            cache_control: Some("public, max-age=31536000, immutable"),
+            body: MASCOT_PNG.to_vec(),
+        },
+        _ => DashboardResponse {
+            status: 404,
+            reason: "Not Found",
+            content_type: "text/plain; charset=utf-8",
+            cache_control: None,
+            body: b"not found\n".to_vec(),
+        },
+    }
+}
+
+/// Build the live stats snapshot from the relay's registry + counters (locks the registry briefly).
+/// Shared by the `/stats.json` route and the HTML page's data.
+pub async fn live_snapshot(state: &RelayState, full: bool) -> StatsSnapshot {
     let peers = state.registry.lock().await.peers(None);
-    let snapshot = build_snapshot(
+    build_snapshot(
         peers,
-        counters_of(&state),
+        counters_of(state),
         state.uptime_secs(),
         now_secs(),
-        q.wants_full(),
-    );
-    Json(snapshot)
-}
-
-/// `GET /` — the HTML overview. Static markup + client-side JS that fetches `/stats.json` and
-/// renders it (handling loading / error / empty / success), auto-refreshing every ~5 s.
-async fn index() -> Html<&'static str> {
-    Html(DASHBOARD_HTML)
-}
-
-/// `GET /mascot.png` — the DIG Network robot mascot, served from the [`MASCOT_PNG`] embedded in the
-/// binary with a long immutable cache (the asset never changes within a build).
-async fn mascot() -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "image/png"),
-            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-        ],
-        MASCOT_PNG,
+        full,
     )
 }
 
-/// Serve the dashboard (`GET /` + `GET /stats.json` + `GET /mascot.png`) until the listener errors.
-/// Binds `state.config.dashboard_listen` dual-stack (IPv6-first, IPv4-fallback — see [`crate::net`]).
-pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/stats.json", get(stats))
-        .route("/mascot.png", get(mascot))
-        .with_state(state.clone());
-    let listener = bind_tcp_dual_stack(state.config.dashboard_listen)?;
-    tracing::info!(addr = %state.config.dashboard_listen, "dig-relay dashboard listening (HTTP)");
-    axum::serve(listener, app).await
+/// Serve ONE dashboard HTTP request over an already-accepted (TLS-terminated-upstream) stream — the
+/// non-WebSocket branch of the relay's `:443` listener. `head` is the request the wire accept loop
+/// already peeked; this reads the live stats, routes the path, and writes the response.
+pub async fn serve_http<S>(
+    state: &RelayState,
+    stream: &mut S,
+    head: &RequestHead,
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let snapshot = live_snapshot(state, wants_full(&head.target)).await;
+    let resp = route(head.path(), &snapshot);
+    let mut headers: Vec<(&str, &str)> = vec![("Content-Type", resp.content_type)];
+    if let Some(cc) = resp.cache_control {
+        headers.push(("Cache-Control", cc));
+    }
+    crate::http_serve::write_response(stream, resp.status, resp.reason, &headers, &resp.body).await
+}
+
+/// The absolute `https://` URL a plain-HTTP request should be redirected to. Uses the request's own
+/// `Host` header so it works for any hostname the relay is fronted under; falls back to
+/// `relay.dig.net` when a (non-conformant) request omits `Host`.
+pub fn https_location(head: &RequestHead) -> String {
+    let host = head.host.as_deref().unwrap_or("relay.dig.net");
+    format!("https://{host}{}", head.target)
+}
+
+/// Run the plain-HTTP redirect listener on `listen` (dual-stack): every request gets a
+/// `301 → https://<host><path>`. The relay supports only HTTPS/WSS, so `:80` exists solely to bounce
+/// browsers to the secure origin — it never serves content.
+pub async fn run_redirect(listen: SocketAddr) -> std::io::Result<()> {
+    let listener = bind_tcp_dual_stack(listen)?;
+    tracing::info!(addr = %listen, "dig-relay http→https redirect listening");
+    loop {
+        let (mut stream, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "redirect accept failed");
+                continue;
+            }
+        };
+        tokio::spawn(async move {
+            if let Ok((head, _)) = crate::http_serve::read_request_head(&mut stream).await {
+                let location = https_location(&head);
+                let _ = crate::http_serve::write_response(
+                    &mut stream,
+                    301,
+                    "Moved Permanently",
+                    &[("Location", &location)],
+                    b"",
+                )
+                .await;
+            }
+        });
+    }
 }
 
 /// The dashboard page. Fully static (the live data arrives from `/stats.json`), so no server-side
@@ -636,19 +697,55 @@ mod tests {
     }
 
     #[test]
-    fn query_wants_full_only_for_truthy_values() {
-        let full = |s: Option<&str>| {
-            DashboardQuery {
-                full: s.map(str::to_string),
-            }
-            .wants_full()
+    fn wants_full_only_for_truthy_query_values() {
+        assert!(wants_full("/stats.json?full=1"));
+        assert!(wants_full("/?full=true"));
+        assert!(wants_full("/stats.json?full=yes"));
+        assert!(!wants_full("/stats.json?full=0"));
+        assert!(!wants_full("/stats.json"));
+        assert!(!wants_full("/"));
+    }
+
+    #[test]
+    fn route_serves_the_three_surfaces_and_404s_the_rest() {
+        let snap = build_snapshot(vec![], Counters::default(), 0, 0, false);
+        let html = route("/", &snap);
+        assert_eq!(html.status, 200);
+        assert_eq!(html.content_type, "text/html; charset=utf-8");
+        assert!(html.body.starts_with(b"<!DOCTYPE html>"));
+
+        let json = route("/stats.json", &snap);
+        assert_eq!(json.status, 200);
+        assert_eq!(json.content_type, "application/json");
+        assert!(json.body.starts_with(b"{"));
+
+        let png = route("/mascot.png", &snap);
+        assert_eq!(png.status, 200);
+        assert_eq!(png.content_type, "image/png");
+        assert_eq!(&png.body[..8], b"\x89PNG\r\n\x1a\n");
+
+        let missing = route("/nope", &snap);
+        assert_eq!(missing.status, 404);
+    }
+
+    #[test]
+    fn https_location_uses_the_request_host_and_target() {
+        let head = RequestHead {
+            method: "GET".into(),
+            target: "/stats.json?full=1".into(),
+            host: Some("relay.dig.net".into()),
+            is_websocket_upgrade: false,
         };
-        assert!(full(Some("1")));
-        assert!(full(Some("true")));
-        assert!(full(Some("yes")));
-        assert!(!full(Some("0")));
-        assert!(!full(Some("")));
-        assert!(!full(None));
+        assert_eq!(
+            https_location(&head),
+            "https://relay.dig.net/stats.json?full=1"
+        );
+        // A (non-conformant) request without Host still yields an absolute, secure Location.
+        let no_host = RequestHead { host: None, ..head };
+        assert_eq!(
+            https_location(&no_host),
+            "https://relay.dig.net/stats.json?full=1"
+        );
     }
 
     #[test]
