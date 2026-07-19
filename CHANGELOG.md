@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.0] - 2026-07-19
+
+### Features
+- **dial:** Order reflexive candidates via canonical dig-ip Family (#12)
+
 ## [0.9.0] - 2026-07-18
 
 ### Features
