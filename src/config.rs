@@ -104,6 +104,40 @@ pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 30;
 /// echo the client would not send.
 pub const DEFAULT_LIVENESS_DEADLINE_SECS: u64 = 90;
 
+/// Default cap on concurrent OPEN connections from a single source IP (#1386). The global
+/// [`DEFAULT_MAX_CONNECTIONS`] cap alone lets one abusive host exhaust every slot; this per-IP cap
+/// means no single source can hold more than a modest share, so a distributed set of legitimate
+/// nodes always has room. A legitimate host runs one (or a handful of) node(s), so 64 is generous;
+/// `0` disables the per-IP cap (STUN-limit precedent). SHOULD be `<= max_connections`.
+pub const DEFAULT_MAX_CONNECTIONS_PER_IP: u32 = 64;
+
+/// Default per-source-IP registration RATE budget (RLY-001 `Register` attempts per second per IP,
+/// #1386). Registration is comparatively expensive (registry insert + PEX mirror + peer fan-out), so
+/// a single IP hammering `Register` is throttled to this sustained rate; `0` disables the limit. A
+/// real node registers once per connection, so a handful per second per IP is far above legitimate need.
+pub const DEFAULT_REGISTRATIONS_PER_IP_PER_SEC: u32 = 10;
+
+/// Default cap on CONCURRENT live registrations from a single source IP (#1386). Bounds how many
+/// distinct `peer_id`s one source may hold registered at once (each is an advertisable introduction),
+/// so one host cannot flood the peer set other nodes are handed. `0` disables the cap.
+pub const DEFAULT_MAX_REGISTRATIONS_PER_IP: u32 = 128;
+
+/// Default per-connection inbound MESSAGE-rate budget (frames per second, #1386). A well-behaved peer
+/// sends keepalives + occasional control/gossip frames; a connection exceeding this sustained frame
+/// rate is a flood and the connection is disconnected. `0` disables the per-connection message limit.
+pub const DEFAULT_MESSAGES_PER_CONN_PER_SEC: u32 = 256;
+
+/// Default per-connection inbound BYTE-rate budget (bytes per second, #1386). Caps sustained inbound
+/// throughput per connection independently of frame count; a connection exceeding it is disconnected.
+/// `0` disables the per-connection byte-rate limit. 1 MiB/s is generous for relay control/gossip.
+pub const DEFAULT_BYTES_PER_CONN_PER_SEC: u32 = 1_048_576;
+
+/// Default CUMULATIVE inbound-bytes ceiling for a single connection's whole lifetime (#1386). A
+/// connection that has relayed more than this total is disconnected regardless of its instantaneous
+/// rate, bounding the work one long-lived connection can extract. `0` disables the cumulative cap.
+/// 1 GiB is far above any legitimate relay-fallback session.
+pub const DEFAULT_MAX_RELAYED_BYTES_PER_CONN: u64 = 1_073_741_824;
+
 /// Validated relay server configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayServerConfig {
@@ -153,6 +187,26 @@ pub struct RelayServerConfig {
     /// Optional path to the relay's OWN TLS private key (PEM), paired with
     /// [`tls_cert_path`](Self::tls_cert_path).
     pub tls_key_path: Option<std::path::PathBuf>,
+    /// Max concurrent OPEN connections from a single source IP (#1386). `0` disables the per-IP cap.
+    /// SHOULD be `<= max_connections` (a per-IP cap above the global cap can never bind). See
+    /// [`DEFAULT_MAX_CONNECTIONS_PER_IP`].
+    pub max_connections_per_ip: u32,
+    /// Per-source-IP `Register` RATE budget (attempts/sec/IP, #1386). `0` disables the limit. See
+    /// [`DEFAULT_REGISTRATIONS_PER_IP_PER_SEC`].
+    pub registrations_per_ip_per_sec: u32,
+    /// Max CONCURRENT live registrations from a single source IP (#1386). `0` disables the cap. See
+    /// [`DEFAULT_MAX_REGISTRATIONS_PER_IP`].
+    pub max_registrations_per_ip: u32,
+    /// Per-connection inbound MESSAGE-rate budget (frames/sec, #1386). `0` disables the limit; a
+    /// breach DISCONNECTS the connection. See [`DEFAULT_MESSAGES_PER_CONN_PER_SEC`].
+    pub messages_per_conn_per_sec: u32,
+    /// Per-connection inbound BYTE-rate budget (bytes/sec, #1386). `0` disables the limit; a breach
+    /// DISCONNECTS the connection. See [`DEFAULT_BYTES_PER_CONN_PER_SEC`].
+    pub bytes_per_conn_per_sec: u32,
+    /// Cumulative inbound-bytes ceiling for a single connection's whole lifetime (#1386). `0`
+    /// disables the cap; a breach DISCONNECTS the connection. See
+    /// [`DEFAULT_MAX_RELAYED_BYTES_PER_CONN`].
+    pub max_relayed_bytes_per_conn: u64,
 }
 
 impl Default for RelayServerConfig {
@@ -181,6 +235,12 @@ impl Default for RelayServerConfig {
             liveness_deadline: Duration::from_secs(DEFAULT_LIVENESS_DEADLINE_SECS),
             tls_cert_path: None,
             tls_key_path: None,
+            max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP,
+            registrations_per_ip_per_sec: DEFAULT_REGISTRATIONS_PER_IP_PER_SEC,
+            max_registrations_per_ip: DEFAULT_MAX_REGISTRATIONS_PER_IP,
+            messages_per_conn_per_sec: DEFAULT_MESSAGES_PER_CONN_PER_SEC,
+            bytes_per_conn_per_sec: DEFAULT_BYTES_PER_CONN_PER_SEC,
+            max_relayed_bytes_per_conn: DEFAULT_MAX_RELAYED_BYTES_PER_CONN,
         }
     }
 }
@@ -223,6 +283,13 @@ impl RelayServerConfig {
         }
         if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
             return Err("tls_cert_path and tls_key_path must be set together".to_string());
+        }
+        // A per-IP connection cap ABOVE the global cap could never bind (the global cap is reached
+        // first), so it is always a misconfiguration (#1386). `0` disables the per-IP cap entirely.
+        if self.max_connections_per_ip != 0
+            && (self.max_connections_per_ip as usize) > self.max_connections
+        {
+            return Err("max_connections_per_ip must be <= max_connections".to_string());
         }
         Ok(())
     }
@@ -478,5 +545,90 @@ mod tests {
             !c.register_timeout.is_zero() && c.register_timeout < c.idle_timeout,
             "register timeout is finite and shorter than the idle timeout"
         );
+    }
+
+    /// The app-level abuse limits (#1386) are all present and ON by default: a per-IP connection cap,
+    /// per-IP registration rate + concurrent cap, and per-connection message/byte + cumulative caps
+    /// are all non-zero out of the box, so a freshly-defaulted relay is protected without config.
+    #[test]
+    fn abuse_limits_are_enabled_by_default() {
+        let c = RelayServerConfig::default();
+        assert!(c.max_connections_per_ip > 0, "per-IP conn cap defaults ON");
+        assert!(
+            c.registrations_per_ip_per_sec > 0,
+            "per-IP register rate defaults ON"
+        );
+        assert!(
+            c.max_registrations_per_ip > 0,
+            "per-IP concurrent-register cap defaults ON"
+        );
+        assert!(
+            c.messages_per_conn_per_sec > 0,
+            "per-conn message rate defaults ON"
+        );
+        assert!(
+            c.bytes_per_conn_per_sec > 0,
+            "per-conn byte rate defaults ON"
+        );
+        assert!(
+            c.max_relayed_bytes_per_conn > 0,
+            "per-conn cumulative-byte cap defaults ON"
+        );
+    }
+
+    /// The default per-IP connection cap is within the global connection cap (a per-IP cap above the
+    /// global cap could never bind), so the default config satisfies `validate()`'s ordering rule.
+    #[test]
+    fn default_per_ip_cap_is_within_the_global_cap() {
+        let c = RelayServerConfig::default();
+        assert!((c.max_connections_per_ip as usize) <= c.max_connections);
+    }
+
+    #[test]
+    fn per_ip_conn_cap_above_the_global_cap_is_rejected() {
+        let c = RelayServerConfig {
+            max_connections: 100,
+            max_connections_per_ip: 101,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn per_ip_conn_cap_equal_to_the_global_cap_is_allowed() {
+        let c = RelayServerConfig {
+            max_connections: 100,
+            max_connections_per_ip: 100,
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    /// `0` disables the per-IP connection cap, so the "must be <= max_connections" ordering rule does
+    /// not apply — a disabled per-IP cap is always valid regardless of the global cap.
+    #[test]
+    fn zero_per_ip_conn_cap_disables_the_ordering_check() {
+        let c = RelayServerConfig {
+            max_connections: 1,
+            max_connections_per_ip: 0,
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    /// All abuse limits may be individually disabled with `0` (STUN-limit precedent) and the config
+    /// stays valid — an operator can opt out of any single dimension.
+    #[test]
+    fn all_abuse_limits_may_be_disabled_with_zero() {
+        let c = RelayServerConfig {
+            max_connections_per_ip: 0,
+            registrations_per_ip_per_sec: 0,
+            max_registrations_per_ip: 0,
+            messages_per_conn_per_sec: 0,
+            bytes_per_conn_per_sec: 0,
+            max_relayed_bytes_per_conn: 0,
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
     }
 }

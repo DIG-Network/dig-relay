@@ -32,6 +32,7 @@ pub mod dashboard;
 pub mod dial;
 pub mod health;
 pub mod http_serve;
+pub mod limits;
 pub mod net;
 pub mod pex;
 pub mod registry;

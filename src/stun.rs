@@ -26,16 +26,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::limits::{TokenBucket, MAX_TRACKED_IPS};
 use crate::net::bind_udp_dual_stack;
 use crate::server::RelayState;
-
-/// Hard cap on the number of distinct source IPs the [`StunRateLimiter`] tracks at once. A STUN
-/// server answers spoofable, unauthenticated datagrams, so the per-IP bucket map is itself an
-/// attacker-controlled data structure: without a bound, a flood of forged source IPs would grow it
-/// without limit (a memory-exhaustion vector). When the map is full and an unseen IP arrives, the
-/// limiter evicts the least-recently-seen bucket. 65_536 buckets is far more than any legitimate
-/// concurrent client population and is tiny in memory (~a few MiB).
-const MAX_TRACKED_IPS: usize = 65_536;
 
 /// The STUN magic cookie (RFC 5389 §6): a fixed 32-bit value in bytes 4..8 of every STUN message.
 /// Its top 16 bits also key the XOR of XOR-MAPPED-ADDRESS.
@@ -258,47 +251,6 @@ pub fn find_xor_mapped_address(message: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Per-source token bucket: a whole-token count refilled to `capacity` once per one-second window.
-///
-/// A fixed one-second refill window (rather than continuous drip) keeps the arithmetic integer-only
-/// and trivially testable, while still bounding the sustained rate to `capacity` responses/second.
-#[derive(Debug, Clone, Copy)]
-struct Bucket {
-    /// Tokens remaining in the current window.
-    tokens: u32,
-    /// The one-second window this bucket's `tokens` belong to (`now_ms / 1000`).
-    window: u64,
-    /// Last time (ms) this bucket was touched — used for LRU eviction when the map is full.
-    last_seen_ms: u64,
-}
-
-impl Bucket {
-    fn new(capacity: u32, now_ms: u64) -> Self {
-        Bucket {
-            tokens: capacity,
-            window: now_ms / 1000,
-            last_seen_ms: now_ms,
-        }
-    }
-
-    /// Try to spend one token in the window containing `now_ms`, refilling to `capacity` at each new
-    /// one-second window. Returns `true` if a token was available (the caller may respond).
-    fn try_spend(&mut self, capacity: u32, now_ms: u64) -> bool {
-        let window = now_ms / 1000;
-        if window != self.window {
-            self.window = window;
-            self.tokens = capacity;
-        }
-        self.last_seen_ms = now_ms;
-        if self.tokens > 0 {
-            self.tokens -= 1;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 /// Rate limiter for STUN responses (SECURITY_AUDIT_P2P dig-relay #2): a per-source-IP token bucket
 /// plus a single global token bucket. `allow(src, now)` returns whether the relay may send a Binding
 /// Success Response to `src` right now. Both budgets must permit the response; a `0` capacity for
@@ -313,8 +265,8 @@ impl Bucket {
 struct StunRateLimiter {
     per_ip_capacity: u32,
     global_capacity: u32,
-    per_ip: HashMap<IpAddr, Bucket>,
-    global: Bucket,
+    per_ip: HashMap<IpAddr, TokenBucket>,
+    global: TokenBucket,
 }
 
 impl StunRateLimiter {
@@ -324,7 +276,7 @@ impl StunRateLimiter {
             global_capacity,
             per_ip: HashMap::new(),
             // The global bucket starts full for the current window regardless of whether it is used.
-            global: Bucket::new(global_capacity.max(1), now_ms),
+            global: TokenBucket::new(global_capacity.max(1), now_ms),
         }
     }
 
@@ -381,7 +333,7 @@ impl StunRateLimiter {
 
     /// Get (or create) the bucket for `key`, evicting the least-recently-seen bucket first when the
     /// map is at [`MAX_TRACKED_IPS`] and `key` is not already tracked.
-    fn bucket_for(&mut self, key: IpAddr, now_ms: u64) -> &mut Bucket {
+    fn bucket_for(&mut self, key: IpAddr, now_ms: u64) -> &mut TokenBucket {
         if !self.per_ip.contains_key(&key) && self.per_ip.len() >= MAX_TRACKED_IPS {
             if let Some(&victim) = self
                 .per_ip
@@ -394,7 +346,7 @@ impl StunRateLimiter {
         }
         self.per_ip
             .entry(key)
-            .or_insert_with(|| Bucket::new(self.per_ip_capacity.max(1), now_ms))
+            .or_insert_with(|| TokenBucket::new(self.per_ip_capacity.max(1), now_ms))
     }
 }
 
