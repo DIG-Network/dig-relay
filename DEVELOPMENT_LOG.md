@@ -2,6 +2,13 @@
 
 Durable realizations from developing dig-relay. Context, not a change diary (CLAUDE.md §4.5).
 
+## `/map` — coarse-grid geo visualization is in flight (#1452)
+
+Tracking note for the in-progress `/map` + `/map.json` globe feature: peer geo is resolved
+server-side only, from a bundled offline mmdb, and published ONLY as a ~5°-snapped grid-cell
+centroid + count — never a raw IP, peer_id, or precise coordinate. See `src/geoip.rs` and
+`src/map.rs` (once landed) for the full contract.
+
 ## App-level abuse protection — keying + breach response (#1386)
 
 - **IPv6 is keyed on the /64 prefix, not the full /128.** A single IPv6 assignment is typically a /64
