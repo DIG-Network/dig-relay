@@ -347,20 +347,49 @@ ever exposed (the relay is an untrusted forwarder and holds none).
 | `outbound_queue_capacity` | 1024 | MUST be ≥ 1 (per-connection queue bound, §3.0) |
 | `max_message_bytes` | 262144 | MUST be ≥ 1 (inbound frame size bound, §3.0) |
 | `register_timeout` | 10 s | MUST be > 0 (register deadline, §3.0) |
+| `health_check_interval` | 30 s | MUST be > 0; MUST be ≤ `liveness_deadline` (§7.1) |
+| `liveness_deadline` | 90 s | MUST be > 0; MUST be ≥ `health_check_interval`; MUST be < `idle_timeout` (§7.1) |
 | `tls_cert_path` | `None` | Optional; MUST be set together with `tls_key_path` (§3.2/§8) |
 | `tls_key_path` | `None` | Optional; MUST be set together with `tls_cert_path` (§3.2/§8) |
 
 `validate()` rejects `max_connections == 0`, a zero `idle_timeout`, a zero `outbound_queue_capacity`,
-a zero `max_message_bytes`, a zero `register_timeout`, and exactly one of `tls_cert_path`/
-`tls_key_path` being set, with a stable error string. Config may be built from CLI flags (`main.rs`,
-`clap` — `--tls-cert`/`--tls-key` alongside the others) or environment variables consumed by the
-service installer (`DIG_RELAY_LISTEN`, `DIG_RELAY_HEALTH_LISTEN`, `DIG_RELAY_DASHBOARD_LISTEN`,
-`DIG_RELAY_STUN_LISTEN`,
+a zero `max_message_bytes`, a zero `register_timeout`, a zero `health_check_interval` or
+`liveness_deadline`, a `liveness_deadline` shorter than `health_check_interval`, a `liveness_deadline`
+not strictly shorter than `idle_timeout`, and exactly one of `tls_cert_path`/`tls_key_path` being set,
+with a stable error string. Config may be built from CLI flags (`main.rs`, `clap` —
+`--tls-cert`/`--tls-key`/`--health-check-interval-secs`/`--liveness-deadline-secs` alongside the
+others) or environment variables consumed by the service installer (`DIG_RELAY_LISTEN`,
+`DIG_RELAY_HEALTH_LISTEN`, `DIG_RELAY_DASHBOARD_LISTEN`, `DIG_RELAY_STUN_LISTEN`,
 `DIG_RELAY_MAX_CONNECTIONS`, `DIG_RELAY_STUN_PER_IP_RPS`, `DIG_RELAY_STUN_GLOBAL_RPS`,
 `DIG_RELAY_OUTBOUND_QUEUE_CAPACITY`, `DIG_RELAY_MAX_MESSAGE_BYTES`,
 `DIG_RELAY_REGISTER_TIMEOUT_SECS`, `DIG_RELAY_TLS_CERT_PATH`, `DIG_RELAY_TLS_KEY_PATH` — see
 `src/service.rs::config_from_env`), so an installed OS service serves identically to a manually-run
 `dig-relay serve` with the same flags.
+
+### 7.1 Liveness & pruning (#1382)
+
+The relay actively, promptly prunes registrations belonging to dead or half-open connections, rather
+than leaving them to poison peer discovery until the (much longer) idle timeout finally reaps them:
+
+- **A periodic health sweep** runs every `health_check_interval` (default 30 s) alongside the PEX
+  housekeeping tick, for the lifetime of the accept loop. Each pass removes every registration that is
+  **dead** (its outbound channel is closed — the connection task has already torn down) OR **stale**
+  (no inbound activity for longer than `liveness_deadline`, default 90 s) — collecting and removing
+  under ONE registry-lock hold so a concurrent reconnect can never be evicted in the sweep's place
+  (`src/server.rs::sweep_once`/`Registry::dead_or_stale`).
+- **Liveness is INBOUND-activity-based, never pong-dependent.** A registration's liveness clock
+  (`last_activity`) is stamped to "now" on EVERY inbound frame from that connection — valid or
+  invalid, RLY or PEX. The relay never actively pings a peer and waits for a pong to judge liveness:
+  the dig-gossip relay CLIENT does not answer relay-initiated `Ping`s, so an expect-a-pong liveness
+  check would prune every live peer. The node's own RLY-006 keepalive ping (roughly every 30 s) is
+  what keeps a genuinely live, quiet connection's activity fresh.
+- **A pruned peer is evicted from BOTH introductions and PEX**, exactly as a graceful `Unregister`/
+  disconnect is (§4): same-network peers receive `PeerDisconnected`, and the PEX introducer subsystem
+  drops it from the advertise set (`PexRelay::on_unregister`) — a dead/stale peer stops being handed
+  out to new nodes as soon as the next sweep catches it, not up to `idle_timeout` later.
+- **The idle timeout remains a strictly LONGER backstop**, not a replacement: `liveness_deadline` MUST
+  be `< idle_timeout` (config validation enforces it). The sweep is the fast, active path; the idle
+  timeout is the connection's own read loop failing safe if the sweep were ever disabled or delayed.
 
 ## 8. Transport security
 
