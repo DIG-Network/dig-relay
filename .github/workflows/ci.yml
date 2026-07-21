@@ -24,15 +24,18 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: fmt
         run: cargo fmt --all --check
+      # --locked: fail if Cargo.lock is stale vs Cargo.toml (e.g. a version bump not mirrored into
+      # the lockfile). release.yml builds with --locked, so without this the PR gate would pass a
+      # drift that only the release then catches — a red release after a green PR.
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       # nextest natively detects+reports flaky tests (failed-then-passed on retry) instead of
       # silently hiding them; --retries 2 absorbs environmental flakiness without masking a real
       # regression (a test failing all 3 attempts still fails the job).
       - name: test (nextest, flaky-aware)
-        run: cargo nextest run --all --retries 2
+        run: cargo nextest run --all --locked --retries 2
       - name: build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
 
   coverage:
     runs-on: ubuntu-latest
