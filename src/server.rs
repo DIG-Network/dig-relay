@@ -1556,7 +1556,10 @@ mod tests {
         });
         let ip1 = addr_on("198.51.100.10").ip();
         let ip2 = addr_on("198.51.100.11").ip();
-        let _slot = state.abuse.try_acquire_conn(ip1).expect("ip1 first allowed");
+        let _slot = state
+            .abuse
+            .try_acquire_conn(ip1)
+            .expect("ip1 first allowed");
         assert!(
             state.abuse.try_acquire_conn(ip1).is_none(),
             "ip1 at its per-IP cap → refused"
@@ -1595,7 +1598,10 @@ mod tests {
         )
         .await;
         assert!(ok_a, "first register from the IP succeeds");
-        assert!(slot_a.is_some(), "and retains its concurrent-registration slot");
+        assert!(
+            slot_a.is_some(),
+            "and retains its concurrent-registration slot"
+        );
 
         // Peer B from the SAME IP1 is over the concurrent cap → refused with RATE_LIMITED.
         let mut session_b = Session::default();
@@ -1615,14 +1621,18 @@ mod tests {
             &mut None,
         )
         .await;
-        assert!(!ok_b, "second concurrent register from the same IP is refused");
-        assert!(session_b.peer_id.is_none(), "refused session stays unregistered");
+        assert!(
+            !ok_b,
+            "second concurrent register from the same IP is refused"
+        );
+        assert!(
+            session_b.peer_id.is_none(),
+            "refused session stays unregistered"
+        );
         let msgs = drain(&mut rx_b);
         assert!(
-            msgs.iter().any(|m| matches!(
-                m,
-                RelayMessage::RegisterAck { success: false, .. }
-            )),
+            msgs.iter()
+                .any(|m| matches!(m, RelayMessage::RegisterAck { success: false, .. })),
             "a failing register_ack is sent"
         );
         assert!(
@@ -1683,10 +1693,12 @@ mod tests {
                 &mut None,
             )
             .await;
-            if drain(&mut rx).iter().any(|m| matches!(
-                m,
-                RelayMessage::Error { code, .. } if *code == errcode::RATE_LIMITED
-            )) {
+            if drain(&mut rx).iter().any(|m| {
+                matches!(
+                    m,
+                    RelayMessage::Error { code, .. } if *code == errcode::RATE_LIMITED
+                )
+            }) {
                 saw_rate_limited = true;
             }
         }

@@ -486,7 +486,10 @@ mod tests {
             base.registrations_per_ip_per_sec
         );
         assert_eq!(out.max_registrations_per_ip, base.max_registrations_per_ip);
-        assert_eq!(out.messages_per_conn_per_sec, base.messages_per_conn_per_sec);
+        assert_eq!(
+            out.messages_per_conn_per_sec,
+            base.messages_per_conn_per_sec
+        );
         assert_eq!(out.bytes_per_conn_per_sec, base.bytes_per_conn_per_sec);
         assert_eq!(
             out.max_relayed_bytes_per_conn,
