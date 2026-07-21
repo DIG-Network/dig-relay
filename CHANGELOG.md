@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.13.0] - 2026-07-21
+
+### Features
+- **relay:** /map — 3D globe of registered peers (coarse-geo, privacy-first) (#1452) (#16)
+
 ## [0.12.0] - 2026-07-21
 
 ### Features
