@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.11.0] - 2026-07-21
+
+### Features
+- **relay:** Periodic health-sweep prunes dead/half-open connections (#1382) (#13)
+
 ## [0.10.0] - 2026-07-19
 
 ### Features
