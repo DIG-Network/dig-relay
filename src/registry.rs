@@ -12,6 +12,8 @@
 //! hold the lock briefly (clone out the sender, drop the lock, then send) — see [`Registry`] doc.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -28,6 +30,13 @@ pub struct Peer {
     /// means the peer is not draining, and further sends to it are dropped rather than buffered
     /// without limit, so a slow/hostile reader cannot grow the relay heap.
     pub tx: mpsc::Sender<RelayMessage>,
+    /// Last inbound-activity time (Unix seconds) — the relay's OWN liveness clock for the periodic
+    /// health sweep (#1382), distinct from the advertised [`RelayPeerInfo::last_seen`] on the wire.
+    /// The connection task stores the current time here (lock-free, `Relaxed`) on every inbound frame,
+    /// so a live peer's own RLY-006 keepalive pings keep it fresh; the health sweep prunes a record
+    /// whose activity is older than the liveness deadline (a half-open / silently-dead peer). Shared
+    /// (`Arc`) with the connection task, which holds the write side.
+    pub last_activity: Arc<AtomicU64>,
 }
 
 /// The outcome of a [`Registry::register`] call — a first registration, a reconnect that reclaimed
@@ -99,6 +108,7 @@ impl Registry {
         network_id: String,
         info: RelayPeerInfo,
         tx: mpsc::Sender<RelayMessage>,
+        last_activity: Arc<AtomicU64>,
     ) -> RegisterOutcome {
         if let Some(existing) = self.peers.get(&peer_id) {
             // A live incumbent holds this id: refuse (anti-hijack). Only a demonstrably-dead prior
@@ -112,6 +122,7 @@ impl Registry {
                     network_id,
                     info,
                     tx,
+                    last_activity,
                 },
             );
             return RegisterOutcome::Reconnected;
@@ -122,9 +133,33 @@ impl Registry {
                 network_id,
                 info,
                 tx,
+                last_activity,
             },
         );
         RegisterOutcome::Registered
+    }
+
+    /// Collect `(peer_id, network_id)` for every registration the periodic health sweep should PRUNE
+    /// (#1382): one whose outbound channel is CLOSED (`tx.is_closed()` — its connection task has torn
+    /// down) OR whose last inbound activity is older than `deadline_secs` (a half-open / silently-dead
+    /// peer that has stopped sending even its RLY-006 keepalive). Pure read — the caller removes the
+    /// returned records (re-checked atomically under the same lock in `server::sweep_once`) and mirrors
+    /// each departure into introductions + PEX.
+    ///
+    /// This is the sweep's counterpart to [`register`](Self::register)'s anti-hijack rule: both treat
+    /// ONLY a demonstrably-dead (closed) or demonstrably-stale (silent past the generous deadline)
+    /// record as reclaimable — a live peer sending its keepalive keeps `last_activity` fresh and is
+    /// never selected here.
+    pub fn dead_or_stale(&self, now_secs: u64, deadline_secs: u64) -> Vec<(String, String)> {
+        self.peers
+            .iter()
+            .filter(|(_, p)| {
+                p.tx.is_closed()
+                    || now_secs.saturating_sub(p.last_activity.load(Ordering::Relaxed))
+                        > deadline_secs
+            })
+            .map(|(id, p)| (id.clone(), p.network_id.clone()))
+            .collect()
     }
 
     /// Remove a peer by id, returning its record if present.
@@ -194,10 +229,16 @@ mod tests {
         mpsc::channel(8).0
     }
 
+    /// A `last_activity` clock for a test registration, seeded to a fixed "now". Tests that exercise
+    /// the liveness sweep set explicit values; the distinct-id/routing tests don't care about it.
+    fn act() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(1_000_000))
+    }
+
     #[test]
     fn register_then_lookup_in_same_network() {
         let mut r = Registry::new();
-        r.register("a".into(), "net1".into(), info("a", "net1"), chan());
+        r.register("a".into(), "net1".into(), info("a", "net1"), chan(), act());
         assert_eq!(r.len(), 1);
         assert!(r.sender_in_network("a", "net1").is_some());
     }
@@ -205,7 +246,7 @@ mod tests {
     #[test]
     fn lookup_across_networks_is_denied() {
         let mut r = Registry::new();
-        r.register("a".into(), "net1".into(), info("a", "net1"), chan());
+        r.register("a".into(), "net1".into(), info("a", "net1"), chan(), act());
         // Same peer_id but asked for under a different network → not routable.
         assert!(r.sender_in_network("a", "net2").is_none());
     }
@@ -213,7 +254,7 @@ mod tests {
     #[test]
     fn unregister_removes_the_peer() {
         let mut r = Registry::new();
-        r.register("a".into(), "net1".into(), info("a", "net1"), chan());
+        r.register("a".into(), "net1".into(), info("a", "net1"), chan(), act());
         assert!(r.unregister("a").is_some());
         assert!(r.is_empty());
         assert!(r.unregister("a").is_none());
@@ -223,7 +264,7 @@ mod tests {
     fn first_registration_reports_registered() {
         let mut r = Registry::new();
         assert_eq!(
-            r.register("a".into(), "net1".into(), info("a", "net1"), chan()),
+            r.register("a".into(), "net1".into(), info("a", "net1"), chan(), act()),
             RegisterOutcome::Registered
         );
         assert_eq!(r.len(), 1);
@@ -238,14 +279,14 @@ mod tests {
         // First registration keeps a live sender (rx held → channel stays open).
         let (tx1, _rx1) = mpsc::channel(8);
         assert_eq!(
-            r.register("a".into(), "net1".into(), info("a", "net1"), tx1),
+            r.register("a".into(), "net1".into(), info("a", "net1"), tx1, act()),
             RegisterOutcome::Registered
         );
 
         // A hijack attempt under the same id while the incumbent is live: refused.
         let (tx2, _rx2) = mpsc::channel(8);
         assert_eq!(
-            r.register("a".into(), "net1".into(), info("a", "net1"), tx2),
+            r.register("a".into(), "net1".into(), info("a", "net1"), tx2, act()),
             RegisterOutcome::Occupied,
             "a live incumbent must NOT be evicted by a duplicate-id register"
         );
@@ -265,7 +306,7 @@ mod tests {
         let mut r = Registry::new();
         let (tx1, rx1) = mpsc::channel(8);
         assert_eq!(
-            r.register("a".into(), "net1".into(), info("a", "net1"), tx1),
+            r.register("a".into(), "net1".into(), info("a", "net1"), tx1, act()),
             RegisterOutcome::Registered
         );
         // Drop the receiver → the incumbent's sender is now closed (its connection is gone).
@@ -273,7 +314,7 @@ mod tests {
 
         let (tx2, _rx2) = mpsc::channel(8);
         assert_eq!(
-            r.register("a".into(), "net1".into(), info("a", "net1"), tx2),
+            r.register("a".into(), "net1".into(), info("a", "net1"), tx2, act()),
             RegisterOutcome::Reconnected,
             "a dead prior connection may be reclaimed by a reconnect"
         );
@@ -283,9 +324,9 @@ mod tests {
     #[test]
     fn peers_filters_by_network_and_is_sorted() {
         let mut r = Registry::new();
-        r.register("c".into(), "net1".into(), info("c", "net1"), chan());
-        r.register("a".into(), "net1".into(), info("a", "net1"), chan());
-        r.register("b".into(), "net2".into(), info("b", "net2"), chan());
+        r.register("c".into(), "net1".into(), info("c", "net1"), chan(), act());
+        r.register("a".into(), "net1".into(), info("a", "net1"), chan(), act());
+        r.register("b".into(), "net2".into(), info("b", "net2"), chan(), act());
 
         let net1 = r.peers(Some("net1"));
         let ids: Vec<_> = net1.iter().map(|p| p.peer_id.as_str()).collect();
@@ -297,14 +338,106 @@ mod tests {
     #[test]
     fn broadcast_excludes_sender_and_excluded_and_other_networks() {
         let mut r = Registry::new();
-        r.register("a".into(), "net1".into(), info("a", "net1"), chan());
-        r.register("b".into(), "net1".into(), info("b", "net1"), chan());
-        r.register("c".into(), "net1".into(), info("c", "net1"), chan());
-        r.register("z".into(), "net2".into(), info("z", "net2"), chan());
+        r.register("a".into(), "net1".into(), info("a", "net1"), chan(), act());
+        r.register("b".into(), "net1".into(), info("b", "net1"), chan(), act());
+        r.register("c".into(), "net1".into(), info("c", "net1"), chan(), act());
+        r.register("z".into(), "net2".into(), info("z", "net2"), chan(), act());
 
         let targets = r.broadcast_targets("a", "net1", &["c".to_string()]);
         let ids: Vec<_> = targets.iter().map(|(id, _)| id.clone()).collect();
         // From "a" on net1, excluding "c": only "b" remains ("z" is another network).
         assert_eq!(ids, vec!["b".to_string()]);
+    }
+
+    /// The health sweep (#1382) selects a registration whose outbound channel is CLOSED — the
+    /// connection task has torn down, so `tx.is_closed()` is `true` — regardless of its activity time.
+    #[test]
+    fn dead_or_stale_selects_a_closed_channel_peer() {
+        let mut r = Registry::new();
+        // A dead peer: build its own channel and drop the receiver so the sender reads closed.
+        let (dead_tx, dead_rx) = mpsc::channel(8);
+        r.register(
+            "dead".into(),
+            "net".into(),
+            info("dead", "net"),
+            dead_tx,
+            Arc::new(AtomicU64::new(1_000_000)), // fresh activity — closed channel alone must select it
+        );
+        drop(dead_rx);
+        // A live peer: hold its receiver so the sender stays open, fresh activity.
+        let (live_tx, _live_rx) = mpsc::channel(8);
+        r.register(
+            "live".into(),
+            "net".into(),
+            info("live", "net"),
+            live_tx,
+            Arc::new(AtomicU64::new(1_000_000)),
+        );
+
+        let victims = r.dead_or_stale(1_000_000, 90);
+        let ids: Vec<_> = victims.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["dead"],
+            "only the closed-channel peer is selected"
+        );
+    }
+
+    /// The health sweep selects a registration whose last inbound activity is older than the liveness
+    /// deadline (a half-open / silently-dead peer) even though its channel is still open, and SPARES a
+    /// peer whose activity is fresh (a live peer sending its keepalive) — the anti-false-prune rule.
+    #[test]
+    fn dead_or_stale_selects_stale_activity_and_spares_fresh() {
+        let mut r = Registry::new();
+        let (stale_tx, _stale_rx) = mpsc::channel(8);
+        r.register(
+            "stale".into(),
+            "net".into(),
+            info("stale", "net"),
+            stale_tx, // open channel, but old activity
+            Arc::new(AtomicU64::new(1_000)),
+        );
+        let (fresh_tx, _fresh_rx) = mpsc::channel(8);
+        r.register(
+            "fresh".into(),
+            "net".into(),
+            info("fresh", "net"),
+            fresh_tx,
+            Arc::new(AtomicU64::new(999_950)), // 50s ago at now=1_000_000, within the 90s deadline
+        );
+
+        // now = 1_000_000, deadline = 90s. "stale" (last activity 1_000, ~999_000s ago) is past the
+        // deadline; "fresh" (50s ago) is within it.
+        let victims = r.dead_or_stale(1_000_000, 90);
+        let ids: Vec<_> = victims.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["stale"],
+            "only the silently-dead peer is selected"
+        );
+    }
+
+    /// A registry of only live, fresh peers yields NO sweep victims — the sweep is a no-op when every
+    /// peer is healthy.
+    #[test]
+    fn dead_or_stale_is_empty_when_all_peers_are_live_and_fresh() {
+        let mut r = Registry::new();
+        let (a_tx, _a_rx) = mpsc::channel(8);
+        let (b_tx, _b_rx) = mpsc::channel(8);
+        r.register(
+            "a".into(),
+            "net".into(),
+            info("a", "net"),
+            a_tx,
+            Arc::new(AtomicU64::new(1_000_000)),
+        );
+        r.register(
+            "b".into(),
+            "net".into(),
+            info("b", "net"),
+            b_tx,
+            Arc::new(AtomicU64::new(1_000_000)),
+        );
+        assert!(r.dead_or_stale(1_000_000, 90).is_empty());
     }
 }

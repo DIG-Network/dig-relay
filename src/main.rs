@@ -72,6 +72,15 @@ struct Cli {
     /// Seconds an accepted connection has to Register before being dropped (default 10).
     #[arg(long, value_name = "SECS", global = true)]
     register_timeout_secs: Option<u64>,
+    /// How often the periodic health sweep runs, pruning dead/half-open connections (default 30;
+    /// #1382). Strictly shorter than --liveness-deadline-secs.
+    #[arg(long, value_name = "SECS", global = true)]
+    health_check_interval_secs: Option<u64>,
+    /// Seconds of silence (no inbound frame, including the node's own RLY-006 keepalive) before the
+    /// health sweep prunes a registration as dead/stale (default 90; #1382). Strictly shorter than
+    /// --idle-timeout-secs, which remains the longer backstop.
+    #[arg(long, value_name = "SECS", global = true)]
+    liveness_deadline_secs: Option<u64>,
     /// Path to the relay's own TLS certificate (PEM). Set together with --tls-key to make the relay
     /// terminate mTLS itself: every client MUST present a certificate, and a `Register`'s `peer_id`
     /// must match the one derived from it (proof-of-possession, SPEC.md §3.2/§8). Unset (default):
@@ -144,6 +153,12 @@ fn apply_overrides(mut config: RelayServerConfig, cli: &Cli) -> RelayServerConfi
     }
     if let Some(s) = cli.register_timeout_secs {
         config.register_timeout = Duration::from_secs(s);
+    }
+    if let Some(s) = cli.health_check_interval_secs {
+        config.health_check_interval = Duration::from_secs(s);
+    }
+    if let Some(s) = cli.liveness_deadline_secs {
+        config.liveness_deadline = Duration::from_secs(s);
     }
     if let Some(p) = cli.tls_cert.clone() {
         config.tls_cert_path = Some(p);
@@ -379,6 +394,10 @@ mod tests {
             "4096",
             "--register-timeout-secs",
             "3",
+            "--health-check-interval-secs",
+            "15",
+            "--liveness-deadline-secs",
+            "45",
         ]);
         let out = apply_overrides(base, &cli);
         assert_eq!(out.listen, "127.0.0.1:8000".parse().unwrap());
@@ -392,6 +411,23 @@ mod tests {
         assert_eq!(out.outbound_queue_capacity, 256);
         assert_eq!(out.max_message_bytes, 4096);
         assert_eq!(out.register_timeout, Duration::from_secs(3));
+        assert_eq!(out.health_check_interval, Duration::from_secs(15));
+        assert_eq!(out.liveness_deadline, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn apply_overrides_applies_health_sweep_flags_only_when_given() {
+        let base = RelayServerConfig::default();
+        let cli = parse(&["serve"]);
+        let out = apply_overrides(base.clone(), &cli);
+        assert_eq!(
+            out.health_check_interval, base.health_check_interval,
+            "unset flag leaves the base health_check_interval alone"
+        );
+        assert_eq!(
+            out.liveness_deadline, base.liveness_deadline,
+            "unset flag leaves the base liveness_deadline alone"
+        );
     }
 
     #[test]

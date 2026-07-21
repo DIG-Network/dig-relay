@@ -5,8 +5,9 @@
 //! registry + counters, and make actual `GET` requests over raw TCP — proving the live serving path,
 //! not just the pure snapshot builder.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use dig_relay::wire::RelayPeerInfo;
 use dig_relay::{server, RelayServerConfig, RelayState};
@@ -29,11 +30,24 @@ async fn seeded_state(config: RelayServerConfig) -> Arc<RelayState> {
         let mut reg = state.registry.lock().await;
         let mut info = RelayPeerInfo::new("peeralphabravocharlie".into(), "mainnet".into(), 1);
         info.addresses = vec!["203.0.113.7:9444".parse().unwrap()];
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // Leak the receiver (#1382): `server::run` spawns the periodic health sweep, which prunes
+        // any registration whose outbound channel reads CLOSED. This seeded peer has no real
+        // connection task draining it, so the receiver must be kept alive for the test's lifetime
+        // (dropping it would make `tx.is_closed()` true and the sweep would prune it immediately).
+        std::mem::forget(rx);
         reg.register(
             "peeralphabravocharlie".into(),
             "mainnet".into(),
             info,
-            tokio::sync::mpsc::channel(1).0,
+            tx,
+            // Fresh activity: spared by the sweep's staleness check too.
+            Arc::new(AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )),
         );
     }
     state.connected.store(1, Ordering::Relaxed);

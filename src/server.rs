@@ -187,6 +187,16 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Current Unix-epoch time in SECONDS (saturating) — the clock the per-connection `last_activity`
+/// liveness timestamps and the health sweep (#1382) run on. Same wall-clock basis as the wire's
+/// `RelayPeerInfo::last_seen`.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Per-connection registration state, set after a successful `Register`.
 #[derive(Debug, Clone, Default)]
 struct Session {
@@ -426,6 +436,11 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
     // to the matching connection's PEX channel. Runs for the lifetime of the accept loop.
     tokio::spawn(pex_housekeeping(state.clone()));
 
+    // Periodic health sweep (#1382): prune dead/stale registrations promptly rather than waiting
+    // for the (much longer) idle timeout, so a half-open peer stops poisoning introductions + PEX
+    // quickly. Runs for the lifetime of the accept loop.
+    tokio::spawn(health_sweep(state.clone()));
+
     // Optional mTLS termination (SPEC.md §3.2/§8, `src/tls.rs`): when configured, every accepted TCP
     // connection is first wrapped in a client-cert-mandatory TLS handshake; the `peer_id` derived
     // from the certificate the client actually used is threaded into `handle_connection` so
@@ -589,6 +604,10 @@ where
     let mut session = Session::default();
     let idle = state.config.idle_timeout;
     let register_timeout = state.config.register_timeout;
+    // The health sweep's liveness clock for THIS connection (#1382): stamped to "now" on every
+    // inbound frame, shared (`Arc`) with the registry record once registered so `sweep_once` can
+    // read it without touching this task.
+    let last_activity = Arc::new(AtomicU64::new(now_secs()));
 
     loop {
         // Until the connection has registered (RLY-001), it is held only to the SHORT register
@@ -618,6 +637,11 @@ where
             Ok(Some(Ok(Message::Binary(b)))) => b,
             Ok(Some(Ok(Message::Frame(_)))) => continue,
         };
+
+        // Health-sweep liveness (#1382): ANY inbound frame — RLY or PEX, valid or not — counts as
+        // activity, mirroring the node's own RLY-006 keepalive (the client answers relay-initiated
+        // pings never; its ~30s keepalive ping is the only inbound liveness signal we can rely on).
+        last_activity.store(now_secs(), Ordering::Relaxed);
 
         // RLY-008: a PEX frame (`type:"pex_…"`) is routed to the PEX subsystem, never parsed as an
         // RLY message. This is checked BEFORE the RLY parse so a valid PEX frame never trips the
@@ -678,6 +702,7 @@ where
                     &out_tx,
                     &pex_tx,
                     verified_peer_id.as_deref(),
+                    last_activity.clone(),
                 )
                 .await
                 {
@@ -810,6 +835,7 @@ async fn register_peer(
     out_tx: &mpsc::Sender<RelayMessage>,
     pex_tx: &mpsc::Sender<PexMessage>,
     verified_peer_id: Option<&str>,
+    last_activity: Arc<AtomicU64>,
 ) -> bool {
     let mut reg = state.registry.lock().await;
 
@@ -865,6 +891,7 @@ async fn register_peer(
         network_id.clone(),
         info.clone(),
         out_tx.clone(),
+        last_activity,
     ) {
         RegisterOutcome::Registered => {
             state.connected.fetch_add(1, Ordering::Relaxed);
@@ -984,6 +1011,26 @@ async fn broadcast(
     }
 }
 
+/// Remove one peer from the registry (if present) and adjust the live `connected` counter,
+/// returning the same-network peers that should be told it's gone (RLY-005 `PeerDisconnected`
+/// targets). Pure registry bookkeeping under the caller's held lock — the caller sends the
+/// notifications and mirrors the departure into PEX AFTER releasing the lock, so the two
+/// call sites ([`deregister`] for a graceful close, [`sweep_once`] for a pruned dead/stale
+/// registration) share one authoritative "remove a peer" path.
+fn remove_locked(
+    reg: &mut Registry,
+    state: &RelayState,
+    peer_id: &str,
+    network_id: &str,
+) -> Option<Vec<(String, mpsc::Sender<RelayMessage>)>> {
+    if reg.unregister(peer_id).is_some() {
+        state.connected.fetch_sub(1, Ordering::Relaxed);
+        Some(reg.broadcast_targets(peer_id, network_id, &[]))
+    } else {
+        None
+    }
+}
+
 /// Remove the connection from the registry on teardown and notify same-network peers (RLY-005
 /// PeerDisconnected). Also MIRRORS the departure into the PEX introducer subsystem (RLY-008, SPEC
 /// §10.2): the peer drops from the advertise set (surfacing as a `dropped` delta to the links that
@@ -993,21 +1040,72 @@ async fn deregister(state: &Arc<RelayState>, session: &Session) {
         return;
     };
     let mut reg = state.registry.lock().await;
-    if reg.unregister(peer_id).is_some() {
-        state.connected.fetch_sub(1, Ordering::Relaxed);
-        let remaining = reg.len();
-        let targets = reg.broadcast_targets(peer_id, network_id, &[]);
-        drop(reg);
-        // RLY observability (issue #862/P2P): log the departure + remaining count. Paired with the
-        // register log above, a rapid register→deregister of the same peer_id exposes an ephemeral
-        // (non-persistent) reservation client at a glance.
-        tracing::info!(%peer_id, %network_id, remaining, "peer deregistered");
+    let Some(targets) = remove_locked(&mut reg, state, peer_id, network_id) else {
+        return;
+    };
+    let remaining = reg.len();
+    drop(reg);
+    // RLY observability (issue #862/P2P): log the departure + remaining count. Paired with the
+    // register log above, a rapid register→deregister of the same peer_id exposes an ephemeral
+    // (non-persistent) reservation client at a glance.
+    tracing::info!(%peer_id, %network_id, remaining, "peer deregistered");
+    for (_, tx) in targets {
+        let _ = tx.try_send(RelayMessage::PeerDisconnected {
+            peer_id: peer_id.clone(),
+        });
+    }
+    state.pex.lock().await.on_unregister(peer_id, network_id);
+}
+
+/// One pass of the periodic health sweep (#1382): under ONE registry-lock hold, find every
+/// dead/stale registration ([`Registry::dead_or_stale`]) and remove it — collecting the
+/// `PeerDisconnected` fan-out targets for each as it goes — then, AFTER releasing the lock, send
+/// those notifications and mirror each departure into PEX. Collecting + removing under a single
+/// lock acquisition (rather than re-locking per victim) closes the race a naive
+/// find-then-remove-later sweep would have: a peer that reconnects between "found dead" and
+/// "removed" could have its brand-new LIVE registration evicted by this sweep instead of the stale
+/// one it was meant to prune. Because the registry is re-checked and mutated atomically in one
+/// critical section, that window never opens.
+async fn sweep_once(state: &Arc<RelayState>, now: u64) {
+    /// One pruned peer's id, network, and the `PeerDisconnected` fan-out targets it needs.
+    type PrunedPeer = (String, String, Vec<(String, mpsc::Sender<RelayMessage>)>);
+
+    let pruned: Vec<PrunedPeer> = {
+        let mut reg = state.registry.lock().await;
+        let victims = reg.dead_or_stale(now, state.config.liveness_deadline.as_secs());
+        victims
+            .into_iter()
+            .filter_map(|(peer_id, network_id)| {
+                let targets = remove_locked(&mut reg, state, &peer_id, &network_id)?;
+                Some((peer_id, network_id, targets))
+            })
+            .collect()
+    };
+
+    for (peer_id, network_id, targets) in pruned {
+        tracing::info!(%peer_id, %network_id, "health sweep: pruned dead/stale peer (#1382)");
         for (_, tx) in targets {
             let _ = tx.try_send(RelayMessage::PeerDisconnected {
                 peer_id: peer_id.clone(),
             });
         }
-        state.pex.lock().await.on_unregister(peer_id, network_id);
+        state.pex.lock().await.on_unregister(&peer_id, &network_id);
+    }
+}
+
+/// The periodic health-sweep loop (#1382, SPEC "Liveness & pruning"): on
+/// [`RelayServerConfig::health_check_interval`], run [`sweep_once`] to prune registrations that
+/// have gone dead (closed channel) or silently stale (no inbound activity — including the node's
+/// own RLY-006 keepalive — within [`RelayServerConfig::liveness_deadline`]). This is an ACTIVE,
+/// promptly-running complement to the [`RelayServerConfig::idle_timeout`] backstop each
+/// connection's own read loop already enforces (strictly longer, `config.rs` validates it) — the
+/// sweep is what stops a half-open peer from poisoning introductions + PEX for the whole idle
+/// window. Runs for the lifetime of the accept loop, same as [`pex_housekeeping`].
+async fn health_sweep(state: Arc<RelayState>) {
+    let mut ticker = tokio::time::interval(state.config.health_check_interval);
+    loop {
+        ticker.tick().await;
+        sweep_once(&state, now_secs()).await;
     }
 }
 
@@ -1033,6 +1131,12 @@ mod tests {
     /// output (the PEX mirroring is exercised directly in the dedicated PEX tests below).
     fn pex_sink() -> mpsc::Sender<PexMessage> {
         mpsc::channel(64).0
+    }
+
+    /// A fresh `last_activity` clock for a test registration, stamped to "now" — the health sweep
+    /// (#1382) test cases that care about staleness build their own explicit value instead.
+    fn fresh_activity() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(now_secs()))
     }
 
     #[test]
@@ -1369,6 +1473,7 @@ mod tests {
             &tx,
             &pex_sink(),
             None,
+            fresh_activity(),
         )
         .await;
         assert!(ok);
@@ -1399,11 +1504,13 @@ mod tests {
         {
             let (tx0, _rx0) = mpsc::channel(64);
             let info = RelayPeerInfo::new("first".into(), "net".into(), 1);
-            state
-                .registry
-                .lock()
-                .await
-                .register("first".into(), "net".into(), info, tx0);
+            state.registry.lock().await.register(
+                "first".into(),
+                "net".into(),
+                info,
+                tx0,
+                fresh_activity(),
+            );
             state.connected.store(1, Ordering::Relaxed);
         }
 
@@ -1420,6 +1527,7 @@ mod tests {
             &tx,
             &pex_sink(),
             None,
+            fresh_activity(),
         )
         .await;
         assert!(!ok, "register must fail at capacity");
@@ -1462,6 +1570,7 @@ mod tests {
                 &tx1,
                 &pex_sink(),
                 None,
+                fresh_activity(),
             )
             .await
         );
@@ -1486,6 +1595,7 @@ mod tests {
             &tx2,
             &pex_sink(),
             None,
+            fresh_activity(),
         )
         .await;
         assert!(!ok, "a duplicate-id register against a live peer must fail");
@@ -1550,6 +1660,7 @@ mod tests {
                 &tx1,
                 &pex_sink(),
                 None,
+                fresh_activity(),
             )
             .await
         );
@@ -1571,6 +1682,7 @@ mod tests {
                 &tx2,
                 &pex_sink(),
                 None,
+                fresh_activity(),
             )
             .await,
             "a reconnect over a dead prior connection must succeed"
@@ -1596,6 +1708,7 @@ mod tests {
             "net".into(),
             RelayPeerInfo::new("b".into(), "net".into(), 1),
             btx,
+            fresh_activity(),
         );
 
         let (atx, mut arx) = mpsc::channel(64);
@@ -1684,6 +1797,7 @@ mod tests {
             "net".into(),
             RelayPeerInfo::new("b".into(), "net".into(), 1),
             btx,
+            fresh_activity(),
         );
         let (atx, _arx) = mpsc::channel(64);
         let session = Session {
@@ -1731,6 +1845,7 @@ mod tests {
                 net.into(),
                 RelayPeerInfo::new(id.into(), net.into(), 1),
                 tx,
+                fresh_activity(),
             );
             rxs.insert(id, rx);
         }
@@ -1766,12 +1881,14 @@ mod tests {
             "net".into(),
             RelayPeerInfo::new("a".into(), "net".into(), 1),
             atx,
+            fresh_activity(),
         );
         state.registry.lock().await.register(
             "b".into(),
             "net".into(),
             RelayPeerInfo::new("b".into(), "net".into(), 1),
             btx,
+            fresh_activity(),
         );
         state.connected.store(2, Ordering::Relaxed);
 
@@ -1796,6 +1913,177 @@ mod tests {
         // Never-registered session: deregister returns early, touches nothing.
         deregister(&state, &Session::default()).await;
         assert_eq!(state.connected.load(Ordering::Relaxed), 0);
+    }
+
+    // ---- Periodic health sweep (#1382): active pruning of dead/half-open registrations, mirrored
+    // into introductions (the registry) + PEX, independent of and strictly faster than the idle
+    // timeout backstop. ----
+
+    /// (a) A peer whose connection task already tore down (its outbound channel is CLOSED) is pruned
+    /// by `sweep_once` — removed from the registry AND mirrored out of PEX (`known_count`/
+    /// `conn_count` both drop) — while an unrelated live peer is untouched.
+    #[tokio::test]
+    async fn sweep_prunes_a_dead_closed_channel_peer_and_updates_pex() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let live = register_into(&state, &hex(0x0a), "net", 5001).await;
+
+        // A second peer whose channel is already closed (its connection task tore down) — mirrored
+        // into PEX exactly as a live registration would be, so the sweep's PEX cleanup is exercised.
+        let (dead_tx, dead_rx) = mpsc::channel(64);
+        let dead_id = hex(0x0b);
+        {
+            let mut reg = state.registry.lock().await;
+            reg.register(
+                dead_id.clone(),
+                "net".into(),
+                RelayPeerInfo::new(dead_id.clone(), "net".into(), 1),
+                dead_tx,
+                fresh_activity(),
+            );
+        }
+        state.connected.fetch_add(1, Ordering::Relaxed);
+        state.pex.lock().await.on_register(
+            &dead_id,
+            "net",
+            "127.0.0.1:5002".parse().unwrap(),
+            pex_sink(),
+            now_ms(),
+        );
+        drop(dead_rx); // the connection is gone: the sender now reads closed
+
+        assert_eq!(state.pex.lock().await.known_count("net"), 2);
+        assert_eq!(state.pex.lock().await.conn_count(), 2);
+
+        sweep_once(&state, now_secs()).await;
+
+        assert!(
+            state
+                .registry
+                .lock()
+                .await
+                .sender_in_network(&dead_id, "net")
+                .is_none(),
+            "the dead peer is removed from the registry"
+        );
+        assert!(
+            state
+                .registry
+                .lock()
+                .await
+                .sender_in_network(&live.0.peer_id.clone().unwrap(), "net")
+                .is_some(),
+            "the unrelated live peer is untouched"
+        );
+        assert_eq!(state.connected.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.pex.lock().await.known_count("net"),
+            1,
+            "the dead peer drops out of the introducer's advertise set"
+        );
+        assert_eq!(state.pex.lock().await.conn_count(), 1);
+    }
+
+    /// (b) A peer whose channel is still OPEN but whose last inbound activity is older than the
+    /// liveness deadline (a half-open / silently-dead peer — no more RLY-006 keepalives) is pruned
+    /// exactly as a closed-channel peer would be.
+    #[tokio::test]
+    async fn sweep_prunes_a_stale_activity_peer_with_an_open_channel() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let now = now_secs();
+        let stale_id = hex(0x0c);
+        let (stale_tx, _stale_rx_kept_open) = mpsc::channel(64);
+        {
+            let mut reg = state.registry.lock().await;
+            reg.register(
+                stale_id.clone(),
+                "net".into(),
+                RelayPeerInfo::new(stale_id.clone(), "net".into(), 1),
+                stale_tx,
+                Arc::new(AtomicU64::new(now.saturating_sub(1_000))), // long past any sane deadline
+            );
+        }
+
+        sweep_once(&state, now).await;
+
+        assert!(
+            state
+                .registry
+                .lock()
+                .await
+                .sender_in_network(&stale_id, "net")
+                .is_none(),
+            "a silently-stale peer is pruned even with its channel still open"
+        );
+    }
+
+    /// (c) A peer with an open channel and activity within the liveness deadline survives a sweep
+    /// untouched — the sweep is a no-op for a genuinely live, keepalive-sending peer.
+    #[tokio::test]
+    async fn sweep_spares_a_live_and_fresh_peer() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let (_session, _rly_rx, _pex_tx, _pex_rx) =
+            register_into(&state, &hex(0x0d), "net", 5003).await;
+
+        sweep_once(&state, now_secs()).await;
+
+        assert_eq!(
+            state.registry.lock().await.len(),
+            1,
+            "a live, fresh peer is never pruned"
+        );
+    }
+
+    /// (d) Anti-hijack: a reconnect that reclaims a formerly-dead `peer_id` BEFORE the sweep runs
+    /// (`Registry::register`'s own `Reconnected` path) leaves a live, open-channel record in the
+    /// registry — `dead_or_stale` scans the registry fresh on every call, so the sweep never prunes
+    /// that live incumbent even though the SAME id was dead moments earlier. `sweep_once` collects and
+    /// removes victims under one held registry lock (no `.await` between the scan and the removal), so
+    /// a racing register can never land in the gap between "found dead" and "removed" — the reconnect
+    /// either completes entirely before the sweep's lock acquisition (this test) or waits for it
+    /// (structurally, since both take the same `Mutex`).
+    #[tokio::test]
+    async fn sweep_never_prunes_a_peer_that_reconnected_over_a_dead_incumbent() {
+        let state = RelayState::new(RelayServerConfig::default());
+        let id = hex(0x0e);
+
+        // First registration goes dead (its channel closes).
+        let (dead_tx, dead_rx) = mpsc::channel(64);
+        {
+            let mut reg = state.registry.lock().await;
+            reg.register(
+                id.clone(),
+                "net".into(),
+                RelayPeerInfo::new(id.clone(), "net".into(), 1),
+                dead_tx,
+                Arc::new(AtomicU64::new(now_secs().saturating_sub(1_000))), // also stale
+            );
+        }
+        drop(dead_rx);
+
+        // A reconnect reclaims the id with a LIVE, fresh registration — as `register_peer` would do
+        // for a genuine reconnecting node — before the sweep ever runs.
+        let (live_tx, _live_rx) = mpsc::channel(64);
+        let outcome = state.registry.lock().await.register(
+            id.clone(),
+            "net".into(),
+            RelayPeerInfo::new(id.clone(), "net".into(), 1),
+            live_tx,
+            fresh_activity(),
+        );
+        assert_eq!(outcome, RegisterOutcome::Reconnected);
+
+        sweep_once(&state, now_secs()).await;
+
+        assert!(
+            state
+                .registry
+                .lock()
+                .await
+                .sender_in_network(&id, "net")
+                .is_some(),
+            "the reconnected LIVE incumbent must survive the sweep, never the stale record it replaced"
+        );
+        assert_eq!(state.registry.lock().await.len(), 1);
     }
 
     #[test]
@@ -1943,6 +2231,7 @@ mod tests {
             &out_tx,
             &pex_tx,
             None,
+            fresh_activity(),
         )
         .await;
         assert!(ok, "registration should succeed");
@@ -1975,6 +2264,7 @@ mod tests {
                 &tx,
                 &pex_sink(),
                 None,
+                fresh_activity(),
             )
             .await
         );
@@ -2011,6 +2301,7 @@ mod tests {
                 &tx,
                 &pex_sink(),
                 None,
+                fresh_activity(),
             )
             .await
         );
@@ -2046,6 +2337,7 @@ mod tests {
                 &tx,
                 &pex_sink(),
                 None,
+                fresh_activity(),
             )
             .await
         );
@@ -2071,6 +2363,7 @@ mod tests {
             "net2".into(),
             RelayPeerInfo::new("b".into(), "net2".into(), 1),
             btx,
+            fresh_activity(),
         );
         // The sender is on net1 and tries to forward to "b".
         let (atx, mut arx) = mpsc::channel(64);
@@ -2133,6 +2426,7 @@ mod tests {
             &tx,
             &pex_sink(),
             Some("abc123"),
+            fresh_activity(),
         )
         .await;
         assert!(ok, "a claimed id matching the mTLS identity must register");
@@ -2166,6 +2460,7 @@ mod tests {
             &tx,
             &pex_sink(),
             Some("the-real-cert-derived-id"),
+            fresh_activity(),
         )
         .await;
         assert!(!ok, "a peer_id/certificate mismatch must be refused");
@@ -2216,6 +2511,7 @@ mod tests {
             &tx,
             &pex_sink(),
             Some("real-id"),
+            fresh_activity(),
         )
         .await;
         assert!(!ok);

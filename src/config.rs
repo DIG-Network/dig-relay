@@ -81,6 +81,29 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 256 * 1024;
 /// (SECURITY_AUDIT_P2P dig-relay #5).
 pub const DEFAULT_REGISTER_TIMEOUT_SECS: u64 = 10;
 
+/// Default cadence (seconds) of the ACTIVE registry health sweep (#1382). On this interval the relay
+/// scans its whole registry and PROMPTLY prunes any registration whose connection is dead
+/// (`tx.is_closed()`) or that has shown no inbound activity for longer than
+/// [`liveness_deadline`](RelayServerConfig::liveness_deadline) — a half-open / silently-dead peer.
+/// Pruning removes the record from introductions (RLY-005) + the PEX advertisable set (RLY-008) at
+/// once, so a dead peer is never handed out. Aligned to the gossip client's 30 s keepalive: sweeping
+/// once per keepalive is ample and cheap (a single registry scan).
+pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 30;
+
+/// Default liveness deadline (seconds): a REGISTERED connection with no inbound frame for this long is
+/// treated as dead by the health sweep (#1382) and pruned. Set to 3× the gossip client's 30 s
+/// keepalive so a live peer (which pings every 30 s) is never falsely pruned — only a peer that has
+/// missed several consecutive keepalives (a half-open / vanished host) is. Deliberately SHORTER than
+/// [`idle_timeout`](RelayServerConfig::idle_timeout) (120 s) so the active sweep — which also clears
+/// the peer from introductions/PEX — reclaims a dead record well before the passive per-connection
+/// idle backstop would, and the record is not handed out in the meantime.
+///
+/// Detection is by inbound activity, NOT by a returned pong: the relay client answers the relay's
+/// keepalive pongs but does not itself reply to a relay-initiated ping (it only SENDS keepalive
+/// pings), so a live peer's liveness is proven by its own inbound keepalive traffic, never by an
+/// echo the client would not send.
+pub const DEFAULT_LIVENESS_DEADLINE_SECS: u64 = 90;
+
 /// Validated relay server configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayServerConfig {
@@ -111,6 +134,14 @@ pub struct RelayServerConfig {
     pub max_message_bytes: usize,
     /// Time an accepted connection has to complete RLY-001 `Register` before it is dropped.
     pub register_timeout: Duration,
+    /// Cadence of the active registry health sweep (#1382): how often the relay scans its registry and
+    /// prunes dead / half-open registrations. See [`DEFAULT_HEALTH_CHECK_INTERVAL_SECS`].
+    pub health_check_interval: Duration,
+    /// How long a registered connection may go with no inbound activity before the health sweep prunes
+    /// it as dead (#1382). Kept `< idle_timeout` so the active sweep reclaims a dead record — and pulls
+    /// it from introductions/PEX — before the passive idle backstop. See
+    /// [`DEFAULT_LIVENESS_DEADLINE_SECS`].
+    pub liveness_deadline: Duration,
     /// Optional path to the relay's OWN TLS certificate (PEM). When set together with
     /// [`tls_key_path`](Self::tls_key_path), the relay terminates TLS itself on [`listen`](Self::listen)
     /// and REQUIRES every client to present a certificate (mTLS) — `src/tls.rs` derives
@@ -146,6 +177,8 @@ impl Default for RelayServerConfig {
             outbound_queue_capacity: DEFAULT_OUTBOUND_QUEUE_CAPACITY,
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             register_timeout: Duration::from_secs(DEFAULT_REGISTER_TIMEOUT_SECS),
+            health_check_interval: Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECS),
+            liveness_deadline: Duration::from_secs(DEFAULT_LIVENESS_DEADLINE_SECS),
             tls_cert_path: None,
             tls_key_path: None,
         }
@@ -172,6 +205,21 @@ impl RelayServerConfig {
         }
         if self.register_timeout.is_zero() {
             return Err("register_timeout must be > 0".to_string());
+        }
+        if self.health_check_interval.is_zero() {
+            return Err("health_check_interval must be > 0".to_string());
+        }
+        if self.liveness_deadline.is_zero() {
+            return Err("liveness_deadline must be > 0".to_string());
+        }
+        if self.liveness_deadline < self.health_check_interval {
+            return Err("liveness_deadline must be >= health_check_interval".to_string());
+        }
+        if self.liveness_deadline >= self.idle_timeout {
+            return Err(
+                "liveness_deadline must be < idle_timeout (idle timeout is the longer backstop)"
+                    .to_string(),
+            );
         }
         if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
             return Err("tls_cert_path and tls_key_path must be set together".to_string());
@@ -351,6 +399,69 @@ mod tests {
             ..Default::default()
         };
         assert!(c.validate().is_ok());
+    }
+
+    /// Health-sweep defaults (#1382) are present, sane, and correctly ORDERED relative to the idle
+    /// backstop: a non-zero sweep cadence, a liveness deadline at least one cadence long, and a
+    /// deadline STRICTLY shorter than the passive idle timeout so the active sweep reclaims a dead
+    /// record (and clears it from introductions/PEX) before the idle backstop would.
+    #[test]
+    fn health_sweep_defaults_are_present_and_ordered() {
+        let c = RelayServerConfig::default();
+        assert_eq!(c.health_check_interval, Duration::from_secs(30));
+        assert_eq!(c.liveness_deadline, Duration::from_secs(90));
+        assert!(
+            c.health_check_interval > Duration::ZERO,
+            "sweep cadence must be non-zero"
+        );
+        assert!(
+            c.liveness_deadline >= c.health_check_interval,
+            "deadline must be at least one sweep long"
+        );
+        assert!(
+            c.liveness_deadline < c.idle_timeout,
+            "liveness deadline must be a shorter, active reclaim vs the idle backstop"
+        );
+    }
+
+    #[test]
+    fn zero_health_check_interval_is_rejected() {
+        let c = RelayServerConfig {
+            health_check_interval: Duration::from_secs(0),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn zero_liveness_deadline_is_rejected() {
+        let c = RelayServerConfig {
+            liveness_deadline: Duration::from_secs(0),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn liveness_deadline_shorter_than_the_sweep_cadence_is_rejected() {
+        let c = RelayServerConfig {
+            health_check_interval: Duration::from_secs(60),
+            liveness_deadline: Duration::from_secs(30),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn liveness_deadline_not_shorter_than_idle_timeout_is_rejected() {
+        // The idle timeout MUST remain a strictly-longer backstop; a deadline >= idle timeout would
+        // make the active sweep pointless (idle would fire first) — reject it.
+        let c = RelayServerConfig {
+            liveness_deadline: Duration::from_secs(120),
+            idle_timeout: Duration::from_secs(120),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
     }
 
     /// The DoS-hardening defaults (SECURITY_AUDIT_P2P dig-relay #3/#4/#5) are all present and sane out
