@@ -78,7 +78,7 @@ dig-ip = "0.1"
 # MaxMind-format (.mmdb) database. Pure-Rust, permissively licensed (ISC), fine as a leaf dep in
 # this GPL-2.0 crate. Never used for a per-request third-party lookup — the DB is opened once,
 # in-process, so a peer's IP never leaves the relay.
-maxminddb = "0.24"
+maxminddb = "0.27"
 
 [target.'cfg(windows)'.dependencies]
 # Windows Service Control Protocol dispatcher: a service-manager-registered service must itself

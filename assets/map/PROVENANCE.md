@@ -10,6 +10,7 @@ These assets are embedded into the `dig-relay` binary (`include_bytes!` in `src/
 - **License:** MIT (https://github.com/vasturiano/globe.gl/blob/master/LICENSE)
 - This is the self-contained UMD build — it bundles `three` (WebGL), `three-globe`, and
   `three-render-objects` internally, so no separate `three.min.js` vendoring is needed.
+- **SHA-256:** `2ab6767f47e2be0ac346cd7a5eb55d259ea3da06d479dc22f1820ddd698f496a`
 
 ## `earth.jpg`
 
@@ -17,6 +18,7 @@ These assets are embedded into the `dig-relay` binary (`include_bytes!` in `src/
 - **License:** MIT (same repo as `three-globe`, part of its example assets)
 - Chosen over the repo's `earth-blue-marble.jpg` (1.4 MiB) specifically because it renders dark —
   matching the DIG dashboard's dark theme — and is a fraction of the size (~93 KiB).
+- **SHA-256:** `8b8f3a4e258428b6e669a0799fb8b6f2db15c6240825d6a7c75963829b576994`
 
 ## Size note
 

@@ -8,9 +8,8 @@
 //! globe still renders — every peer simply lands in the "unknown/relayed" bucket
 //! ([`crate::map::MapSnapshot::unknown_peers`]).
 
-use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use maxminddb::geoip2;
 use maxminddb::Reader;
@@ -49,52 +48,22 @@ fn db() -> &'static Option<Reader<Vec<u8>>> {
     })
 }
 
-/// A peer's IP rarely changes across the relay's `/map` 5s refresh cadence, and an mmdb lookup is
-/// the one part of `locate` that isn't free — so every resolved answer (a hit AND a miss) is cached
-/// permanently for the life of the process, keyed on the canonicalized IP. This also means a peer
-/// is looked up in the bundled offline database AT MOST ONCE ever, never on a schedule and never
-/// per-request, reinforcing the "no repeated external/expensive lookup" side of the privacy
-/// contract. The cache holds only coarse-irrelevant precise (lat, lon) pairs in-process — it is
-/// never serialized, so it does not itself widen what leaves the relay (`src/map.rs` still snaps to
-/// the coarse grid before anything is published).
-/// A cached geo answer, or the recorded absence of one (see [`CACHE`]).
-type CachedLocation = Option<(f64, f64)>;
-
-static CACHE: OnceLock<Mutex<HashMap<IpAddr, CachedLocation>>> = OnceLock::new();
-
-fn cache() -> &'static Mutex<HashMap<IpAddr, CachedLocation>> {
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// Best-effort (lat, lon) for a public IP, or `None` when the address is private/reserved/
 /// unlocatable or no database is loaded. IPv6-aware: an IPv4-mapped IPv6 address is canonicalized
-/// to its IPv4 form first (§5.2), so a dual-stack peer resolves the same either way. Cached
-/// permanently per IP (see [`CACHE`]) so a peer is only ever looked up once.
+/// to its IPv4 form first (§5.2), so a dual-stack peer resolves the same either way.
+///
+/// Deliberately UNCACHED: an mmdb lookup is a microsecond-scale in-memory read, so caching it
+/// bought negligible latency at the cost of an unbounded per-IP map — an attacker cycling source
+/// IPs (trivially cheap across an IPv6 /64) could grow that cache without bound and exhaust
+/// process memory. Every call re-queries the database directly.
 pub fn locate(ip: IpAddr) -> Option<(f64, f64)> {
     let ip = ip.to_canonical();
-
-    if let Some(cached) = cache().lock().unwrap_or_else(|e| e.into_inner()).get(&ip) {
-        return *cached;
-    }
-
-    let result = locate_uncached(ip);
-    cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(ip, result);
-    result
-}
-
-/// The real (uncached) database lookup — factored out so [`locate`]'s cache wrapper stays a thin,
-/// obviously-correct layer over it.
-fn locate_uncached(ip: IpAddr) -> Option<(f64, f64)> {
     if !is_public(&ip) {
         return None;
     }
     let reader = db().as_ref()?;
-    let city: geoip2::City = reader.lookup(ip).ok()?;
-    let location = city.location?;
-    Some((location.latitude?, location.longitude?))
+    let city: geoip2::City = reader.lookup(ip).ok()?.decode().ok().flatten()?;
+    Some((city.location.latitude?, city.location.longitude?))
 }
 
 /// Whether `ip` is a plausible public, dialable address worth looking up — excludes loopback,
@@ -201,35 +170,11 @@ mod tests {
     }
 
     #[test]
-    fn locate_caches_a_result_permanently_so_a_second_call_skips_the_real_lookup() {
-        // Use a distinct IP per test (module-level CACHE is shared across the whole test binary)
-        // so this assertion can't be polluted by another test's lookup of the same address.
+    fn locate_is_stateless_across_repeated_calls_for_the_same_ip() {
+        // No cache to poison: two calls for the same IP must agree, and must not accumulate any
+        // process-lifetime state (regression guard for the removed unbounded per-IP cache).
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 199));
-        assert!(
-            !cache().lock().unwrap().contains_key(&ip),
-            "precondition: this IP was never looked up before"
-        );
-
-        let first = locate(ip);
-        assert!(
-            cache().lock().unwrap().contains_key(&ip),
-            "the first call must populate the cache (hit or miss)"
-        );
-
-        // Sabotage the cached entry with a sentinel value distinguishable from any real answer,
-        // then call locate() again — if it consulted the cache (rather than the database) it MUST
-        // return the sentinel, proving the second call never touched `locate_uncached`.
-        let sentinel = Some((12.34, 56.78));
-        cache().lock().unwrap().insert(ip, sentinel);
-        assert_eq!(
-            locate(ip),
-            sentinel,
-            "a cached entry must be served verbatim, without re-querying the database"
-        );
-        assert_ne!(
-            sentinel, first,
-            "sanity: the sentinel must differ from whatever the real (uncached) lookup returned"
-        );
+        assert_eq!(locate(ip), locate(ip));
     }
 
     #[test]

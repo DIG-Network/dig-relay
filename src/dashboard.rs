@@ -665,6 +665,9 @@ const MAP_HTML: &str = r##"<!DOCTYPE html>
   const summary = document.getElementById("summary");
   const srSummary = document.getElementById("sr-summary");
 
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
   function setOverlay(html) {
     overlay.style.display = html ? "flex" : "none";
     overlay.innerHTML = html || "";
@@ -738,7 +741,7 @@ const MAP_HTML: &str = r##"<!DOCTYPE html>
       setOverlay(d.located_peers > 0 ? "" :
         '<div class="state">' + summaryText + '</div>');
     } catch (e) {
-      setOverlay('<div class="state error">Could not load the peer map: ' + e.message + '</div>');
+      setOverlay('<div class="state error">Could not load the peer map: ' + esc(e.message) + '</div>');
       summary.textContent = "Error loading peer map";
     }
   }
