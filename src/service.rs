@@ -137,6 +137,32 @@ pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
             "DIG_RELAY_MAX_CONNECTIONS".to_string(),
             config.max_connections.to_string(),
         ),
+        // App-level abuse limits (#1386): persist the configured caps so the installed service runs
+        // with the same protection as the foreground `serve` that installed it.
+        (
+            "DIG_RELAY_MAX_CONNECTIONS_PER_IP".to_string(),
+            config.max_connections_per_ip.to_string(),
+        ),
+        (
+            "DIG_RELAY_REGISTRATIONS_PER_IP_PER_SEC".to_string(),
+            config.registrations_per_ip_per_sec.to_string(),
+        ),
+        (
+            "DIG_RELAY_MAX_REGISTRATIONS_PER_IP".to_string(),
+            config.max_registrations_per_ip.to_string(),
+        ),
+        (
+            "DIG_RELAY_MESSAGES_PER_CONN_PER_SEC".to_string(),
+            config.messages_per_conn_per_sec.to_string(),
+        ),
+        (
+            "DIG_RELAY_BYTES_PER_CONN_PER_SEC".to_string(),
+            config.bytes_per_conn_per_sec.to_string(),
+        ),
+        (
+            "DIG_RELAY_MAX_RELAYED_BYTES_PER_CONN".to_string(),
+            config.max_relayed_bytes_per_conn.to_string(),
+        ),
     ];
     environment.extend(tls_environment_pairs(config));
 
@@ -358,6 +384,57 @@ pub fn config_from_env() -> RelayServerConfig {
     {
         config.register_timeout = std::time::Duration::from_secs(s);
     }
+    // Health-sweep knobs (#1382 fold-in): these shipped with CLI flags but no env overrides; add
+    // them here so an installed service can tune them the same way as every other knob.
+    if let Some(s) = std::env::var("DIG_RELAY_HEALTH_CHECK_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        config.health_check_interval = std::time::Duration::from_secs(s);
+    }
+    if let Some(s) = std::env::var("DIG_RELAY_LIVENESS_DEADLINE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        config.liveness_deadline = std::time::Duration::from_secs(s);
+    }
+    // App-level abuse limits (#1386).
+    if let Some(n) = std::env::var("DIG_RELAY_MAX_CONNECTIONS_PER_IP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.max_connections_per_ip = n;
+    }
+    if let Some(n) = std::env::var("DIG_RELAY_REGISTRATIONS_PER_IP_PER_SEC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.registrations_per_ip_per_sec = n;
+    }
+    if let Some(n) = std::env::var("DIG_RELAY_MAX_REGISTRATIONS_PER_IP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.max_registrations_per_ip = n;
+    }
+    if let Some(n) = std::env::var("DIG_RELAY_MESSAGES_PER_CONN_PER_SEC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.messages_per_conn_per_sec = n;
+    }
+    if let Some(n) = std::env::var("DIG_RELAY_BYTES_PER_CONN_PER_SEC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.bytes_per_conn_per_sec = n;
+    }
+    if let Some(n) = std::env::var("DIG_RELAY_MAX_RELAYED_BYTES_PER_CONN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.max_relayed_bytes_per_conn = n;
+    }
     if let Ok(p) = std::env::var("DIG_RELAY_TLS_CERT_PATH") {
         config.tls_cert_path = Some(std::path::PathBuf::from(p));
     }
@@ -379,7 +456,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// The env vars `config_from_env` reads, cleared so a test starts from a known state.
-    const RELAY_ENV: [&str; 12] = [
+    const RELAY_ENV: [&str; 20] = [
         "DIG_RELAY_LISTEN",
         "DIG_RELAY_HEALTH_LISTEN",
         "DIG_RELAY_DASHBOARD_LISTEN",
@@ -390,6 +467,14 @@ mod tests {
         "DIG_RELAY_OUTBOUND_QUEUE_CAPACITY",
         "DIG_RELAY_MAX_MESSAGE_BYTES",
         "DIG_RELAY_REGISTER_TIMEOUT_SECS",
+        "DIG_RELAY_HEALTH_CHECK_INTERVAL_SECS",
+        "DIG_RELAY_LIVENESS_DEADLINE_SECS",
+        "DIG_RELAY_MAX_CONNECTIONS_PER_IP",
+        "DIG_RELAY_REGISTRATIONS_PER_IP_PER_SEC",
+        "DIG_RELAY_MAX_REGISTRATIONS_PER_IP",
+        "DIG_RELAY_MESSAGES_PER_CONN_PER_SEC",
+        "DIG_RELAY_BYTES_PER_CONN_PER_SEC",
+        "DIG_RELAY_MAX_RELAYED_BYTES_PER_CONN",
         "DIG_RELAY_TLS_CERT_PATH",
         "DIG_RELAY_TLS_KEY_PATH",
     ];
@@ -599,6 +684,14 @@ mod tests {
         std::env::set_var("DIG_RELAY_OUTBOUND_QUEUE_CAPACITY", "256");
         std::env::set_var("DIG_RELAY_MAX_MESSAGE_BYTES", "4096");
         std::env::set_var("DIG_RELAY_REGISTER_TIMEOUT_SECS", "3");
+        std::env::set_var("DIG_RELAY_HEALTH_CHECK_INTERVAL_SECS", "20");
+        std::env::set_var("DIG_RELAY_LIVENESS_DEADLINE_SECS", "50");
+        std::env::set_var("DIG_RELAY_MAX_CONNECTIONS_PER_IP", "8");
+        std::env::set_var("DIG_RELAY_REGISTRATIONS_PER_IP_PER_SEC", "3");
+        std::env::set_var("DIG_RELAY_MAX_REGISTRATIONS_PER_IP", "16");
+        std::env::set_var("DIG_RELAY_MESSAGES_PER_CONN_PER_SEC", "64");
+        std::env::set_var("DIG_RELAY_BYTES_PER_CONN_PER_SEC", "2048");
+        std::env::set_var("DIG_RELAY_MAX_RELAYED_BYTES_PER_CONN", "4096");
         std::env::set_var("DIG_RELAY_TLS_CERT_PATH", "/etc/dig-relay/cert.pem");
         std::env::set_var("DIG_RELAY_TLS_KEY_PATH", "/etc/dig-relay/key.pem");
         let c = config_from_env();
@@ -613,6 +706,14 @@ mod tests {
         assert_eq!(c.outbound_queue_capacity, 256);
         assert_eq!(c.max_message_bytes, 4096);
         assert_eq!(c.register_timeout, std::time::Duration::from_secs(3));
+        assert_eq!(c.health_check_interval, std::time::Duration::from_secs(20));
+        assert_eq!(c.liveness_deadline, std::time::Duration::from_secs(50));
+        assert_eq!(c.max_connections_per_ip, 8);
+        assert_eq!(c.registrations_per_ip_per_sec, 3);
+        assert_eq!(c.max_registrations_per_ip, 16);
+        assert_eq!(c.messages_per_conn_per_sec, 64);
+        assert_eq!(c.bytes_per_conn_per_sec, 2048);
+        assert_eq!(c.max_relayed_bytes_per_conn, 4096);
         assert_eq!(
             c.tls_cert_path,
             Some(std::path::PathBuf::from("/etc/dig-relay/cert.pem"))
