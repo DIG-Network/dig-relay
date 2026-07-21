@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.12.0] - 2026-07-21
+
+### Features
+- **relay:** App-level abuse protection — per-IP conn/registration/bandwidth limits (#1386) (#14)
+
 ## [0.11.0] - 2026-07-21
 
 ### Features
