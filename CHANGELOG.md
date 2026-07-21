@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.14.1] - 2026-07-21
+
+### Bug Fixes
+- **release:** Sync Cargo.lock to package version + enforce --locked in CI (#18)
+
 ## [0.14.0] - 2026-07-21
 
 ### Features
