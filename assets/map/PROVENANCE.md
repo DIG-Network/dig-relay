@@ -14,17 +14,34 @@ These assets are embedded into the `dig-relay` binary (`include_bytes!` in `src/
 
 ## `earth.jpg`
 
-- **Source:** https://raw.githubusercontent.com/vasturiano/three-globe/master/example/img/earth-dark.jpg
-- **License:** MIT (same repo as `three-globe`, part of its example assets)
-- Chosen over the repo's `earth-blue-marble.jpg` (1.4 MiB) specifically because it renders dark —
-  matching the DIG dashboard's dark theme — and is a fraction of the size (~93 KiB).
-- **SHA-256:** `8b8f3a4e258428b6e669a0799fb8b6f2db15c6240825d6a7c75963829b576994`
+- **Source:** https://raw.githubusercontent.com/vasturiano/three-globe/master/example/img/earth-blue-marble.jpg
+- **Texture:** NASA **Blue Marble** — the standard `globe.gl` daytime earth texture (4096×2048
+  equirectangular).
+- **License:** **Public domain.** NASA imagery is not subject to copyright
+  (https://visibleearth.nasa.gov/); redistributed here via the `three-globe` example assets (MIT).
+- Daytime texture (#1475): `/map` reads as a bright, familiar globe. Peer markers are drawn
+  near-opaque (alpha `0.95`, see `colorFor` in `src/dashboard.rs`) so they stay legible over the
+  lighter surface rather than washing out (they were tuned for the previous dark texture).
+- **Size:** ~1.4 MiB.
+- **SHA-256:** `228deba2e4b600146bdcb6cfa359b8ead6aacc2b1c13550a29cd82824cfa1c01`
 
 ## Size note
 
-`globe.gl.min.js` (~1.71 MiB) + `earth.jpg` (~93 KiB) totals ~1.8 MiB embedded — slightly over the
-original ≲1.5 MiB target, because `globe.gl`'s only self-contained minified build bundles the whole
+`globe.gl.min.js` (~1.71 MiB) + `earth.jpg` (~1.4 MiB) totals ~3.1 MiB embedded (well under the
+`dashboard.rs` 4 MiB embed guard). `globe.gl`'s only self-contained minified build bundles the whole
 WebGL stack (three.js + three-globe + three-render-objects) rather than shipping a separate
-`three.min.js` an app loads independently. Splitting into a bare `three.min.js` + a `three-globe`
+`three.min.js` an app loads independently; splitting into a bare `three.min.js` + a `three-globe`
 build that expects `THREE` as a global would trade a larger, harder-to-maintain vendoring surface
-for a small size win, so the single self-contained bundle was kept. Flagged in the PR for review.
+for a small size win, so the single self-contained bundle was kept.
+
+## Geo-IP database (`/opt/dig-relay/geoip/dbip-city-lite.mmdb`, image-only — not embedded)
+
+- **Source:** https://download.db-ip.com/free/dbip-city-lite-YYYY-MM.mmdb.gz (pinned month in the
+  `Dockerfile` `geoip` stage; DB-IP retains ~2 recent months).
+- **Database:** **DB-IP City Lite** — free, coarse city-level accuracy, which is all the deliberately
+  coarse ~5° `/map` grid needs.
+- **License:** **CC-BY 4.0** (NO license key required). Attribution ("IP Geolocation by DB-IP") is
+  rendered in the `/map` page footer (`src/dashboard.rs`), satisfying the CC-BY term.
+- Downloaded + unpacked in a throwaway Docker builder stage and `COPY`d into the final image at the
+  path `src/geoip.rs::DEFAULT_GEOIP_DB_PATH` reads (overridable via `DIG_RELAY_GEOIP_DB`). It is NOT
+  `include_bytes!`-embedded in the binary (it is ~130 MiB uncompressed).
