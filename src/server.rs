@@ -49,6 +49,11 @@ pub mod errcode {
     /// a peer cannot register an id it does not hold the key for (proof-of-possession, SPEC.md
     /// §3.2/§8, super-repo issue `DIG-Network/dig_ecosystem#5`).
     pub const IDENTITY_MISMATCH: u32 = 6;
+    /// A `Register` was refused by the app-level abuse limits (#1386): the source IP exceeded its
+    /// per-IP registration RATE budget or its per-IP concurrent-registration cap. Distinct from
+    /// `CAPACITY` (the GLOBAL connection cap) so a client can tell a per-source throttle from the
+    /// relay being globally full. Like `CAPACITY`, it accompanies a failing `register_ack`.
+    pub const RATE_LIMITED: u32 = 7;
 }
 
 /// Shared relay state: the registry plus a connected-peer counter for `/health`.
@@ -89,6 +94,11 @@ pub struct RelayState {
     /// [`RelayServerConfig::tls_cert_path`]/`tls_key_path`. `None` keeps the listener plain `ws://`
     /// (the default — SPEC.md §3.2/§8).
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// App-level abuse protection (#1386): the shared per-source-IP connection / registration limits
+    /// (`src/limits.rs`). The accept loop reserves a per-IP connection slot and `register_peer`
+    /// checks the per-IP registration rate + concurrent-registration cap. The per-connection
+    /// message/byte limiter is task-local (a `PerConnLimiter`), not held here.
+    pub abuse: crate::limits::AbusePolicy,
 }
 
 impl RelayState {
@@ -105,6 +115,7 @@ impl RelayState {
         tls: Option<Arc<rustls::ServerConfig>>,
     ) -> Arc<Self> {
         Arc::new(RelayState {
+            abuse: crate::limits::AbusePolicy::new(&config),
             registry: Mutex::new(Registry::new()),
             pex: Mutex::new(PexRelay::new()),
             connected: AtomicU64::new(0),
@@ -532,6 +543,16 @@ where
     }
     let _open_guard = OpenConnectionGuard::acquire(&state);
 
+    // Per-source-IP connection cap (#1386): the global cap above bounds the relay in aggregate, but
+    // one source IP could still hold every slot. Reserve a per-IP slot (RAII, released on ANY exit
+    // path beside `_open_guard`); refuse the connection when this source is already at its per-IP cap
+    // so a single host cannot monopolise the relay. `peer_addr` is the observed reflexive source; the
+    // slot's key normalises IPv4-mapped IPv6 + groups an IPv6 /64 (see `limits::ip_key`).
+    let Some(_ip_slot) = state.abuse.try_acquire_conn(peer_addr.ip()) else {
+        tracing::warn!(%peer_addr, "refusing connection: at per-IP connection cap (#1386)");
+        return Ok(());
+    };
+
     // This one TLS-terminated port carries BOTH surfaces (dig_ecosystem #1041): peek the HTTP request
     // head, and route on it. A WebSocket upgrade is a relay-wire peer — its request bytes are replayed
     // to the handshake unchanged via `Prefixed`, so the wire path stays byte-for-byte the same. Any
@@ -609,6 +630,15 @@ where
     // read it without touching this task.
     let last_activity = Arc::new(AtomicU64::new(now_secs()));
 
+    // Per-connection abuse limiter (#1386): task-local (no shared lock), enforcing this connection's
+    // inbound message-rate, byte-rate, and cumulative-byte budgets. A breach DISCONNECTS (breaks the
+    // loop) — a connection flooding far past the generous defaults is shed, not throttled. The
+    // per-IP caps (`_ip_slot`, `register_peer`) are the shared dimension; this is the hot per-frame one.
+    let mut conn_limiter = crate::limits::PerConnLimiter::new(&state.config, now_ms());
+    // The per-IP concurrent-registration slot (#1386), acquired in `register_peer` on a successful
+    // register and released when this connection ends (dropped at teardown below).
+    let mut reg_slot: Option<crate::limits::RegSlot> = None;
+
     loop {
         // Until the connection has registered (RLY-001), it is held only to the SHORT register
         // timeout, so a connect-but-never-register socket is reaped quickly (SECURITY_AUDIT_P2P
@@ -642,6 +672,15 @@ where
         // activity, mirroring the node's own RLY-006 keepalive (the client answers relay-initiated
         // pings never; its ~30s keepalive ping is the only inbound liveness signal we can rely on).
         last_activity.store(now_secs(), Ordering::Relaxed);
+
+        // Per-connection abuse limits (#1386): account for this inbound frame's size against the
+        // message-rate, byte-rate, and cumulative-byte budgets. A breach means the peer is flooding
+        // far past the generous defaults — disconnect it (the RAII guards release its slots on the
+        // way out). Checked for every frame (RLY or PEX, valid or not) since all consume resources.
+        if let crate::limits::Admit::Disconnect = conn_limiter.admit(frame.len(), now_ms()) {
+            tracing::warn!(%peer_addr, "disconnecting: per-connection abuse limit exceeded (#1386)");
+            break;
+        }
 
         // RLY-008: a PEX frame (`type:"pex_…"`) is routed to the PEX subsystem, never parsed as an
         // RLY message. This is checked BEFORE the RLY parse so a valid PEX frame never trips the
@@ -703,6 +742,7 @@ where
                     &pex_tx,
                     verified_peer_id.as_deref(),
                     last_activity.clone(),
+                    &mut reg_slot,
                 )
                 .await
                 {
@@ -836,7 +876,46 @@ async fn register_peer(
     pex_tx: &mpsc::Sender<PexMessage>,
     verified_peer_id: Option<&str>,
     last_activity: Arc<AtomicU64>,
+    reg_slot: &mut Option<crate::limits::RegSlot>,
 ) -> bool {
+    // App-level registration-flood protection (#1386), BEFORE any registry work or the mTLS check:
+    // (1) the per-source-IP registration RATE, then (2) the per-source-IP CONCURRENT-registration
+    // cap. Both refuse with a failing `register_ack` + an `Error{RATE_LIMITED}`, mirroring the
+    // capacity/anti-hijack refusal shape below, so a client distinguishes a per-source throttle from
+    // the relay being globally full. The concurrent slot is held in a local and only moved into the
+    // caller's `reg_slot` on a fully-successful register — any later refusal drops it (releasing the
+    // count). `peer_addr` is the observed reflexive source; `limits::ip_key` normalises it.
+    let connected_now = state.connected.load(Ordering::Relaxed) as usize;
+    if !state.abuse.allow_registration(peer_addr.ip(), now_ms()) {
+        tracing::warn!(%peer_id, %peer_addr, "refusing register: per-IP registration rate exceeded (#1386)");
+        let _ = out_tx.try_send(RelayMessage::RegisterAck {
+            success: false,
+            message: "registration rate limit exceeded for your address".to_string(),
+            connected_peers: connected_now,
+        });
+        let _ = out_tx.try_send(RelayMessage::Error {
+            code: errcode::RATE_LIMITED,
+            message: "registration rate limit exceeded for your address".to_string(),
+        });
+        return false;
+    }
+    let acquired_reg_slot = match state.abuse.try_acquire_registration(peer_addr.ip()) {
+        Some(slot) => slot,
+        None => {
+            tracing::warn!(%peer_id, %peer_addr, "refusing register: per-IP concurrent-registration cap reached (#1386)");
+            let _ = out_tx.try_send(RelayMessage::RegisterAck {
+                success: false,
+                message: "too many concurrent registrations from your address".to_string(),
+                connected_peers: connected_now,
+            });
+            let _ = out_tx.try_send(RelayMessage::Error {
+                code: errcode::RATE_LIMITED,
+                message: "too many concurrent registrations from your address".to_string(),
+            });
+            return false;
+        }
+    };
+
     let mut reg = state.registry.lock().await;
 
     if let Some(verified) = verified_peer_id {
@@ -955,6 +1034,10 @@ async fn register_peer(
         .lock()
         .await
         .on_register(&peer_id, &network_id, peer_addr, pex_tx.clone(), now_ms());
+
+    // Registration fully succeeded: retain the per-IP concurrent-registration slot for the lifetime
+    // of this connection (#1386). It is released when the connection task ends (dropped at teardown).
+    *reg_slot = Some(acquired_reg_slot);
 
     session.peer_id = Some(peer_id);
     session.network_id = Some(network_id);
@@ -1456,6 +1539,175 @@ mod tests {
         out
     }
 
+    /// A SocketAddr on a specific IP (the observed reflexive source a real connection carries), for
+    /// the per-IP abuse-limit tests (#1386).
+    fn addr_on(ip: &str) -> SocketAddr {
+        format!("{ip}:40000").parse().unwrap()
+    }
+
+    /// #1386: `RelayState` wires the per-IP connection cap from config — one source IP is capped
+    /// while a DIFFERENT source IP still gets a connection slot (the accept loop's `try_acquire_conn`
+    /// gate, exercised at the shared-state level since the loop itself needs a real socket).
+    #[tokio::test]
+    async fn per_ip_connection_cap_is_wired_and_a_second_ip_is_unaffected() {
+        let state = RelayState::new(RelayServerConfig {
+            max_connections_per_ip: 1,
+            ..Default::default()
+        });
+        let ip1 = addr_on("198.51.100.10").ip();
+        let ip2 = addr_on("198.51.100.11").ip();
+        let _slot = state
+            .abuse
+            .try_acquire_conn(ip1)
+            .expect("ip1 first allowed");
+        assert!(
+            state.abuse.try_acquire_conn(ip1).is_none(),
+            "ip1 at its per-IP cap → refused"
+        );
+        assert!(
+            state.abuse.try_acquire_conn(ip2).is_some(),
+            "a different source IP still gets a slot"
+        );
+    }
+
+    /// #1386: `register_peer` refuses with a failing ack + `RATE_LIMITED` once the per-IP CONCURRENT
+    /// registration cap is reached, while a register from a DIFFERENT IP still succeeds.
+    #[tokio::test]
+    async fn register_peer_refuses_over_the_concurrent_registration_cap_with_rate_limited() {
+        let state = RelayState::new(RelayServerConfig {
+            max_registrations_per_ip: 1,
+            ..Default::default()
+        });
+        let mut session_a = Session::default();
+        let (tx_a, _rx_a) = mpsc::channel(64);
+        let mut slot_a: Option<crate::limits::RegSlot> = None;
+        // Peer A from IP1 registers and RETAINS its concurrent slot (held in slot_a).
+        let ok_a = register_peer(
+            &state,
+            &mut session_a,
+            "a".into(),
+            "net".into(),
+            1,
+            &[],
+            addr_on("203.0.113.1"),
+            &tx_a,
+            &pex_sink(),
+            None,
+            fresh_activity(),
+            &mut slot_a,
+        )
+        .await;
+        assert!(ok_a, "first register from the IP succeeds");
+        assert!(
+            slot_a.is_some(),
+            "and retains its concurrent-registration slot"
+        );
+
+        // Peer B from the SAME IP1 is over the concurrent cap → refused with RATE_LIMITED.
+        let mut session_b = Session::default();
+        let (tx_b, mut rx_b) = mpsc::channel(64);
+        let ok_b = register_peer(
+            &state,
+            &mut session_b,
+            "b".into(),
+            "net".into(),
+            1,
+            &[],
+            addr_on("203.0.113.1"),
+            &tx_b,
+            &pex_sink(),
+            None,
+            fresh_activity(),
+            &mut None,
+        )
+        .await;
+        assert!(
+            !ok_b,
+            "second concurrent register from the same IP is refused"
+        );
+        assert!(
+            session_b.peer_id.is_none(),
+            "refused session stays unregistered"
+        );
+        let msgs = drain(&mut rx_b);
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, RelayMessage::RegisterAck { success: false, .. })),
+            "a failing register_ack is sent"
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                RelayMessage::Error { code, .. } if *code == errcode::RATE_LIMITED
+            )),
+            "a RATE_LIMITED error is sent, got {msgs:?}"
+        );
+
+        // A register from a DIFFERENT IP is unaffected by IP1's concurrent cap.
+        let mut session_c = Session::default();
+        let (tx_c, _rx_c) = mpsc::channel(64);
+        let ok_c = register_peer(
+            &state,
+            &mut session_c,
+            "c".into(),
+            "net".into(),
+            1,
+            &[],
+            addr_on("203.0.113.2"),
+            &tx_c,
+            &pex_sink(),
+            None,
+            fresh_activity(),
+            &mut None,
+        )
+        .await;
+        assert!(ok_c, "a different source IP still registers");
+    }
+
+    /// #1386: a burst of registers from one source IP eventually trips the per-IP registration RATE
+    /// budget — at least one is refused with a failing ack + `RATE_LIMITED`. Robust across a
+    /// one-second window boundary (a rate of 2 admits at most 4 across two windows, so a burst of 10
+    /// always sees a refusal).
+    #[tokio::test]
+    async fn register_peer_registration_rate_flood_is_eventually_rate_limited() {
+        let state = RelayState::new(RelayServerConfig {
+            registrations_per_ip_per_sec: 2,
+            ..Default::default()
+        });
+        let mut saw_rate_limited = false;
+        for i in 0..10 {
+            let mut session = Session::default();
+            let (tx, mut rx) = mpsc::channel(64);
+            let _ = register_peer(
+                &state,
+                &mut session,
+                format!("peer-{i}"),
+                "net".into(),
+                1,
+                &[],
+                addr_on("203.0.113.50"),
+                &tx,
+                &pex_sink(),
+                None,
+                fresh_activity(),
+                &mut None,
+            )
+            .await;
+            if drain(&mut rx).iter().any(|m| {
+                matches!(
+                    m,
+                    RelayMessage::Error { code, .. } if *code == errcode::RATE_LIMITED
+                )
+            }) {
+                saw_rate_limited = true;
+            }
+        }
+        assert!(
+            saw_rate_limited,
+            "a 10-deep register burst from one IP must trip the per-IP rate limit"
+        );
+    }
+
     #[tokio::test]
     async fn register_peer_acks_success_and_bumps_connected() {
         let state = RelayState::new(RelayServerConfig::default());
@@ -1474,6 +1726,7 @@ mod tests {
             &pex_sink(),
             None,
             fresh_activity(),
+            &mut None,
         )
         .await;
         assert!(ok);
@@ -1528,6 +1781,7 @@ mod tests {
             &pex_sink(),
             None,
             fresh_activity(),
+            &mut None,
         )
         .await;
         assert!(!ok, "register must fail at capacity");
@@ -1571,6 +1825,7 @@ mod tests {
                 &pex_sink(),
                 None,
                 fresh_activity(),
+                &mut None,
             )
             .await
         );
@@ -1596,6 +1851,7 @@ mod tests {
             &pex_sink(),
             None,
             fresh_activity(),
+            &mut None,
         )
         .await;
         assert!(!ok, "a duplicate-id register against a live peer must fail");
@@ -1661,6 +1917,7 @@ mod tests {
                 &pex_sink(),
                 None,
                 fresh_activity(),
+                &mut None,
             )
             .await
         );
@@ -1683,6 +1940,7 @@ mod tests {
                 &pex_sink(),
                 None,
                 fresh_activity(),
+                &mut None,
             )
             .await,
             "a reconnect over a dead prior connection must succeed"
@@ -2232,6 +2490,7 @@ mod tests {
             &pex_tx,
             None,
             fresh_activity(),
+            &mut None,
         )
         .await;
         assert!(ok, "registration should succeed");
@@ -2265,6 +2524,7 @@ mod tests {
                 &pex_sink(),
                 None,
                 fresh_activity(),
+                &mut None,
             )
             .await
         );
@@ -2302,6 +2562,7 @@ mod tests {
                 &pex_sink(),
                 None,
                 fresh_activity(),
+                &mut None,
             )
             .await
         );
@@ -2338,6 +2599,7 @@ mod tests {
                 &pex_sink(),
                 None,
                 fresh_activity(),
+                &mut None,
             )
             .await
         );
@@ -2427,6 +2689,7 @@ mod tests {
             &pex_sink(),
             Some("abc123"),
             fresh_activity(),
+            &mut None,
         )
         .await;
         assert!(ok, "a claimed id matching the mTLS identity must register");
@@ -2461,6 +2724,7 @@ mod tests {
             &pex_sink(),
             Some("the-real-cert-derived-id"),
             fresh_activity(),
+            &mut None,
         )
         .await;
         assert!(!ok, "a peer_id/certificate mismatch must be refused");
@@ -2512,6 +2776,7 @@ mod tests {
             &pex_sink(),
             Some("real-id"),
             fresh_activity(),
+            &mut None,
         )
         .await;
         assert!(!ok);

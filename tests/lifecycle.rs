@@ -38,6 +38,11 @@ async fn free_udp_addr() -> std::net::SocketAddr {
 async fn start_relay(max_connections: usize) -> (String, std::net::SocketAddr) {
     start_relay_with(RelayServerConfig {
         max_connections,
+        // These lifecycle tests drive every client from ONE loopback source IP and assert on the
+        // GLOBAL `max_connections` cap; disable the per-IP abuse cap (#1386) so it never conflates
+        // with the global cap (and so a global cap of 1 stays valid — a non-zero per-IP cap must be
+        // <= max_connections). The per-IP cap has its own dedicated tests in `tests/abuse_limits.rs`.
+        max_connections_per_ip: 0,
         ..Default::default()
     })
     .await

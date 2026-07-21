@@ -120,7 +120,7 @@ byte-identically into `src/wire.rs` (pinned by `tests/wire_conformance.rs`). Mes
 | RLY-006 Keepalive | `Ping`/`Pong` | Bidirectional liveness; an idle connection past `idle_timeout` is reaped. |
 | RLY-007 Hole-punch coordination | `HolePunchRequest{peer_id,target_peer_id,external_addr}` → `HolePunchCoordinate{peer_id,external_addr}` (to target) → `HolePunchResult` | Exchanges each side's STUN-derived reflexive address so both peers can attempt a simultaneous-open hole punch; the relay carries no application data for this path. |
 | RLY-008 Peer Exchange (PEX) | `pex_handshake` / `pex_snapshot` / `pex_delta` / `pex_error` | Purely additive introducer PUSH binding (§4). |
-| Errors | `Error{code,message}` | Stable envelope: `1=NOT_REGISTERED`, `2=BAD_MESSAGE`, `3=PEER_NOT_FOUND`, `4=CAPACITY`, `5=ID_IN_USE`, `6=IDENTITY_MISMATCH` (§3.2). |
+| Errors | `Error{code,message}` | Stable envelope: `1=NOT_REGISTERED`, `2=BAD_MESSAGE`, `3=PEER_NOT_FOUND`, `4=CAPACITY`, `5=ID_IN_USE`, `6=IDENTITY_MISMATCH` (§3.2), `7=RATE_LIMITED` (per-source-IP register throttle, §3.0). |
 
 A message before RLY-001 registration (other than `Register` itself) is answered with
 `Error{code:1}`. Full message shapes are frozen by `tests/wire_conformance.rs`; a shape change here
@@ -188,6 +188,31 @@ exhaust the relay:
 - **Register timeout.** An accepted connection that has not completed RLY-001 `Register` within
   `register_timeout` (default 10 s) is dropped. This is distinct from — and shorter than — the
   post-register `idle_timeout` (§7), so half-open / never-registering sockets are reaped promptly.
+
+**App-level abuse protection — per-source-IP + per-connection limits (normative, #1386).** The
+aggregate bounds above cap the relay as a whole; these add the per-SOURCE dimension so one abusive
+source cannot deny service to legitimate peers. Every limit defaults ON; setting any to `0` disables
+THAT dimension. Source IPs are keyed by `limits::ip_key`: an IPv4-mapped IPv6 address collapses to its
+IPv4 form, IPv4 is keyed on the full /32, and IPv6 is keyed on its **/64 prefix** (so the many
+addresses within one delegated /64 share a budget).
+
+- **Per-IP connection cap.** At most `max_connections_per_ip` (default 64) concurrent OPEN connections
+  per source IP, checked before the WebSocket handshake beside the global `max_connections` cap; the
+  excess is refused (the socket is dropped). MUST be `<= max_connections`.
+- **Per-IP registration rate.** RLY-001 `Register` attempts from one source IP are throttled to
+  `registrations_per_ip_per_sec` (default 10) per second; an over-rate register is REFUSED with
+  `RegisterAck{success:false}` + `Error{code:7, RATE_LIMITED}`.
+- **Per-IP concurrent registrations.** At most `max_registrations_per_ip` (default 128) live
+  registrations per source IP; the excess is REFUSED with `RegisterAck{success:false}` +
+  `Error{code:7, RATE_LIMITED}`.
+- **Per-connection message + byte rate.** A connection exceeding `messages_per_conn_per_sec`
+  (default 256) inbound frames/sec, `bytes_per_conn_per_sec` (default 1048576) inbound bytes/sec, or
+  a cumulative `max_relayed_bytes_per_conn` (default 1073741824) over its lifetime is DISCONNECTED
+  (the socket is closed). This limiter is per-connection state, checked on every inbound frame.
+
+The registration checks run in order **rate → concurrent-cap →** the existing mTLS / capacity /
+anti-hijack checks (§3.2), so a per-source throttle is reported (code 7) distinctly from the global
+capacity cap (code 4).
 
 ### 3.1 Two NAT-traversal tiers
 
@@ -349,20 +374,33 @@ ever exposed (the relay is an untrusted forwarder and holds none).
 | `register_timeout` | 10 s | MUST be > 0 (register deadline, §3.0) |
 | `health_check_interval` | 30 s | MUST be > 0; MUST be ≤ `liveness_deadline` (§7.1) |
 | `liveness_deadline` | 90 s | MUST be > 0; MUST be ≥ `health_check_interval`; MUST be < `idle_timeout` (§7.1) |
+| `max_connections_per_ip` | 64 | `0` disables; when non-zero MUST be ≤ `max_connections` (per-IP conn cap, §3.0) |
+| `registrations_per_ip_per_sec` | 10 | `0` disables the per-IP registration rate (§3.0) |
+| `max_registrations_per_ip` | 128 | `0` disables the per-IP concurrent-registration cap (§3.0) |
+| `messages_per_conn_per_sec` | 256 | `0` disables the per-connection message-rate limit (§3.0) |
+| `bytes_per_conn_per_sec` | 1048576 | `0` disables the per-connection byte-rate limit (§3.0) |
+| `max_relayed_bytes_per_conn` | 1073741824 | `0` disables the per-connection cumulative-byte cap (§3.0) |
 | `tls_cert_path` | `None` | Optional; MUST be set together with `tls_key_path` (§3.2/§8) |
 | `tls_key_path` | `None` | Optional; MUST be set together with `tls_cert_path` (§3.2/§8) |
 
 `validate()` rejects `max_connections == 0`, a zero `idle_timeout`, a zero `outbound_queue_capacity`,
 a zero `max_message_bytes`, a zero `register_timeout`, a zero `health_check_interval` or
 `liveness_deadline`, a `liveness_deadline` shorter than `health_check_interval`, a `liveness_deadline`
-not strictly shorter than `idle_timeout`, and exactly one of `tls_cert_path`/`tls_key_path` being set,
-with a stable error string. Config may be built from CLI flags (`main.rs`, `clap` —
-`--tls-cert`/`--tls-key`/`--health-check-interval-secs`/`--liveness-deadline-secs` alongside the
+not strictly shorter than `idle_timeout`, a non-zero `max_connections_per_ip` greater than
+`max_connections`, and exactly one of `tls_cert_path`/`tls_key_path` being set, with a stable error
+string. Config may be built from CLI flags (`main.rs`, `clap` —
+`--tls-cert`/`--tls-key`/`--health-check-interval-secs`/`--liveness-deadline-secs`/
+`--max-connections-per-ip`/`--registrations-per-ip-per-sec`/`--max-registrations-per-ip`/
+`--messages-per-conn-per-sec`/`--bytes-per-conn-per-sec`/`--max-relayed-bytes-per-conn` alongside the
 others) or environment variables consumed by the service installer (`DIG_RELAY_LISTEN`,
 `DIG_RELAY_HEALTH_LISTEN`, `DIG_RELAY_DASHBOARD_LISTEN`, `DIG_RELAY_STUN_LISTEN`,
 `DIG_RELAY_MAX_CONNECTIONS`, `DIG_RELAY_STUN_PER_IP_RPS`, `DIG_RELAY_STUN_GLOBAL_RPS`,
 `DIG_RELAY_OUTBOUND_QUEUE_CAPACITY`, `DIG_RELAY_MAX_MESSAGE_BYTES`,
-`DIG_RELAY_REGISTER_TIMEOUT_SECS`, `DIG_RELAY_TLS_CERT_PATH`, `DIG_RELAY_TLS_KEY_PATH` — see
+`DIG_RELAY_REGISTER_TIMEOUT_SECS`, `DIG_RELAY_HEALTH_CHECK_INTERVAL_SECS`,
+`DIG_RELAY_LIVENESS_DEADLINE_SECS`, `DIG_RELAY_MAX_CONNECTIONS_PER_IP`,
+`DIG_RELAY_REGISTRATIONS_PER_IP_PER_SEC`, `DIG_RELAY_MAX_REGISTRATIONS_PER_IP`,
+`DIG_RELAY_MESSAGES_PER_CONN_PER_SEC`, `DIG_RELAY_BYTES_PER_CONN_PER_SEC`,
+`DIG_RELAY_MAX_RELAYED_BYTES_PER_CONN`, `DIG_RELAY_TLS_CERT_PATH`, `DIG_RELAY_TLS_KEY_PATH` — see
 `src/service.rs::config_from_env`), so an installed OS service serves identically to a manually-run
 `dig-relay serve` with the same flags.
 

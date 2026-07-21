@@ -81,6 +81,28 @@ struct Cli {
     /// --idle-timeout-secs, which remains the longer backstop.
     #[arg(long, value_name = "SECS", global = true)]
     liveness_deadline_secs: Option<u64>,
+    /// Max concurrent OPEN connections from a single source IP (default 64; 0 disables; #1386).
+    /// Must be <= --max-connections. Stops one host from monopolising the relay's global cap.
+    #[arg(long, value_name = "N", global = true)]
+    max_connections_per_ip: Option<u32>,
+    /// RLY-001 Register attempts per second per source IP (default 10; 0 disables; #1386).
+    #[arg(long, value_name = "N", global = true)]
+    registrations_per_ip_per_sec: Option<u32>,
+    /// Max concurrent live registrations from a single source IP (default 128; 0 disables; #1386).
+    #[arg(long, value_name = "N", global = true)]
+    max_registrations_per_ip: Option<u32>,
+    /// Inbound frames per second per connection before it is disconnected (default 256; 0 disables;
+    /// #1386).
+    #[arg(long, value_name = "N", global = true)]
+    messages_per_conn_per_sec: Option<u32>,
+    /// Inbound bytes per second per connection before it is disconnected (default 1048576; 0
+    /// disables; #1386).
+    #[arg(long, value_name = "BYTES", global = true)]
+    bytes_per_conn_per_sec: Option<u32>,
+    /// Cumulative inbound bytes a single connection may relay before it is disconnected (default
+    /// 1073741824; 0 disables; #1386).
+    #[arg(long, value_name = "BYTES", global = true)]
+    max_relayed_bytes_per_conn: Option<u64>,
     /// Path to the relay's own TLS certificate (PEM). Set together with --tls-key to make the relay
     /// terminate mTLS itself: every client MUST present a certificate, and a `Register`'s `peer_id`
     /// must match the one derived from it (proof-of-possession, SPEC.md §3.2/§8). Unset (default):
@@ -159,6 +181,24 @@ fn apply_overrides(mut config: RelayServerConfig, cli: &Cli) -> RelayServerConfi
     }
     if let Some(s) = cli.liveness_deadline_secs {
         config.liveness_deadline = Duration::from_secs(s);
+    }
+    if let Some(n) = cli.max_connections_per_ip {
+        config.max_connections_per_ip = n;
+    }
+    if let Some(n) = cli.registrations_per_ip_per_sec {
+        config.registrations_per_ip_per_sec = n;
+    }
+    if let Some(n) = cli.max_registrations_per_ip {
+        config.max_registrations_per_ip = n;
+    }
+    if let Some(n) = cli.messages_per_conn_per_sec {
+        config.messages_per_conn_per_sec = n;
+    }
+    if let Some(n) = cli.bytes_per_conn_per_sec {
+        config.bytes_per_conn_per_sec = n;
+    }
+    if let Some(n) = cli.max_relayed_bytes_per_conn {
+        config.max_relayed_bytes_per_conn = n;
     }
     if let Some(p) = cli.tls_cert.clone() {
         config.tls_cert_path = Some(p);
@@ -398,6 +438,18 @@ mod tests {
             "15",
             "--liveness-deadline-secs",
             "45",
+            "--max-connections-per-ip",
+            "8",
+            "--registrations-per-ip-per-sec",
+            "3",
+            "--max-registrations-per-ip",
+            "16",
+            "--messages-per-conn-per-sec",
+            "64",
+            "--bytes-per-conn-per-sec",
+            "2048",
+            "--max-relayed-bytes-per-conn",
+            "4096",
         ]);
         let out = apply_overrides(base, &cli);
         assert_eq!(out.listen, "127.0.0.1:8000".parse().unwrap());
@@ -413,6 +465,36 @@ mod tests {
         assert_eq!(out.register_timeout, Duration::from_secs(3));
         assert_eq!(out.health_check_interval, Duration::from_secs(15));
         assert_eq!(out.liveness_deadline, Duration::from_secs(45));
+        assert_eq!(out.max_connections_per_ip, 8);
+        assert_eq!(out.registrations_per_ip_per_sec, 3);
+        assert_eq!(out.max_registrations_per_ip, 16);
+        assert_eq!(out.messages_per_conn_per_sec, 64);
+        assert_eq!(out.bytes_per_conn_per_sec, 2048);
+        assert_eq!(out.max_relayed_bytes_per_conn, 4096);
+    }
+
+    /// #1386: the abuse-limit flags are unset by default → the base config's values are preserved
+    /// (each is `Option::None` unless the operator passes the flag).
+    #[test]
+    fn apply_overrides_leaves_abuse_limits_alone_when_no_flags() {
+        let base = RelayServerConfig::default();
+        let cli = parse(&["serve"]);
+        let out = apply_overrides(base.clone(), &cli);
+        assert_eq!(out.max_connections_per_ip, base.max_connections_per_ip);
+        assert_eq!(
+            out.registrations_per_ip_per_sec,
+            base.registrations_per_ip_per_sec
+        );
+        assert_eq!(out.max_registrations_per_ip, base.max_registrations_per_ip);
+        assert_eq!(
+            out.messages_per_conn_per_sec,
+            base.messages_per_conn_per_sec
+        );
+        assert_eq!(out.bytes_per_conn_per_sec, base.bytes_per_conn_per_sec);
+        assert_eq!(
+            out.max_relayed_bytes_per_conn,
+            base.max_relayed_bytes_per_conn
+        );
     }
 
     #[test]
