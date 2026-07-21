@@ -47,9 +47,9 @@ const MASCOT_PNG: &[u8] = include_bytes!("../assets/minion-dighub.png");
 /// `assets/map/PROVENANCE.md`. Served immutably at `GET /map/globe.gl.min.js`.
 const GLOBE_GL_JS: &[u8] = include_bytes!("../assets/map/globe.gl.min.js");
 
-/// A modest dark equirectangular earth texture (matches the DIG dark theme) the globe page paints
-/// onto the sphere. Provenance + license in `assets/map/PROVENANCE.md`. Served immutably at
-/// `GET /map/earth.jpg`.
+/// The daytime NASA Blue Marble equirectangular earth texture (public domain) the globe page paints
+/// onto the sphere; peer markers are drawn near-opaque so they stay legible over the bright surface.
+/// Provenance + license in `assets/map/PROVENANCE.md`. Served immutably at `GET /map/earth.jpg`.
 const EARTH_JPG: &[u8] = include_bytes!("../assets/map/earth.jpg");
 
 /// A point-in-time read of the relay's cheap atomic counters — decoupled from [`RelayState`] so the
@@ -680,10 +680,11 @@ const MAP_HTML: &str = r##"<!DOCTYPE html>
 
   function colorFor(count, maxCount) {
     const t = maxCount > 1 ? Math.log2(count) / Math.log2(maxCount) : 0;
-    // Magenta (few peers) -> teal (many peers), the DIG brand ramp.
+    // Magenta (few peers) -> teal (many peers), the DIG brand ramp. Near-opaque (0.95) so the
+    // markers stay legible over the bright daytime Blue Marble texture rather than washing out.
     const from = [177, 74, 237], to = [45, 212, 191];
     const mix = from.map((c, i) => Math.round(c + (to[i] - c) * t));
-    return `rgba(${mix[0]}, ${mix[1]}, ${mix[2]}, 0.85)`;
+    return `rgba(${mix[0]}, ${mix[1]}, ${mix[2]}, 0.95)`;
   }
 
   const world = Globe()(globeEl)
@@ -693,7 +694,7 @@ const MAP_HTML: &str = r##"<!DOCTYPE html>
     .atmosphereColor("#8ab4ff")
     .atmosphereAltitude(0.2)
     .pointAltitude((d) => altitudeFor(d.count))
-    .pointRadius(0.35)
+    .pointRadius(0.4)
     .pointColor((d) => d._color)
     .pointLabel((d) => `${d.count} peer${d.count === 1 ? "" : "s"} in this ~5&deg; region`)
     .ringsData([])

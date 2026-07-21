@@ -64,3 +64,17 @@ disconnect the socket.
 |---|---|---|---|
 | `--tls-cert` | `DIG_RELAY_TLS_CERT_PATH` | unset | Relay's own cert (PEM); set with `--tls-key` to terminate mTLS. |
 | `--tls-key` | `DIG_RELAY_TLS_KEY_PATH` | unset | Relay's own key (PEM), paired with `--tls-cert`. |
+
+## Geo-IP database (the `/map` globe)
+
+Direct env read (no CLI flag) — the `/map` globe geo-locates registered peers server-side from an
+offline `.mmdb` database (see `SPEC.md` §6.2 for the privacy contract).
+
+| Env | Default | Meaning |
+|---|---|---|
+| `DIG_RELAY_GEOIP_DB` | `/opt/dig-relay/geoip/dbip-city-lite.mmdb` | Path to the offline MaxMind-format geo-IP `.mmdb`. |
+
+The published relay image bakes in the free **DB-IP City Lite** database at the default path, so no
+setup is needed to run it — `relay.dig.net/map` locates peers out of the box. If the file is absent
+(e.g. a hand-built image that skipped the `Dockerfile` `geoip` stage), the globe still serves and every
+peer shows as "unlocated". To refresh the database, bump `DBIP_MONTH` in the `Dockerfile` and rebuild.

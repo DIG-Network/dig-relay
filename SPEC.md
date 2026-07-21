@@ -388,9 +388,12 @@ coordinate is ever computed into or serialized by this endpoint:
 
 - Geo-location happens SERVER-SIDE ONLY, in-memory, from a bundled OFFLINE MaxMind-format database
   (`DIG_RELAY_GEOIP_DB`, default `/opt/dig-relay/geoip/dbip-city-lite.mmdb`) — never a third-party geo
-  API call per request, which would itself leak the peer's IP to whoever runs that service. A resolved
-  answer (hit or miss) is cached permanently in-process per IP, so a given peer is looked up in the
-  database AT MOST ONCE for the life of the process.
+  API call per request, which would itself leak the peer's IP to whoever runs that service. The relay
+  image ships the free, CC-BY **DB-IP City Lite** database baked in at that default path (coarse
+  city-level accuracy, which is all the ~5° grid needs); an operator may point `DIG_RELAY_GEOIP_DB` at
+  a different `.mmdb`. The database is opened once; each lookup is a direct in-memory read performed
+  fresh, with NO per-IP cache — an attacker cycling source IPs (trivially cheap across an IPv6 /64)
+  therefore cannot grow unbounded process memory.
 - Every located point is snapped to a deliberately COARSE global grid (`cell_deg`, ~5°, roughly 300
   miles at the equator) BEFORE it is published; only the grid cell's CENTROID + a peer COUNT for that
   cell is ever exposed. A published coordinate means "somewhere in this ~300-mile cell," never a

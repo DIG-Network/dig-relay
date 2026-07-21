@@ -78,7 +78,7 @@ pub struct MapSnapshot {
 /// .floor() + 0.5) * cell_deg`. Symmetric across zero (negative latitudes/longitudes and the
 /// antimeridian snap the same way `floor` always does), and a pole (`±90`) snaps into its own
 /// boundary cell like any other value.
-fn snap(coord: f64, cell_deg: f64) -> f64 {
+pub(crate) fn snap(coord: f64, cell_deg: f64) -> f64 {
     ((coord / cell_deg).floor() + 0.5) * cell_deg
 }
 

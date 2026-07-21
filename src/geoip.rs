@@ -61,7 +61,17 @@ pub fn locate(ip: IpAddr) -> Option<(f64, f64)> {
     if !is_public(&ip) {
         return None;
     }
-    let reader = db().as_ref()?;
+    lookup_ip(db().as_ref()?, ip)
+}
+
+/// Look up an already-canonical, already-public `ip` in an explicit `reader`, returning the
+/// database's raw `(lat, lon)`. Split out from [`locate`] so the database-PRESENT resolution path
+/// is unit-testable against a small fixture database — the process-lifetime [`db`] singleton is
+/// fixed by its first caller and cannot be swapped per-test, so the DB-present branch could not
+/// otherwise be exercised in CI (where no `.mmdb` is provisioned). The returned coordinate is the
+/// database's raw point; the deliberately COARSE ~5° grid snapping the privacy contract depends on
+/// happens in [`crate::map::build_map_snapshot`] before anything is published — never here.
+fn lookup_ip(reader: &Reader<Vec<u8>>, ip: IpAddr) -> Option<(f64, f64)> {
     let city: geoip2::City = reader.lookup(ip).ok()?.decode().ok().flatten()?;
     Some((city.location.latitude?, city.location.longitude?))
 }
@@ -175,6 +185,44 @@ mod tests {
         // process-lifetime state (regression guard for the removed unbounded per-IP cache).
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 199));
         assert_eq!(locate(ip), locate(ip));
+    }
+
+    /// A small MaxMind-format database vendored under `tests/fixtures/geoip/` (see its
+    /// `PROVENANCE.md`), used ONLY to exercise the database-PRESENT resolution path. The shipped
+    /// image bundles the full DB-IP City Lite database at [`DEFAULT_GEOIP_DB_PATH`] instead.
+    fn fixture_reader() -> Reader<Vec<u8>> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/geoip/GeoIP2-City-Test.mmdb"
+        );
+        Reader::open_readfile(path).expect("vendored geoip test fixture must be readable")
+    }
+
+    #[test]
+    fn db_present_path_resolves_a_known_ip_into_its_expected_coarse_cell() {
+        // Regression guard for the exact defect #1474 fixed: with no database provisioned, the
+        // resolution path returned None for every peer, so all peers showed as "unlocated". With a
+        // database PRESENT, a known public IP must resolve. 81.2.69.142 is London, GB in the
+        // fixture; its raw coordinate must snap (via the SAME `map::snap` the /map privacy tests
+        // use) to the coarse 5° cell centred at (52.5, -2.5) — never a finer point.
+        let reader = fixture_reader();
+        let london = IpAddr::V4(Ipv4Addr::new(81, 2, 69, 142));
+        let (lat, lon) =
+            lookup_ip(&reader, london).expect("a known IP resolves when a DB is present");
+
+        let deg = crate::map::MAP_CELL_DEG;
+        assert_eq!(
+            (crate::map::snap(lat, deg), crate::map::snap(lon, deg)),
+            (52.5, -2.5),
+            "London resolves and snaps to its coarse 5° cell"
+        );
+    }
+
+    #[test]
+    fn db_present_path_still_rejects_a_private_ip() {
+        // Even with a database present, `locate` short-circuits private/reserved IPs before any
+        // lookup, so a private range never resolves to a fabricated location.
+        assert_eq!(locate(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))), None);
     }
 
     #[test]
