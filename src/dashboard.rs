@@ -23,7 +23,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::geoip::LiveGeoResolver;
 use crate::http_serve::RequestHead;
+use crate::map::{build_map_snapshot, MapSnapshot, MAP_CELL_DEG};
 use crate::net::bind_tcp_dual_stack;
 use crate::server::RelayState;
 use crate::wire::RelayPeerInfo;
@@ -39,6 +41,16 @@ const PEER_ID_PREFIX_LEN: usize = 12;
 /// binary so the dashboard is fully self-contained — no CDN, no external asset fetch, works offline.
 /// Served immutably at `GET /mascot.png`.
 const MASCOT_PNG: &[u8] = include_bytes!("../assets/minion-dighub.png");
+
+/// The self-contained `globe.gl` UMD build (bundles three.js + three-globe + three-render-objects)
+/// that renders the `/map` globe entirely client-side with no CDN fetch. Provenance + license in
+/// `assets/map/PROVENANCE.md`. Served immutably at `GET /map/globe.gl.min.js`.
+const GLOBE_GL_JS: &[u8] = include_bytes!("../assets/map/globe.gl.min.js");
+
+/// A modest dark equirectangular earth texture (matches the DIG dark theme) the globe page paints
+/// onto the sphere. Provenance + license in `assets/map/PROVENANCE.md`. Served immutably at
+/// `GET /map/earth.jpg`.
+const EARTH_JPG: &[u8] = include_bytes!("../assets/map/earth.jpg");
 
 /// A point-in-time read of the relay's cheap atomic counters — decoupled from [`RelayState`] so the
 /// snapshot builder is pure and fully unit-testable without a live server.
@@ -228,6 +240,13 @@ fn counters_of(state: &RelayState) -> Counters {
     }
 }
 
+/// A cheap placeholder [`MapSnapshot`] for routes that don't serve `/map`/`/map.json` — `route`
+/// takes one unconditionally so its signature stays simple, but building the real snapshot needs a
+/// registry lock + geo resolution this placeholder skips entirely.
+fn empty_map_snapshot() -> MapSnapshot {
+    build_map_snapshot(&[], &LiveGeoResolver, MAP_CELL_DEG, 0)
+}
+
 /// Current Unix-epoch time in seconds (saturating) — the wall clock for `connected_secs`.
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -249,9 +268,15 @@ pub struct DashboardResponse {
 }
 
 /// Route a dashboard request path to its response: `/` → the HTML overview, `/stats.json` → the
-/// machine-readable snapshot, `/mascot.png` → the embedded mascot, anything else → 404. `snapshot` is
-/// the already-built stats (the caller reads the live registry so this stays free of I/O and locks).
-pub fn route(path: &str, snapshot: &StatsSnapshot) -> DashboardResponse {
+/// machine-readable snapshot, `/mascot.png` → the embedded mascot, `/map` → the peer globe, `/map.json`
+/// → its machine-readable snapshot, `/map/*` → the globe's vendored assets, anything else → 404.
+/// `snapshot`/`map_snapshot` are already-built (the caller reads the live registry so this stays
+/// free of I/O and locks).
+pub fn route(
+    path: &str,
+    snapshot: &StatsSnapshot,
+    map_snapshot: &MapSnapshot,
+) -> DashboardResponse {
     match path {
         "/" => DashboardResponse {
             status: 200,
@@ -273,6 +298,34 @@ pub fn route(path: &str, snapshot: &StatsSnapshot) -> DashboardResponse {
             content_type: "image/png",
             cache_control: Some("public, max-age=31536000, immutable"),
             body: MASCOT_PNG.to_vec(),
+        },
+        "/map" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "text/html; charset=utf-8",
+            cache_control: None,
+            body: MAP_HTML.as_bytes().to_vec(),
+        },
+        "/map.json" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "application/json",
+            cache_control: Some("no-store"),
+            body: serde_json::to_vec(map_snapshot).unwrap_or_else(|_| b"{}".to_vec()),
+        },
+        "/map/globe.gl.min.js" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "application/javascript; charset=utf-8",
+            cache_control: Some("public, max-age=31536000, immutable"),
+            body: GLOBE_GL_JS.to_vec(),
+        },
+        "/map/earth.jpg" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "image/jpeg",
+            cache_control: Some("public, max-age=31536000, immutable"),
+            body: EARTH_JPG.to_vec(),
         },
         _ => DashboardResponse {
             status: 404,
@@ -297,6 +350,15 @@ pub async fn live_snapshot(state: &RelayState, full: bool) -> StatsSnapshot {
     )
 }
 
+/// Build the live `/map` snapshot from the relay's registry, resolving each peer's coarse
+/// grid-cell location through the real (bundled, offline) [`LiveGeoResolver`] — see `src/map.rs`
+/// and `src/geoip.rs` for the privacy contract this upholds. Shared by the `/map.json` route and
+/// the globe page's data.
+pub async fn live_map_snapshot(state: &RelayState) -> MapSnapshot {
+    let peers = state.registry.lock().await.peers(None);
+    build_map_snapshot(&peers, &LiveGeoResolver, MAP_CELL_DEG, now_secs())
+}
+
 /// Serve ONE dashboard HTTP request over an already-accepted (TLS-terminated-upstream) stream — the
 /// non-WebSocket branch of the relay's `:443` listener. `head` is the request the wire accept loop
 /// already peeked; this reads the live stats, routes the path, and writes the response.
@@ -308,8 +370,15 @@ pub async fn serve_http<S>(
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
+    // The map snapshot needs its own registry read + geo resolution, so only build it for the two
+    // routes that actually use it — every other route (`/`, `/stats.json`, `/mascot.png`, the
+    // vendored globe assets) skips that work entirely.
     let snapshot = live_snapshot(state, wants_full(&head.target)).await;
-    let resp = route(head.path(), &snapshot);
+    let map_snapshot = match head.path() {
+        "/map" | "/map.json" => live_map_snapshot(state).await,
+        _ => empty_map_snapshot(),
+    };
+    let resp = route(head.path(), &snapshot, &map_snapshot);
     let mut headers: Vec<(&str, &str)> = vec![("Content-Type", resp.content_type)];
     if let Some(cc) = resp.cache_control {
         headers.push(("Cache-Control", cc));
@@ -512,6 +581,178 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 </html>
 "#;
 
+/// The `/map` globe page. Fully static (the live data arrives from `/map.json`, the WebGL runtime
+/// from the vendored `/map/globe.gl.min.js` + `/map/earth.jpg` — no CDN, matching the dashboard's
+/// offline ethos). DIG dark theme, reusing `/mascot.png` as the favicon; the four async states are
+/// handled in the fetch loop below.
+const MAP_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DIG Network Relay — live peer globe</title>
+<meta name="description" content="A live 3D globe of DIG Network relay peers, aggregated to a coarse ~5-degree grid for privacy — watch the worldwide network form.">
+<link rel="icon" type="image/png" href="/mascot.png">
+<style>
+  :root {
+    --bg: #0b0713; --panel: #171125; --border: #2c2140; --text: #ece7f7;
+    --muted: #a394bd; --accent: #b14aed; --accent2: #2dd4bf; --error: #f87171;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 500px at 80% -10%, rgba(177,74,237,.12), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; padding: 1.25rem 1.5rem; }
+  header .logo { width: 40px; height: 40px; flex: none; filter: drop-shadow(0 4px 14px rgba(177,74,237,.4)); }
+  .titles { display: flex; flex-direction: column; gap: .1rem; }
+  .brand { font-size: .75rem; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+  h1 { font-size: 1.25rem; margin: 0; letter-spacing: -.01em; }
+  h1 .dig { color: var(--accent); }
+  #summary { color: var(--muted); font-size: .85rem; margin-left: auto; text-align: right; }
+  main { position: relative; flex: 1; min-height: 0; }
+  #globe { position: absolute; inset: 0; }
+  .overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+  .state { padding: 1rem 1.5rem; border-radius: 12px; background: var(--panel); border: 1px solid var(--border); color: var(--muted); text-align: center; }
+  .state.error { color: var(--error); }
+  footer { padding: .85rem 1.5rem; color: var(--muted); font-size: .78rem; border-top: 1px solid var(--border); }
+  a { color: var(--accent); }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
+</style>
+</head>
+<body>
+  <header>
+    <img class="logo" src="/mascot.png" width="40" height="40" alt="The DIG Network robot mascot">
+    <div class="titles">
+      <span class="brand">DIG Network</span>
+      <h1><span class="dig">DIG</span> Relay — live peer globe</h1>
+    </div>
+    <div id="summary" aria-live="polite">Loading…</div>
+  </header>
+
+  <main>
+    <div id="globe" role="img" aria-hidden="true"></div>
+    <div class="overlay" id="overlay">
+      <div class="state" id="loading">Loading peer map…</div>
+    </div>
+  </main>
+
+  <!-- Visually-hidden but screen-reader/agent-accessible summary (§6.2/§6.6): the canvas itself
+       is decorative, this text carries the actual content. -->
+  <p class="sr-only" id="sr-summary" aria-live="polite"></p>
+
+  <footer>
+    Part of the <a href="https://dig.net">DIG Network</a> ·
+    <a href="https://hub.dig.net">DIGHub</a> ·
+    <a href="/map.json">map.json</a> ·
+    <a href="/">stats dashboard</a><br>
+    Locations are approximate by design: each point represents a coarse ~5&deg; grid cell
+    (roughly 300 miles across), never an individual peer's real position.
+    IP Geolocation by <a href="https://db-ip.com">DB-IP</a>.
+  </footer>
+
+<script src="/map/globe.gl.min.js"></script>
+<script>
+  const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const globeEl = document.getElementById("globe");
+  const overlay = document.getElementById("overlay");
+  const summary = document.getElementById("summary");
+  const srSummary = document.getElementById("sr-summary");
+
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  function setOverlay(html) {
+    overlay.style.display = html ? "flex" : "none";
+    overlay.innerHTML = html || "";
+  }
+
+  function altitudeFor(count) {
+    // log-scaled so a handful of extra peers in a busy cell doesn't dwarf every other column.
+    return 0.02 + Math.log2(count + 1) * 0.06;
+  }
+
+  function colorFor(count, maxCount) {
+    const t = maxCount > 1 ? Math.log2(count) / Math.log2(maxCount) : 0;
+    // Magenta (few peers) -> teal (many peers), the DIG brand ramp.
+    const from = [177, 74, 237], to = [45, 212, 191];
+    const mix = from.map((c, i) => Math.round(c + (to[i] - c) * t));
+    return `rgba(${mix[0]}, ${mix[1]}, ${mix[2]}, 0.85)`;
+  }
+
+  const world = Globe()(globeEl)
+    .globeImageUrl("/map/earth.jpg")
+    .backgroundColor("rgba(0,0,0,0)")
+    .showAtmosphere(true)
+    .atmosphereColor("#8ab4ff")
+    .atmosphereAltitude(0.2)
+    .pointAltitude((d) => altitudeFor(d.count))
+    .pointRadius(0.35)
+    .pointColor((d) => d._color)
+    .pointLabel((d) => `${d.count} peer${d.count === 1 ? "" : "s"} in this ~5&deg; region`)
+    .ringsData([])
+    .ringColor(() => (t) => `rgba(255, 61, 245, ${1 - t})`)
+    .ringMaxRadius(4)
+    .ringPropagationSpeed(2)
+    .ringRepeatPeriod(900);
+
+  world.pointOfView({ lat: 20, lng: 0, altitude: 2.2 }, 0);
+  if (!reduceMotion) {
+    world.controls().autoRotate = true;
+    world.controls().autoRotateSpeed = 0.4;
+  }
+
+  function resize() {
+    world.width(globeEl.clientWidth).height(globeEl.clientHeight);
+  }
+  new ResizeObserver(resize).observe(globeEl);
+  resize();
+
+  async function refresh() {
+    try {
+      const res = await fetch("/map.json", { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const d = await res.json();
+
+      const maxCount = d.cells.reduce((m, c) => Math.max(m, c.count), 1);
+      const points = d.cells.map((c) => ({
+        lat: c.lat,
+        lng: c.lon,
+        count: c.count,
+        _color: colorFor(c.count, maxCount),
+      }));
+      world.pointsData(points);
+      world.ringsData(points);
+
+      const regionWord = d.cells.length === 1 ? "region" : "regions";
+      const summaryText = d.located_peers > 0
+        ? `${d.total_peers} peer${d.total_peers === 1 ? "" : "s"} across ${d.cells.length} ${regionWord} worldwide`
+          + (d.unknown_peers ? ` (+${d.unknown_peers} unlocated)` : "")
+        : `No peers located yet` + (d.unknown_peers ? ` (${d.unknown_peers} unlocated)` : "");
+      summary.textContent = summaryText;
+      srSummary.textContent = summaryText;
+
+      setOverlay(d.located_peers > 0 ? "" :
+        '<div class="state">' + summaryText + '</div>');
+    } catch (e) {
+      setOverlay('<div class="state error">Could not load the peer map: ' + esc(e.message) + '</div>');
+      summary.textContent = "Error loading peer map";
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+"##;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,23 +950,96 @@ mod tests {
     #[test]
     fn route_serves_the_three_surfaces_and_404s_the_rest() {
         let snap = build_snapshot(vec![], Counters::default(), 0, 0, false);
-        let html = route("/", &snap);
+        let map_snap = empty_map_snapshot();
+        let html = route("/", &snap, &map_snap);
         assert_eq!(html.status, 200);
         assert_eq!(html.content_type, "text/html; charset=utf-8");
         assert!(html.body.starts_with(b"<!DOCTYPE html>"));
 
-        let json = route("/stats.json", &snap);
+        let json = route("/stats.json", &snap, &map_snap);
         assert_eq!(json.status, 200);
         assert_eq!(json.content_type, "application/json");
         assert!(json.body.starts_with(b"{"));
 
-        let png = route("/mascot.png", &snap);
+        let png = route("/mascot.png", &snap, &map_snap);
         assert_eq!(png.status, 200);
         assert_eq!(png.content_type, "image/png");
         assert_eq!(&png.body[..8], b"\x89PNG\r\n\x1a\n");
 
-        let missing = route("/nope", &snap);
+        let missing = route("/nope", &snap, &map_snap);
         assert_eq!(missing.status, 404);
+    }
+
+    #[test]
+    fn route_serves_the_globe_page_its_json_and_its_vendored_assets() {
+        let snap = build_snapshot(vec![], Counters::default(), 0, 0, false);
+        let map_snap = build_map_snapshot(&[], &LiveGeoResolver, MAP_CELL_DEG, 0);
+
+        let html = route("/map", &snap, &map_snap);
+        assert_eq!(html.status, 200);
+        assert_eq!(html.content_type, "text/html; charset=utf-8");
+        assert!(html.body.starts_with(b"<!DOCTYPE html>"));
+
+        let json = route("/map.json", &snap, &map_snap);
+        assert_eq!(json.status, 200);
+        assert_eq!(json.content_type, "application/json");
+        let expected = serde_json::to_vec(&map_snap).unwrap();
+        assert_eq!(json.body, expected);
+
+        let js = route("/map/globe.gl.min.js", &snap, &map_snap);
+        assert_eq!(js.status, 200);
+        assert_eq!(js.content_type, "application/javascript; charset=utf-8");
+        assert!(
+            !js.body.is_empty(),
+            "the vendored globe.gl bundle must be embedded"
+        );
+        assert_eq!(
+            js.cache_control,
+            Some("public, max-age=31536000, immutable"),
+            "vendored, versioned assets are cached immutably"
+        );
+
+        let jpg = route("/map/earth.jpg", &snap, &map_snap);
+        assert_eq!(jpg.status, 200);
+        assert_eq!(jpg.content_type, "image/jpeg");
+        assert_eq!(
+            &jpg.body[..3],
+            &[0xff, 0xd8, 0xff],
+            "must be a real JPEG (SOI marker)"
+        );
+    }
+
+    #[test]
+    fn embedded_globe_assets_are_non_empty_and_within_the_size_budget() {
+        // Total embedded /map asset weight stays bounded so the binary + `include_bytes!` compile
+        // don't grow unboundedly; see assets/map/PROVENANCE.md for the exact pinned sizes/versions.
+        assert!(!GLOBE_GL_JS.is_empty());
+        assert!(!EARTH_JPG.is_empty());
+        assert!(
+            GLOBE_GL_JS.len() + EARTH_JPG.len() < 4 * 1024 * 1024,
+            "vendored /map assets must stay well under a sane embedded-binary budget"
+        );
+    }
+
+    #[test]
+    fn map_html_handles_the_four_states_and_uses_map_json() {
+        assert!(MAP_HTML.contains("/map.json"));
+        assert!(MAP_HTML.contains("Loading peer map")); // loading
+        assert!(MAP_HTML.contains("Could not load the peer map")); // error
+        assert!(MAP_HTML.contains("No peers located yet")); // empty
+        assert!(MAP_HTML.contains("setInterval(refresh, 5000)")); // ~5s auto-refresh
+        assert!(
+            MAP_HTML.contains("prefers-reduced-motion"),
+            "auto-rotate respects reduced motion"
+        );
+        assert!(
+            MAP_HTML.contains("aria-hidden"),
+            "the decorative canvas is hidden from AT"
+        );
+        assert!(
+            MAP_HTML.contains("db-ip.com"),
+            "carries the required DB-IP attribution link"
+        );
     }
 
     #[test]

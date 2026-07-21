@@ -1,6 +1,6 @@
 [package]
 name = "dig-relay"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Relay — NAT-traversal rendezvous + circuit relay so DIG Nodes establish peer connections across NAT."
@@ -74,6 +74,11 @@ socket2 = "0.6"
 # canonicalization) with every other peer crate instead of hand-rolling `is_ipv6()`. Permissively
 # licensed (Apache-2.0 OR MIT), so a leaf dep in this GPL-2.0 crate is fine.
 dig-ip = "0.1"
+# Server-side-only geo-location for the `/map` globe (see `src/geoip.rs`): reads a bundled offline
+# MaxMind-format (.mmdb) database. Pure-Rust, permissively licensed (ISC), fine as a leaf dep in
+# this GPL-2.0 crate. Never used for a per-request third-party lookup — the DB is opened once,
+# in-process, so a peer's IP never leaves the relay.
+maxminddb = "0.27"
 
 [target.'cfg(windows)'.dependencies]
 # Windows Service Control Protocol dispatcher: a service-manager-registered service must itself

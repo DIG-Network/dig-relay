@@ -2,6 +2,32 @@
 
 Durable realizations from developing dig-relay. Context, not a change diary (CLAUDE.md §4.5).
 
+## `/map` — coarse-grid privacy contract + the globe-column technique (#1452)
+
+- **The grid cell IS the anonymity set, not a display convenience.** `/map.json` never carries a
+  per-peer coordinate — every located peer is snapped to a ~5° global grid cell (`map::MAP_CELL_DEG`)
+  and only the cell's CENTROID + a COUNT is published. This means the smallest thing a client can ever
+  learn about any one peer is "somewhere in a ~300-mile region, sharing it with N others" — there is no
+  way to sharpen that by querying more, because the server never computed anything sharper to leak.
+  Snapping happens with `floor(coord / cell_deg)`, not `round` or truncation, so negative
+  latitudes/longitudes and the antimeridian snap consistently (verified in `map::tests`).
+- **Colocated peers become a "column" for free.** The globe just reads `count` per cell and maps it to
+  `pointAltitude` (log-scaled) — the privacy aggregation and the "watch hotspots rise" visual are the
+  SAME data structure; no separate stacking logic needed.
+- **A permanent in-process cache, not a TTL cache.** `geoip::locate` caches every resolved IP (hit or
+  miss) for the life of the process (`geoip::CACHE`), because a peer's IP is realistically static across
+  the relay's lifetime and the offline mmdb lookup is the only non-free part of building `/map.json` on
+  its 5s refresh cadence. This is also a privacy reinforcement: a peer's IP is only ever handed to the
+  geo database once, never on a schedule.
+- **`maxminddb` 0.24's `Reader::lookup<T>` returns `Result<T, Error>`, not
+  `Result<Option<T>, Error>`** — an absent record is a plain `AddressNotFoundError`, so `.ok()` alone
+  (not `.ok()?.ok()??`) collapses "not found" into `None`. Easy to over-apply `?` here since so much of
+  the surrounding code chains `Option`.
+- **`r#"..."#` raw strings break the instant the content contains a literal `"#`** — a CSS hex color
+  written `"#8ab4ff"` inside an `r#"...HTML...`"#` Rust raw string prematurely closes it. Any HTML/CSS
+  template containing a quoted `#colorhex` needs one more hash (`r##"..."##`) than the dashboard's
+  existing `DASHBOARD_HTML` const, which happens not to quote a hex color anywhere.
+
 ## App-level abuse protection — keying + breach response (#1386)
 
 - **IPv6 is keyed on the /64 prefix, not the full /128.** A single IPv6 assignment is typically a /64

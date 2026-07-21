@@ -355,6 +355,52 @@ the dashboard does not publish the network's dialable topology. By default `peer
 short prefix; the query `?full=1` returns the un-truncated `peer_id`. No key material or payload is
 ever exposed (the relay is an untrusted forwarder and holds none).
 
+## 6.2 Peer globe (`/map`) — coarse, privacy-first geo visualization
+
+A second, PURELY VISUAL surface shares the same wire listener + routing as §6.1: `GET /map` renders a
+self-contained 3D globe (no CDN — the WebGL runtime + earth texture are embedded in the binary) showing
+where the relay's registered peers are, in AGGREGATE, worldwide. Accuracy is explicitly not a goal —
+the intent is "watch the network form," never a locator for any individual peer.
+
+- `GET /map` → the globe HTML page. Fetches `/map.json` on load and every ~5 s; the four async states
+  (loading / error / empty / success) are handled client-side.
+- `GET /map.json` → the same data machine-readable (stable snake_case, a pinnable `schema_version`).
+- `GET /map/globe.gl.min.js`, `GET /map/earth.jpg` → the vendored, immutably-cached WebGL runtime +
+  earth texture the page renders with (see `assets/map/PROVENANCE.md` for exact pinned versions +
+  licenses).
+
+`/map.json` body:
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": <u64>,
+  "cell_deg": 5.0,
+  "total_peers": <usize>,
+  "located_peers": <usize>,
+  "unknown_peers": <usize>,
+  "cells": [ { "lat": <f64>, "lon": <f64>, "count": <usize> } ]
+}
+```
+
+**Privacy (normative, load-bearing).** No raw peer IP, no `peer_id`, and no precise per-peer
+coordinate is ever computed into or serialized by this endpoint:
+
+- Geo-location happens SERVER-SIDE ONLY, in-memory, from a bundled OFFLINE MaxMind-format database
+  (`DIG_RELAY_GEOIP_DB`, default `/opt/dig-relay/geoip/dbip-city-lite.mmdb`) — never a third-party geo
+  API call per request, which would itself leak the peer's IP to whoever runs that service. A resolved
+  answer (hit or miss) is cached permanently in-process per IP, so a given peer is looked up in the
+  database AT MOST ONCE for the life of the process.
+- Every located point is snapped to a deliberately COARSE global grid (`cell_deg`, ~5°, roughly 300
+  miles at the equator) BEFORE it is published; only the grid cell's CENTROID + a peer COUNT for that
+  cell is ever exposed. A published coordinate means "somewhere in this ~300-mile cell," never a
+  peer's actual location. Co-located peers (same cell) are exactly the visual "column" the globe
+  renders — the coarse cell IS the stacking bucket.
+- A peer with no public/dialable address (relay-only reachability), or whose IP the database has no
+  answer for, contributes to `unknown_peers` — never a fabricated location.
+- The database file is optional: if absent/unreadable, every peer lands in `unknown_peers` and the
+  globe still renders (empty-state visualization, not an error).
+
 ## 7. Configuration
 
 `RelayServerConfig` (`src/config.rs`) is validated pure data:
