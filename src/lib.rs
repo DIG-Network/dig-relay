@@ -30,9 +30,11 @@
 pub mod config;
 pub mod dashboard;
 pub mod dial;
+pub mod geoip;
 pub mod health;
 pub mod http_serve;
 pub mod limits;
+pub mod map;
 pub mod net;
 pub mod pex;
 pub mod registry;
