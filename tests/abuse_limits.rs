@@ -246,3 +246,71 @@ async fn per_connection_message_flood_is_disconnected_but_a_calm_peer_persists()
     }
     assert!(got_pong, "the well-behaved peer is unaffected");
 }
+
+/// (d) #1396: a source that REPEATEDLY trips a per-IP cap (here, the registration rate) accrues
+/// strikes and, once past the ban threshold, is BANNED at accept — its subsequent connections are
+/// refused before the WebSocket upgrade — while a different source IP is untouched.
+#[tokio::test]
+async fn repeat_registration_abuse_earns_an_accept_time_ban() {
+    let relay_addr = start_relay(RelayServerConfig {
+        // Disable the per-IP CONNECTION cap so a plain connect never strikes on its own — only the
+        // registration-rate trips do — making the accept-time refusal below unambiguously the ban.
+        max_connections_per_ip: 0,
+        max_registrations_per_ip: 0,
+        registrations_per_ip_per_sec: 1, // tiny rate → a register burst trips it repeatedly
+        ban_threshold: 3,                // 3 rate-limit trips within the window → ban
+        ban_duration: Duration::from_secs(300),
+        ban_strike_window: Duration::from_secs(60),
+        ..Default::default()
+    })
+    .await;
+
+    // Hammer registrations from one source IP (a fresh connection each — register is once per
+    // connection). Each rate-limited register is a strike; after `ban_threshold` strikes the source
+    // is banned and further CONNECTIONS are refused at accept: the relay closes the socket before the
+    // WS upgrade, so the client handshake (`client_async`) fails. Detect that transition.
+    let mut banned_at_accept = false;
+    for i in 0..20 {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        // The TCP connect succeeds (the relay accepts then closes a banned socket); the ban surfaces
+        // as a failed WS handshake.
+        let stream = match socket.connect(relay_addr).await {
+            Ok(s) => s,
+            Err(_) => {
+                banned_at_accept = true;
+                break;
+            }
+        };
+        match tokio_tungstenite::client_async(
+            format!("ws://{relay_addr}"),
+            MaybeTlsStream::Plain(stream),
+        )
+        .await
+        {
+            Ok((mut ws, _)) => {
+                register(&mut ws, &format!("abuser-{i}")).await;
+                let _ = next_relay_msg(&mut ws).await; // RegisterAck (success or the rate-limit refusal)
+            }
+            Err(_) => {
+                banned_at_accept = true; // refused at accept → the source is banned
+                break;
+            }
+        }
+    }
+    assert!(
+        banned_at_accept,
+        "sustained registration abuse from one IP earns an accept-time ban (#1396)"
+    );
+
+    // A DIFFERENT source IP is unaffected by the ban — the ban is keyed per source, not global.
+    let mut other = connect_from("127.0.0.2", relay_addr).await;
+    register(&mut other, "innocent").await;
+    assert!(
+        matches!(
+            next_relay_msg(&mut other).await,
+            RelayMessage::RegisterAck { success: true, .. }
+        ),
+        "a different source IP is not caught by the ban"
+    );
+}

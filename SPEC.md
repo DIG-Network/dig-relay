@@ -219,6 +219,27 @@ The registration checks run in order **rate → concurrent-cap →** the existin
 anti-hijack checks (§3.2), so a per-source throttle is reported (code 7) distinctly from the global
 capacity cap (code 4).
 
+**Ephemeral ban list — repeat-offender accept-time ban (normative, #1396).** The per-request limits
+above refuse a single offending request; a source that keeps abusing them is additionally BANNED for
+a short TTL so it is refused at accept without re-evaluating it on every reconnect. It layers on the
+same `limits::ip_key` (IPv6 /64) keying, is in-memory only (a restart clears all bans), and is
+LRU-bounded like the rate-bucket maps.
+
+- **Strikes.** A **strike** is recorded whenever a source TRIPS one of the per-request limits above:
+  the per-IP connection cap, the per-IP registration rate, the per-IP concurrent-registration cap, or
+  the per-connection message/byte/cumulative flood limit. Strikes accumulate within a rolling
+  `ban_strike_window` (default 60 s); strikes older than one window reset, so only strikes CLUSTERED in
+  time count.
+- **Ban.** When a source's strikes reach `ban_threshold` (default 20) within the window it is banned
+  for `ban_duration` (default 300 s). While banned, EVERY new connection from that source IP key is
+  refused at accept — the socket is dropped before the WebSocket handshake (no wire channel exists yet
+  to send a `RATE_LIMITED` frame on; the per-request refusals above carry code 7). The ban lapses
+  automatically at its TTL (a lookup past `banned_until` removes the entry).
+- **`ban_threshold = 0` disables the ban list entirely** (the per-request limits still apply on every
+  reconnect). The threshold is deliberately HIGH and the TTL short so a single misbehaving host in a
+  shared /64 (the ban key) cannot ban the whole site on one stray cap-trip — only sustained, clustered
+  abuse earns a ban.
+
 ### 3.1 Two NAT-traversal tiers
 
 1. **Hole-punch signalling (preferred).** RLY-005 discovery + RLY-007 coordination only. The relay
@@ -434,6 +455,9 @@ coordinate is ever computed into or serialized by this endpoint:
 | `messages_per_conn_per_sec` | 256 | `0` disables the per-connection message-rate limit (§3.0) |
 | `bytes_per_conn_per_sec` | 1048576 | `0` disables the per-connection byte-rate limit (§3.0) |
 | `max_relayed_bytes_per_conn` | 1073741824 | `0` disables the per-connection cumulative-byte cap (§3.0) |
+| `ban_threshold` | 20 | Strikes within `ban_strike_window` before an accept-time ban; `0` disables the ban list (§3.0) |
+| `ban_duration` | 300 s | How long a banned source is refused at accept; MUST be > 0 when `ban_threshold` > 0 (§3.0) |
+| `ban_strike_window` | 60 s | Rolling window strikes accumulate over; MUST be > 0 when `ban_threshold` > 0 (§3.0) |
 | `tls_cert_path` | `None` | Optional; MUST be set together with `tls_key_path` (§3.2/§8) |
 | `tls_key_path` | `None` | Optional; MUST be set together with `tls_cert_path` (§3.2/§8) |
 
@@ -441,11 +465,13 @@ coordinate is ever computed into or serialized by this endpoint:
 a zero `max_message_bytes`, a zero `register_timeout`, a zero `health_check_interval` or
 `liveness_deadline`, a `liveness_deadline` shorter than `health_check_interval`, a `liveness_deadline`
 not strictly shorter than `idle_timeout`, a non-zero `max_connections_per_ip` greater than
-`max_connections`, and exactly one of `tls_cert_path`/`tls_key_path` being set, with a stable error
+`max_connections`, a zero `ban_duration` or `ban_strike_window` while `ban_threshold` is non-zero, and
+exactly one of `tls_cert_path`/`tls_key_path` being set, with a stable error
 string. Config may be built from CLI flags (`main.rs`, `clap` —
 `--tls-cert`/`--tls-key`/`--health-check-interval-secs`/`--liveness-deadline-secs`/
 `--max-connections-per-ip`/`--registrations-per-ip-per-sec`/`--max-registrations-per-ip`/
-`--messages-per-conn-per-sec`/`--bytes-per-conn-per-sec`/`--max-relayed-bytes-per-conn` alongside the
+`--messages-per-conn-per-sec`/`--bytes-per-conn-per-sec`/`--max-relayed-bytes-per-conn`/
+`--ban-threshold`/`--ban-duration-secs`/`--ban-strike-window-secs` alongside the
 others) or environment variables consumed by the service installer (`DIG_RELAY_LISTEN`,
 `DIG_RELAY_HEALTH_LISTEN`, `DIG_RELAY_DASHBOARD_LISTEN`, `DIG_RELAY_STUN_LISTEN`,
 `DIG_RELAY_MAX_CONNECTIONS`, `DIG_RELAY_STUN_PER_IP_RPS`, `DIG_RELAY_STUN_GLOBAL_RPS`,
@@ -454,7 +480,8 @@ others) or environment variables consumed by the service installer (`DIG_RELAY_L
 `DIG_RELAY_LIVENESS_DEADLINE_SECS`, `DIG_RELAY_MAX_CONNECTIONS_PER_IP`,
 `DIG_RELAY_REGISTRATIONS_PER_IP_PER_SEC`, `DIG_RELAY_MAX_REGISTRATIONS_PER_IP`,
 `DIG_RELAY_MESSAGES_PER_CONN_PER_SEC`, `DIG_RELAY_BYTES_PER_CONN_PER_SEC`,
-`DIG_RELAY_MAX_RELAYED_BYTES_PER_CONN`, `DIG_RELAY_TLS_CERT_PATH`, `DIG_RELAY_TLS_KEY_PATH` — see
+`DIG_RELAY_MAX_RELAYED_BYTES_PER_CONN`, `DIG_RELAY_BAN_THRESHOLD`, `DIG_RELAY_BAN_DURATION_SECS`,
+`DIG_RELAY_BAN_STRIKE_WINDOW_SECS`, `DIG_RELAY_TLS_CERT_PATH`, `DIG_RELAY_TLS_KEY_PATH` — see
 `src/service.rs::config_from_env`), so an installed OS service serves identically to a manually-run
 `dig-relay serve` with the same flags.
 
@@ -475,6 +502,14 @@ than leaving them to poison peer discovery until the (much longer) idle timeout 
   the dig-gossip relay CLIENT does not answer relay-initiated `Ping`s, so an expect-a-pong liveness
   check would prune every live peer. The node's own RLY-006 keepalive ping (roughly every 30 s) is
   what keeps a genuinely live, quiet connection's activity fresh.
+- **The liveness clock is MONOTONIC (`std::time::Instant`), not wall-clock (#1395).** Both the
+  `last_activity` stamp and the sweep's "now" read the same monotonic elapsed-since-start clock, so a
+  sweep decision is the difference of two monotonic readings and is IMMUNE to host wall-clock
+  adjustments (an NTP step, a manual clock set, a DST change). A wall-clock basis could, on a forward
+  jump, make every registration look stale at once (mass false-prune of live peers) or, on a backward
+  jump, freeze the deadline and keep dead records — neither can happen. This is DISTINCT from the wire
+  `RelayPeerInfo.last_seen`/`connected_at`, which remain real Unix timestamps other peers interpret as
+  such (`src/server.rs::liveness_now_secs`).
 - **A pruned peer is evicted from BOTH introductions and PEX**, exactly as a graceful `Unregister`/
   disconnect is (§4): same-network peers receive `PeerDisconnected`, and the PEX introducer subsystem
   drops it from the advertise set (`PexRelay::on_unregister`) — a dead/stale peer stops being handed

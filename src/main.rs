@@ -104,6 +104,19 @@ struct Cli {
     /// 1073741824; 0 disables; #1386).
     #[arg(long, value_name = "BYTES", global = true)]
     max_relayed_bytes_per_conn: Option<u64>,
+    /// Abuse STRIKES a source may accrue within --ban-strike-window-secs before it is temporarily
+    /// banned at accept (default 20; 0 disables the ban list; #1396). A strike is recorded whenever a
+    /// source trips one of the per-IP caps above.
+    #[arg(long, value_name = "N", global = true)]
+    ban_threshold: Option<u32>,
+    /// How long (seconds) a banned source is refused at accept before the ban lapses (default 300;
+    /// #1396).
+    #[arg(long, value_name = "SECS", global = true)]
+    ban_duration_secs: Option<u64>,
+    /// Rolling window (seconds) over which strikes accumulate toward --ban-threshold (default 60;
+    /// #1396).
+    #[arg(long, value_name = "SECS", global = true)]
+    ban_strike_window_secs: Option<u64>,
     /// Path to the relay's own TLS certificate (PEM). Set together with --tls-key to make the relay
     /// terminate mTLS itself: every client MUST present a certificate, and a `Register`'s `peer_id`
     /// must match the one derived from it (proof-of-possession, SPEC.md §3.2/§8). Unset (default):
@@ -200,6 +213,15 @@ fn apply_overrides(mut config: RelayServerConfig, cli: &Cli) -> RelayServerConfi
     }
     if let Some(n) = cli.max_relayed_bytes_per_conn {
         config.max_relayed_bytes_per_conn = n;
+    }
+    if let Some(n) = cli.ban_threshold {
+        config.ban_threshold = n;
+    }
+    if let Some(s) = cli.ban_duration_secs {
+        config.ban_duration = Duration::from_secs(s);
+    }
+    if let Some(s) = cli.ban_strike_window_secs {
+        config.ban_strike_window = Duration::from_secs(s);
     }
     if let Some(p) = cli.tls_cert.clone() {
         config.tls_cert_path = Some(p);
@@ -451,6 +473,12 @@ mod tests {
             "2048",
             "--max-relayed-bytes-per-conn",
             "4096",
+            "--ban-threshold",
+            "9",
+            "--ban-duration-secs",
+            "120",
+            "--ban-strike-window-secs",
+            "30",
         ]);
         let out = apply_overrides(base, &cli);
         assert_eq!(out.listen, "127.0.0.1:8000".parse().unwrap());
@@ -472,6 +500,9 @@ mod tests {
         assert_eq!(out.messages_per_conn_per_sec, 64);
         assert_eq!(out.bytes_per_conn_per_sec, 2048);
         assert_eq!(out.max_relayed_bytes_per_conn, 4096);
+        assert_eq!(out.ban_threshold, 9);
+        assert_eq!(out.ban_duration, Duration::from_secs(120));
+        assert_eq!(out.ban_strike_window, Duration::from_secs(30));
     }
 
     /// #1386: the abuse-limit flags are unset by default → the base config's values are preserved
@@ -496,6 +527,9 @@ mod tests {
             out.max_relayed_bytes_per_conn,
             base.max_relayed_bytes_per_conn
         );
+        assert_eq!(out.ban_threshold, base.ban_threshold);
+        assert_eq!(out.ban_duration, base.ban_duration);
+        assert_eq!(out.ban_strike_window, base.ban_strike_window);
     }
 
     #[test]

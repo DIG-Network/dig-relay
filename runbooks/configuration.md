@@ -20,7 +20,7 @@ dig-relay status                      # probe /health (exit 1 if not serving)
 |---|---|---|---|
 | `--listen` | `DIG_RELAY_LISTEN` | `[::]:9450` | Relay WebSocket listener (dual-stack). |
 | `--health-listen` | `DIG_RELAY_HEALTH_LISTEN` | `[::]:9451` | HTTP `/health` for the load balancer. |
-| `--dashboard-listen` | `DIG_RELAY_DASHBOARD_LISTEN` | `[::]:80` | Plain-HTTP → HTTPS redirect listener. |
+| `--dashboard-listen` | `DIG_RELAY_DASHBOARD_LISTEN` | `[::]:8080` | Plain-HTTP → HTTPS redirect listener. Unprivileged port so the non-root service user can bind it; front it at public `:80` in the orchestrator (the `relay.dig.net` NLB maps `:80` → container `:8080`). Binding `:80` directly needs root / `CAP_NET_BIND_SERVICE`. |
 | `--stun-listen` | `DIG_RELAY_STUN_LISTEN` | `[::]:3478` | STUN (RFC 5389) UDP listener. |
 | `--max-connections` | `DIG_RELAY_MAX_CONNECTIONS` | 4096 | Global concurrent-connection cap. |
 | `--idle-timeout-secs` | — | 120 | Reap a silent registered connection after this. |
@@ -57,6 +57,21 @@ disconnect the socket.
 | `--messages-per-conn-per-sec` | `DIG_RELAY_MESSAGES_PER_CONN_PER_SEC` | 256 | Inbound frames/sec/connection before disconnect. |
 | `--bytes-per-conn-per-sec` | `DIG_RELAY_BYTES_PER_CONN_PER_SEC` | 1048576 | Inbound bytes/sec/connection before disconnect. |
 | `--max-relayed-bytes-per-conn` | `DIG_RELAY_MAX_RELAYED_BYTES_PER_CONN` | 1073741824 | Cumulative inbound bytes/connection before disconnect. |
+
+## Ephemeral ban list (#1396)
+
+Repeat-offender accept-time ban (`SPEC.md` §3.0). A **strike** is recorded each time a source trips one
+of the per-request limits above; once a source accrues `ban_threshold` strikes within
+`ban_strike_window`, it is refused at accept (socket dropped before the WebSocket handshake) for
+`ban_duration`. Keyed by the same `limits::ip_key` (IPv6 /64), in-memory (a restart clears all bans),
+LRU-bounded. The high default threshold + short TTL keep one host in a shared /64 from banning the whole
+site on a stray cap-trip. Set `--ban-threshold 0` to disable the ban list (the per-request limits stay).
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--ban-threshold` | `DIG_RELAY_BAN_THRESHOLD` | 20 | Strikes within the window before an accept-time ban (`0` disables the ban list). |
+| `--ban-duration-secs` | `DIG_RELAY_BAN_DURATION_SECS` | 300 | How long a banned source is refused at accept. |
+| `--ban-strike-window-secs` | `DIG_RELAY_BAN_STRIKE_WINDOW_SECS` | 60 | Rolling window over which strikes accumulate toward the threshold. |
 
 ## mTLS (optional, §3.2/§8)
 

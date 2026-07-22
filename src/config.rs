@@ -142,6 +142,29 @@ pub const DEFAULT_BYTES_PER_CONN_PER_SEC: u32 = 1_048_576;
 /// 1 GiB is far above any legitimate relay-fallback session.
 pub const DEFAULT_MAX_RELAYED_BYTES_PER_CONN: u64 = 1_073_741_824;
 
+/// Default ban THRESHOLD (#1396): the number of abuse STRIKES a source may accrue within
+/// [`ban_strike_window`](RelayServerConfig::ban_strike_window) before it is temporarily banned at
+/// accept. A strike is recorded every time a source TRIPS one of the #1386 per-IP caps (per-IP
+/// connection cap, registration rate, concurrent-registration cap, or the per-connection
+/// message/byte flood limit) — i.e. abuse the #1386 limits ALREADY refused. The threshold is
+/// deliberately HIGH so a single misbehaving host in a shared IPv6 /64 (the ban key, like the other
+/// per-IP limits) cannot ban the whole site on one stray cap-trip: it takes sustained,
+/// repeated abuse within the window to earn a ban. `0` disables the ban list entirely (the #1386
+/// per-request caps still apply on every reconnect).
+pub const DEFAULT_BAN_THRESHOLD: u32 = 20;
+
+/// Default ban DURATION / TTL (seconds, #1396): how long a banned source is refused at accept before
+/// the ban lapses and it is re-evaluated normally again. Ephemeral + conservative (5 minutes): long
+/// enough to shed a persistent abuser's reconnect storm, short enough that a false positive on a
+/// shared address self-heals quickly. The ban is in-memory only — a relay restart clears all bans.
+pub const DEFAULT_BAN_DURATION_SECS: u64 = 300;
+
+/// Default ban STRIKE WINDOW (seconds, #1396): the rolling window over which strikes accumulate
+/// toward [`ban_threshold`](RelayServerConfig::ban_threshold). Strikes older than one window are
+/// reset, so only strikes CLUSTERED in time (a genuine abuse burst) reach the threshold — an
+/// occasional, spread-out cap-trip by a legitimate-but-busy source never accumulates to a ban.
+pub const DEFAULT_BAN_STRIKE_WINDOW_SECS: u64 = 60;
+
 /// Validated relay server configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayServerConfig {
@@ -213,6 +236,16 @@ pub struct RelayServerConfig {
     /// disables the cap; a breach DISCONNECTS the connection. See
     /// [`DEFAULT_MAX_RELAYED_BYTES_PER_CONN`].
     pub max_relayed_bytes_per_conn: u64,
+    /// Number of abuse STRIKES a source may accrue within [`ban_strike_window`](Self::ban_strike_window)
+    /// before it is temporarily banned at accept (#1396). `0` disables the ephemeral ban list. See
+    /// [`DEFAULT_BAN_THRESHOLD`].
+    pub ban_threshold: u32,
+    /// How long a banned source stays refused at accept before the ban lapses (#1396). See
+    /// [`DEFAULT_BAN_DURATION_SECS`].
+    pub ban_duration: Duration,
+    /// The rolling window over which strikes accumulate toward [`ban_threshold`](Self::ban_threshold)
+    /// (#1396); strikes older than one window reset. See [`DEFAULT_BAN_STRIKE_WINDOW_SECS`].
+    pub ban_strike_window: Duration,
 }
 
 impl Default for RelayServerConfig {
@@ -247,6 +280,9 @@ impl Default for RelayServerConfig {
             messages_per_conn_per_sec: DEFAULT_MESSAGES_PER_CONN_PER_SEC,
             bytes_per_conn_per_sec: DEFAULT_BYTES_PER_CONN_PER_SEC,
             max_relayed_bytes_per_conn: DEFAULT_MAX_RELAYED_BYTES_PER_CONN,
+            ban_threshold: DEFAULT_BAN_THRESHOLD,
+            ban_duration: Duration::from_secs(DEFAULT_BAN_DURATION_SECS),
+            ban_strike_window: Duration::from_secs(DEFAULT_BAN_STRIKE_WINDOW_SECS),
         }
     }
 }
@@ -296,6 +332,18 @@ impl RelayServerConfig {
             && (self.max_connections_per_ip as usize) > self.max_connections
         {
             return Err("max_connections_per_ip must be <= max_connections".to_string());
+        }
+        // When the ephemeral ban list is ENABLED (a non-zero threshold, #1396), a ban has to last a
+        // non-zero time and strikes have to accumulate over a non-zero window — otherwise the feature
+        // is on but can never actually ban. `ban_threshold == 0` disables the ban list, so the
+        // duration/window are then unconstrained.
+        if self.ban_threshold != 0 {
+            if self.ban_duration.is_zero() {
+                return Err("ban_duration must be > 0 when ban_threshold > 0".to_string());
+            }
+            if self.ban_strike_window.is_zero() {
+                return Err("ban_strike_window must be > 0 when ban_threshold > 0".to_string());
+            }
         }
         Ok(())
     }
@@ -633,8 +681,60 @@ mod tests {
             messages_per_conn_per_sec: 0,
             bytes_per_conn_per_sec: 0,
             max_relayed_bytes_per_conn: 0,
+            ban_threshold: 0,
             ..Default::default()
         };
         assert!(c.validate().is_ok());
+    }
+
+    /// The ephemeral ban list (#1396) is ON by default with a CONSERVATIVE threshold + a finite,
+    /// ephemeral TTL + a finite strike window — so a freshly-defaulted relay sheds a persistent
+    /// abuser's reconnect storm without config, and the high threshold protects a shared /64 from a
+    /// single stray cap-trip.
+    #[test]
+    fn ban_list_defaults_are_enabled_and_conservative() {
+        let c = RelayServerConfig::default();
+        assert!(
+            c.ban_threshold > 1,
+            "ban list defaults ON with a >1 threshold"
+        );
+        assert!(!c.ban_duration.is_zero(), "ban has a finite non-zero TTL");
+        assert!(
+            !c.ban_strike_window.is_zero(),
+            "strike window is finite + non-zero"
+        );
+        assert!(c.validate().is_ok());
+    }
+
+    /// `ban_threshold == 0` disables the ban list, so its (unused) duration/window are unconstrained.
+    #[test]
+    fn zero_ban_threshold_disables_and_ignores_duration_window() {
+        let c = RelayServerConfig {
+            ban_threshold: 0,
+            ban_duration: Duration::from_secs(0),
+            ban_strike_window: Duration::from_secs(0),
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_ban_list_with_zero_duration_is_rejected() {
+        let c = RelayServerConfig {
+            ban_threshold: 5,
+            ban_duration: Duration::from_secs(0),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn enabled_ban_list_with_zero_strike_window_is_rejected() {
+        let c = RelayServerConfig {
+            ban_threshold: 5,
+            ban_strike_window: Duration::from_secs(0),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
     }
 }
