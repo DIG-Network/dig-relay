@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.15.0] - 2026-07-22
+
+### Features
+- **relay:** Ban list + monotonic liveness + dashboard port (#1396, #1395, #1036) (#15)
+
 ## [0.14.1] - 2026-07-21
 
 ### Bug Fixes
