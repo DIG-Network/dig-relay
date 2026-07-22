@@ -2,6 +2,25 @@
 
 Durable realizations from developing dig-relay. Context, not a change diary (CLAUDE.md §4.5).
 
+## Liveness sweep must run on a MONOTONIC clock + ban-list keying trade-off (#1395/#1396)
+
+- **The health sweep's clock must be `Instant`, never `SystemTime` (#1395).** The sweep prunes a
+  registration when `now - last_activity > liveness_deadline`. If both readings are wall-clock
+  (`SystemTime`), a host clock jump breaks it in BOTH directions: a forward NTP step (or DST) makes
+  `now` leap so EVERY live registration suddenly reads as stale → a mass false-prune of the whole peer
+  set at once; a backward step freezes the deadline so dead records linger. The fix is `liveness_now_secs()`
+  — monotonic elapsed-since-start from a process-start `Instant` in a `OnceLock` — used for BOTH the
+  `last_activity` stamp and the sweep's `now`, so a decision is the difference of two monotonic readings.
+  Crucially this is a SEPARATE clock from the wire `RelayPeerInfo.last_seen`/`connected_at`, which MUST
+  stay real Unix timestamps (other peers read them as such) — don't "simplify" by making them one clock.
+- **The ban list (#1396) keys on the IPv6 /64, same as every #1386 per-IP cap — so a ban is a /64-wide
+  hammer.** The mitigation is NOT finer keying (a /64 is the smallest a site is reliably delegated;
+  finer lets an attacker walk addresses to dodge it) but a HIGH strike threshold (default 20) + a rolling
+  strike window (default 60s) + a short TTL (default 300s): only sustained, clustered abuse earns a ban,
+  so one misbehaving host in a shared /64 never bans the whole site on a stray cap-trip. Strikes are fed
+  from the EXISTING #1386 choke points (each cap-trip = one `record_strike`); the ban only adds the
+  accept-time refusal, it invents no new detection. In-memory only — a restart clears all bans.
+
 ## `/map` — coarse-grid privacy contract + the globe-column technique (#1452)
 
 - **The grid cell IS the anonymity set, not a display convenience.** `/map.json` never carries a

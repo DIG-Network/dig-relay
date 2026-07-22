@@ -11,8 +11,8 @@
 //! onto the socket so forwards from OTHER connections reach this peer without lock contention.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -198,14 +198,33 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Current Unix-epoch time in SECONDS (saturating) — the clock the per-connection `last_activity`
-/// liveness timestamps and the health sweep (#1382) run on. Same wall-clock basis as the wire's
-/// `RelayPeerInfo::last_seen`.
+/// Current Unix-epoch time in SECONDS (saturating), WALL-CLOCK. TEST-ONLY: production no longer uses a
+/// wall-clock seconds helper — the wire's `RelayPeerInfo::last_seen`/`connected_at` are stamped inside
+/// `wire::RelayPeerInfo::new`, and the relay's own liveness sweep runs on the monotonic
+/// [`liveness_now_secs`] clock (#1395). The sweep tests keep this to seed `last_activity` with a
+/// realistic large "now" base against which a `now - N` value is meaningfully past the liveness deadline.
+#[cfg(test)]
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The relay's OWN connection-liveness clock: MONOTONIC seconds since process start, from
+/// [`std::time::Instant`] (#1395). The per-connection `last_activity` stamp and the health sweep
+/// (#1382) both read THIS clock, and a sweep decision is the difference of two readings of it — so a
+/// wall-clock jump (an NTP step, a manual clock set, a DST change) can neither prematurely prune a
+/// live peer (a `SystemTime` that leaps forward would make every peer look stale) nor spare a dead
+/// one (a clock that leaps back would freeze the deadline). `Instant` is guaranteed non-decreasing,
+/// so the liveness deadline measures genuine elapsed wall-time regardless of clock adjustments.
+///
+/// Deliberately distinct from the wire's `last_seen`, which MUST stay a real Unix timestamp (other
+/// peers read it as one); the relay's internal "has this connection gone silent?" clock must not be
+/// perturbable by the host's clock. The process-start reference [`Instant`] is captured once, lazily.
+fn liveness_now_secs() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
 }
 
 /// Per-connection registration state, set after a successful `Register`.
@@ -533,6 +552,16 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Ephemeral ban list (#1396): a source that repeatedly TRIPPED the per-IP caps within the strike
+    // window is temporarily refused HERE, at accept — before any handshake or per-connection work —
+    // for the ban TTL, rather than being re-evaluated on every reconnect. Checked first so a banned
+    // source costs essentially nothing; refusing at accept mirrors the per-IP conn-cap refusal below
+    // (there is no wire channel yet to send a `RATE_LIMITED` frame on — the register-path caps do that).
+    if state.abuse.is_banned(peer_addr.ip(), now_ms()) {
+        tracing::warn!(%peer_addr, "refusing connection: source is temporarily banned (#1396)");
+        return Ok(());
+    }
+
     // Connection cap (SECURITY_AUDIT_P2P dig-relay #5): count OPEN sockets, not just registered peers,
     // so a flood of connect-but-never-register sockets can't bypass the cap. The guard increments the
     // open-connection counter here and decrements it on ANY exit path (RAII), so the count can never
@@ -550,6 +579,9 @@ where
     // slot's key normalises IPv4-mapped IPv6 + groups an IPv6 /64 (see `limits::ip_key`).
     let Some(_ip_slot) = state.abuse.try_acquire_conn(peer_addr.ip()) else {
         tracing::warn!(%peer_addr, "refusing connection: at per-IP connection cap (#1386)");
+        // Tripping the per-IP cap is one abuse STRIKE (#1396); a source that keeps doing it within
+        // the strike window earns a temporary ban and is then refused at accept above.
+        state.abuse.record_strike(peer_addr.ip(), now_ms());
         return Ok(());
     };
 
@@ -627,8 +659,10 @@ where
     let register_timeout = state.config.register_timeout;
     // The health sweep's liveness clock for THIS connection (#1382): stamped to "now" on every
     // inbound frame, shared (`Arc`) with the registry record once registered so `sweep_once` can
-    // read it without touching this task.
-    let last_activity = Arc::new(AtomicU64::new(now_secs()));
+    // read it without touching this task. The clock is the MONOTONIC `liveness_now_secs()` (#1395),
+    // not wall-clock — so a host clock jump can neither prematurely prune this live connection nor
+    // keep a dead one alive.
+    let last_activity = Arc::new(AtomicU64::new(liveness_now_secs()));
 
     // Per-connection abuse limiter (#1386): task-local (no shared lock), enforcing this connection's
     // inbound message-rate, byte-rate, and cumulative-byte budgets. A breach DISCONNECTS (breaks the
@@ -671,7 +705,8 @@ where
         // Health-sweep liveness (#1382): ANY inbound frame — RLY or PEX, valid or not — counts as
         // activity, mirroring the node's own RLY-006 keepalive (the client answers relay-initiated
         // pings never; its ~30s keepalive ping is the only inbound liveness signal we can rely on).
-        last_activity.store(now_secs(), Ordering::Relaxed);
+        // Stamped on the MONOTONIC liveness clock (#1395), the same clock `sweep_once` compares against.
+        last_activity.store(liveness_now_secs(), Ordering::Relaxed);
 
         // Per-connection abuse limits (#1386): account for this inbound frame's size against the
         // message-rate, byte-rate, and cumulative-byte budgets. A breach means the peer is flooding
@@ -679,6 +714,9 @@ where
         // way out). Checked for every frame (RLY or PEX, valid or not) since all consume resources.
         if let crate::limits::Admit::Disconnect = conn_limiter.admit(frame.len(), now_ms()) {
             tracing::warn!(%peer_addr, "disconnecting: per-connection abuse limit exceeded (#1386)");
+            // A per-connection flood is one abuse STRIKE (#1396): a source that repeatedly floods
+            // connections within the window earns a temporary accept-time ban.
+            state.abuse.record_strike(peer_addr.ip(), now_ms());
             break;
         }
 
@@ -888,6 +926,7 @@ async fn register_peer(
     let connected_now = state.connected.load(Ordering::Relaxed) as usize;
     if !state.abuse.allow_registration(peer_addr.ip(), now_ms()) {
         tracing::warn!(%peer_id, %peer_addr, "refusing register: per-IP registration rate exceeded (#1386)");
+        state.abuse.record_strike(peer_addr.ip(), now_ms());
         let _ = out_tx.try_send(RelayMessage::RegisterAck {
             success: false,
             message: "registration rate limit exceeded for your address".to_string(),
@@ -903,6 +942,7 @@ async fn register_peer(
         Some(slot) => slot,
         None => {
             tracing::warn!(%peer_id, %peer_addr, "refusing register: per-IP concurrent-registration cap reached (#1386)");
+            state.abuse.record_strike(peer_addr.ip(), now_ms());
             let _ = out_tx.try_send(RelayMessage::RegisterAck {
                 success: false,
                 message: "too many concurrent registrations from your address".to_string(),
@@ -1188,7 +1228,10 @@ async fn health_sweep(state: Arc<RelayState>) {
     let mut ticker = tokio::time::interval(state.config.health_check_interval);
     loop {
         ticker.tick().await;
-        sweep_once(&state, now_secs()).await;
+        // The sweep's "now" is the MONOTONIC liveness clock (#1395) — the SAME clock each
+        // connection stamps `last_activity` with — so `now - last_activity` measures genuine
+        // elapsed silence, immune to any wall-clock adjustment.
+        sweep_once(&state, liveness_now_secs()).await;
     }
 }
 
@@ -1220,6 +1263,30 @@ mod tests {
     /// (#1382) test cases that care about staleness build their own explicit value instead.
     fn fresh_activity() -> Arc<AtomicU64> {
         Arc::new(AtomicU64::new(now_secs()))
+    }
+
+    /// #1395: the connection-liveness clock the health sweep runs on MUST be MONOTONIC (from
+    /// `std::time::Instant`), NOT wall-clock `SystemTime` — so an NTP correction / manual clock set /
+    /// DST change can neither prematurely prune a live peer (a wall clock leaping FORWARD would make
+    /// every registration look stale at once) nor spare a dead one (a clock leaping BACK would freeze
+    /// the deadline). A monotonic elapsed-since-start clock is small and never decreases; the wall
+    /// clock is the (huge) Unix epoch. Both the `last_activity` stamp and the sweep read this one
+    /// clock, so their difference measures genuine elapsed silence regardless of the host clock.
+    #[test]
+    fn liveness_clock_is_monotonic_not_wall_clock() {
+        let a = liveness_now_secs();
+        let b = liveness_now_secs();
+        assert!(b >= a, "monotonic liveness clock must never go backwards");
+        assert!(
+            a < 1_000_000_000,
+            "liveness clock is elapsed-since-process-start (monotonic Instant), not the Unix epoch"
+        );
+        // Sanity: the WALL clock IS the Unix epoch — proving the two clocks are genuinely different
+        // and that #1395 moved the liveness path OFF the perturbable wall clock.
+        assert!(
+            now_secs() > 1_000_000_000,
+            "wall clock is the Unix epoch (the clock the liveness sweep must NOT depend on)"
+        );
     }
 
     #[test]

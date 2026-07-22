@@ -57,9 +57,10 @@ ENV DIG_RELAY_GEOIP_DB=/opt/dig-relay/geoip/dbip-city-lite.mmdb
 USER digrelay
 EXPOSE 9450 9451
 EXPOSE 3478/udp
-# The peer-stats dashboard defaults to :80, which this non-root (uid 10001) user cannot bind; run it
-# on an unprivileged port and front it at :80 in the orchestrator, e.g.
-# `dig-relay serve --dashboard-listen [::]:8080` (relay.dig.net maps NLB :80 → container :8080).
+# The plain-HTTP→HTTPS redirect (peer-stats dashboard entry) defaults to the unprivileged :8080, so
+# this non-root (uid 10001) user can bind it directly — binding the privileged :80 would need root /
+# CAP_NET_BIND_SERVICE, which Fargate does not grant. The orchestrator fronts it at public :80
+# (relay.dig.net maps NLB :80 → container :8080).
 EXPOSE 8080
 # Bind all interfaces inside the container; the orchestrator maps/fronts the ports.
 ENTRYPOINT ["/usr/local/bin/dig-relay"]

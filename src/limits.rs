@@ -23,8 +23,13 @@
 //! on the **/64 prefix** — the smallest block a site is typically delegated — so an attacker cannot
 //! trivially sidestep the per-IP caps by walking the many addresses within one assigned /64.
 //!
-//! An ephemeral ban list is deliberately NOT built here (a separate ticket): this module provides the
-//! [`ip_key`] normalisation + the [`AbusePolicy`] choke points a ban map would later slot into.
+//! [`AbusePolicy`] also carries the ephemeral **ban list** (#1396): a source that repeatedly TRIPS the
+//! per-IP caps above (each trip is a [`AbusePolicy::record_strike`]) accrues strikes within a rolling
+//! window; once it crosses the ban threshold it is [`AbusePolicy::is_banned`] and refused at the accept
+//! choke for a TTL, rather than being re-evaluated on every reconnect. The ban is keyed by the same
+//! [`ip_key`] (IPv6 /64), in-memory, TTL'd, and LRU-bounded like the rate-bucket maps; the deliberately
+//! HIGH default threshold + short TTL keep one misbehaving host in a shared /64 from banning the whole
+//! site on a stray cap-trip. A `0` threshold disables the ban list entirely.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
@@ -141,6 +146,18 @@ pub fn ip_key(ip: IpAddr) -> IpKey {
     }
 }
 
+/// One source's accumulating abuse strikes within the current strike window (#1396). Reset to a fresh
+/// window once the window elapses, so only strikes CLUSTERED in time reach the ban threshold.
+#[derive(Debug, Clone, Copy)]
+struct StrikeRecord {
+    /// Strikes recorded so far in the current window.
+    count: u32,
+    /// Start (ms) of the current strike window; a strike more than one window later starts a new one.
+    window_start_ms: u64,
+    /// Last time (ms) this record was touched — used for LRU eviction when the strike map is full.
+    last_seen_ms: u64,
+}
+
 /// The mutable per-IP maps behind [`AbusePolicy`], guarded by one [`std::sync::Mutex`]. Held in an
 /// [`Arc`] so an RAII slot ([`ConnSlot`]/[`RegSlot`]) can release its count independently of the
 /// [`AbusePolicy`]'s own lifetime.
@@ -152,6 +169,13 @@ struct AbuseState {
     reg_buckets: HashMap<IpKey, TokenBucket>,
     /// Live CONCURRENT registrations per source IP.
     regs_per_ip: HashMap<IpKey, u32>,
+    /// Accumulating abuse strikes per source IP (#1396, LRU-bounded to [`MAX_TRACKED_IPS`]). A key is
+    /// removed the moment it earns a ban (it moves to `bans`) or when its window is superseded.
+    strikes: HashMap<IpKey, StrikeRecord>,
+    /// Active ephemeral bans (#1396): source IP key → the time (ms) the ban lapses. LRU-bounded and
+    /// lazily expired (a lookup past `banned_until` removes the entry), so the map self-heals without
+    /// a sweep.
+    bans: HashMap<IpKey, u64>,
 }
 
 /// Shared, cheap per-source-IP abuse limits (#1386): a per-IP concurrent-connection cap, a per-IP
@@ -166,6 +190,13 @@ pub struct AbusePolicy {
     max_connections_per_ip: u32,
     registrations_per_ip_per_sec: u32,
     max_registrations_per_ip: u32,
+    /// Strikes within [`ban_strike_window_ms`](Self::ban_strike_window_ms) before a ban (#1396). `0`
+    /// disables the ban list.
+    ban_threshold: u32,
+    /// How long (ms) a ban lasts once triggered (#1396).
+    ban_duration_ms: u64,
+    /// Rolling window (ms) over which strikes accumulate toward the ban threshold (#1396).
+    ban_strike_window_ms: u64,
     state: Arc<Mutex<AbuseState>>,
 }
 
@@ -176,6 +207,9 @@ impl AbusePolicy {
             max_connections_per_ip: config.max_connections_per_ip,
             registrations_per_ip_per_sec: config.registrations_per_ip_per_sec,
             max_registrations_per_ip: config.max_registrations_per_ip,
+            ban_threshold: config.ban_threshold,
+            ban_duration_ms: config.ban_duration.as_millis() as u64,
+            ban_strike_window_ms: config.ban_strike_window.as_millis() as u64,
             state: Arc::new(Mutex::new(AbuseState::default())),
         }
     }
@@ -251,6 +285,95 @@ impl AbusePolicy {
             state: Some(self.state.clone()),
             key,
         })
+    }
+
+    /// Whether `ip`'s source is currently BANNED (#1396) — an active ban whose TTL has not lapsed.
+    /// Checked at the accept choke so a banned source is refused before any handshake work. A lookup
+    /// past the ban's `banned_until` lazily removes the entry (the ban map self-heals without a
+    /// sweep). A `0` ban threshold disables the ban list (always `false`). Never `.await`s.
+    pub fn is_banned(&self, ip: IpAddr, now_ms: u64) -> bool {
+        if self.ban_threshold == 0 {
+            return false;
+        }
+        let key = ip_key(ip);
+        let mut state = lock(&self.state);
+        match state.bans.get(&key).copied() {
+            Some(banned_until) if now_ms < banned_until => true,
+            Some(_) => {
+                // Ban lapsed → drop it so the source is re-evaluated normally from now on.
+                state.bans.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Record one abuse STRIKE against `ip` (#1396): call this each time the source TRIPS a #1386
+    /// per-IP limit (connection cap, registration rate, concurrent-registration cap, or the
+    /// per-connection flood limit). Strikes accumulate within a rolling
+    /// [`ban_strike_window_ms`](Self::ban_strike_window_ms); once the count reaches
+    /// [`ban_threshold`](Self::ban_threshold) the source is banned for
+    /// [`ban_duration_ms`](Self::ban_duration_ms) and its strike record cleared. Strikes older than
+    /// one window reset, so only sustained, clustered abuse earns a ban — one stray cap-trip by a
+    /// legitimate-but-busy source (or one host in a shared /64) never does. A `0` threshold disables
+    /// the ban list (a no-op). Both maps are LRU-bounded to [`MAX_TRACKED_IPS`]. Never `.await`s.
+    pub fn record_strike(&self, ip: IpAddr, now_ms: u64) {
+        if self.ban_threshold == 0 {
+            return;
+        }
+        let key = ip_key(ip);
+        let mut state = lock(&self.state);
+        evict_lru_strikes(&mut state.strikes, key);
+        // Increment (or start / roll) this source's strike window, scoping the record's mutable
+        // borrow so the possible ban insertion below can re-borrow `state`.
+        let count = {
+            let rec = state.strikes.entry(key).or_insert(StrikeRecord {
+                count: 0,
+                window_start_ms: now_ms,
+                last_seen_ms: now_ms,
+            });
+            if now_ms.saturating_sub(rec.window_start_ms) > self.ban_strike_window_ms {
+                rec.count = 0;
+                rec.window_start_ms = now_ms;
+            }
+            rec.count = rec.count.saturating_add(1);
+            rec.last_seen_ms = now_ms;
+            rec.count
+        };
+        if count >= self.ban_threshold {
+            // Threshold reached within the window → ban this source for the TTL and clear its strike
+            // record (a fresh window starts if it returns after the ban lapses).
+            state.strikes.remove(&key);
+            evict_soonest_ban(&mut state.bans, key);
+            let banned_until = now_ms.saturating_add(self.ban_duration_ms);
+            state.bans.insert(key, banned_until);
+        }
+    }
+}
+
+/// Evict the least-recently-seen strike record when `map` is at [`MAX_TRACKED_IPS`] and `key` is not
+/// already tracked — the same LRU bound the rate-bucket map uses, so the strike map stays bounded
+/// under a distinct-key flood (#1396).
+fn evict_lru_strikes(map: &mut HashMap<IpKey, StrikeRecord>, key: IpKey) {
+    if !map.contains_key(&key) && map.len() >= MAX_TRACKED_IPS {
+        if let Some(&victim) = map
+            .iter()
+            .min_by_key(|(_, r)| r.last_seen_ms)
+            .map(|(ip, _)| ip)
+        {
+            map.remove(&victim);
+        }
+    }
+}
+
+/// Evict the SOONEST-EXPIRING ban when the ban `map` is at [`MAX_TRACKED_IPS`] and `key` is not
+/// already banned — bounding the ban map under a distinct-key flood (#1396). Evicting the ban closest
+/// to lapsing loses the least remaining protection.
+fn evict_soonest_ban(map: &mut HashMap<IpKey, u64>, key: IpKey) {
+    if !map.contains_key(&key) && map.len() >= MAX_TRACKED_IPS {
+        if let Some(&victim) = map.iter().min_by_key(|(_, &until)| until).map(|(ip, _)| ip) {
+            map.remove(&victim);
+        }
     }
 }
 
@@ -651,5 +774,139 @@ mod tests {
         for i in 0..10_000 {
             assert_eq!(lim.admit(4096, i), Admit::Ok, "all limits disabled");
         }
+    }
+
+    // ---- ephemeral ban list (#1396) ----
+
+    /// An [`AbusePolicy`] with ONLY the ban knobs set (every rate cap disabled), for exercising
+    /// `record_strike` / `is_banned` directly and deterministically (time is a caller-supplied `ms`).
+    fn ban_policy(threshold: u32, ttl_ms: u64, window_ms: u64) -> AbusePolicy {
+        AbusePolicy::new(&RelayServerConfig {
+            max_connections_per_ip: 0,
+            registrations_per_ip_per_sec: 0,
+            max_registrations_per_ip: 0,
+            messages_per_conn_per_sec: 0,
+            bytes_per_conn_per_sec: 0,
+            max_relayed_bytes_per_conn: 0,
+            ban_threshold: threshold,
+            ban_duration: std::time::Duration::from_millis(ttl_ms),
+            ban_strike_window: std::time::Duration::from_millis(window_ms),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn strikes_below_the_threshold_do_not_ban() {
+        let policy = ban_policy(3, 60_000, 60_000);
+        let ip = v4(10, 5, 0, 1);
+        policy.record_strike(ip, 1_000);
+        policy.record_strike(ip, 1_100);
+        assert!(
+            !policy.is_banned(ip, 1_200),
+            "two strikes is below the threshold of three"
+        );
+    }
+
+    #[test]
+    fn reaching_the_threshold_within_the_window_bans() {
+        let policy = ban_policy(3, 60_000, 60_000);
+        let ip = v4(10, 5, 0, 2);
+        policy.record_strike(ip, 1_000);
+        policy.record_strike(ip, 1_100);
+        assert!(!policy.is_banned(ip, 1_150), "not yet at the threshold");
+        policy.record_strike(ip, 1_200);
+        assert!(
+            policy.is_banned(ip, 1_300),
+            "the third strike in the window crosses the threshold → banned"
+        );
+    }
+
+    /// The direct answer to #1396's "must NOT ban a shared /64 on a SINGLE offender": one stray
+    /// cap-trip never bans; it takes sustained, clustered abuse (the whole threshold) — so a single
+    /// misbehaving host in a shared IPv6 /64 cannot get the whole site banned on one strike.
+    #[test]
+    fn a_single_strike_never_bans_a_shared_slash64() {
+        let policy = ban_policy(20, 300_000, 60_000);
+        let host: IpAddr = "2001:db8:aaaa:1::1".parse().unwrap();
+        policy.record_strike(host, 1_000);
+        // A different host sharing the same /64 must still be admitted — the /64 is not banned.
+        let neighbour: IpAddr = "2001:db8:aaaa:1:dead:beef::9".parse().unwrap();
+        assert!(
+            !policy.is_banned(neighbour, 2_000),
+            "one strike must not ban the shared /64"
+        );
+    }
+
+    #[test]
+    fn a_ban_expires_after_its_ttl() {
+        let policy = ban_policy(1, 5_000, 60_000);
+        let ip = v4(10, 5, 0, 3);
+        policy.record_strike(ip, 1_000); // threshold 1 → immediate ban until 6_000
+        assert!(policy.is_banned(ip, 3_000), "within the TTL → banned");
+        assert!(
+            !policy.is_banned(ip, 6_001),
+            "past banned_until → the ban has lapsed"
+        );
+    }
+
+    #[test]
+    fn strikes_spread_across_windows_never_accumulate_to_a_ban() {
+        // Threshold 3, but a 100 ms window: one strike per window, well spaced, never clusters.
+        let policy = ban_policy(3, 60_000, 100);
+        let ip = v4(10, 5, 0, 4);
+        policy.record_strike(ip, 0);
+        policy.record_strike(ip, 500);
+        policy.record_strike(ip, 1_000);
+        policy.record_strike(ip, 1_500);
+        assert!(
+            !policy.is_banned(ip, 2_000),
+            "strikes in separate windows reset and never reach the threshold"
+        );
+    }
+
+    #[test]
+    fn zero_ban_threshold_disables_the_ban_list() {
+        let policy = ban_policy(0, 60_000, 60_000);
+        let ip = v4(10, 5, 0, 5);
+        for i in 0..1_000 {
+            policy.record_strike(ip, i);
+        }
+        assert!(
+            !policy.is_banned(ip, 2_000),
+            "a 0 threshold disables the ban list entirely"
+        );
+    }
+
+    #[test]
+    fn a_ban_covers_the_whole_slash64_but_not_a_different_one() {
+        let policy = ban_policy(2, 60_000, 60_000);
+        let a: IpAddr = "2001:db8:bbbb:1::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:bbbb:1::2".parse().unwrap(); // same /64 as a
+        let other: IpAddr = "2001:db8:bbbb:2::1".parse().unwrap(); // different /64
+        policy.record_strike(a, 1_000);
+        policy.record_strike(b, 1_100); // both strikes count against the shared /64 key
+        assert!(
+            policy.is_banned(a, 1_200) && policy.is_banned(b, 1_200),
+            "the /64 that crossed the threshold is banned"
+        );
+        assert!(
+            !policy.is_banned(other, 1_200),
+            "a different /64 is independent"
+        );
+    }
+
+    #[test]
+    fn ban_map_is_lru_bounded_under_a_distinct_ip_flood() {
+        // Threshold 1 → each distinct source is banned on its first strike; feed far more distinct
+        // /64s than the cap and assert the ban map never exceeds MAX_TRACKED_IPS.
+        let policy = ban_policy(1, 60_000, 60_000);
+        for i in 0..(MAX_TRACKED_IPS as u64 + 5_000) {
+            let ip: IpAddr = format!("2001:db8:{:x}:{:x}::1", i >> 16, i & 0xffff)
+                .parse()
+                .unwrap();
+            policy.record_strike(ip, 1_000);
+        }
+        let len = lock(&policy.state).bans.len();
+        assert!(len <= MAX_TRACKED_IPS, "ban map stayed bounded ({len})");
     }
 }
