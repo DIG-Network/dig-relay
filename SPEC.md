@@ -23,13 +23,18 @@ bindable:
 |---|---|---|---|---|
 | Relay WebSocket + dashboard | TCP | `[::]:9450` | `listen` / `--listen` | `RelayMessage`/PEX wire (§3) AND the peer-stats dashboard (§6.1) — a WebSocket upgrade is the wire, any other `GET` is the dashboard |
 | Health | TCP (HTTP) | `[::]:9451` | `health_listen` / `--health-listen` | Load-balancer target-group check |
-| HTTP→HTTPS redirect | TCP (HTTP) | `[::]:80` | `dashboard_listen` / `--dashboard-listen` | 301 every plain-HTTP request to `https://` (§6.1) |
+| HTTP→HTTPS redirect | TCP (HTTP) | `[::]:8080` | `dashboard_listen` / `--dashboard-listen` | 301 every plain-HTTP request to `https://` (§6.1) |
 | STUN | UDP | `[::]:3478` | `stun_listen` / `--stun-listen` | RFC 5389 Binding responder |
 
 Port 9450 matches `dig_gossip::constants::DEFAULT_RELAY_PORT`. Port 3478 is the IANA-assigned STUN
 port. The relay serves content ONLY over HTTPS/WSS: the dashboard shares the wire listener (TLS is
 terminated upstream at the load balancer, so `https://relay.dig.net/` and `wss://relay.dig.net/` both
-arrive on the wire port), and port 80 exists solely to redirect plain HTTP to the secure origin.
+arrive on the wire port), and the redirect listener exists solely to bounce plain HTTP to the secure
+origin. The redirect listener defaults to the **unprivileged** port `8080` (not the privileged `80`):
+the relay's service user is non-root (the Docker image runs as uid 10001; Fargate grants no
+`CAP_NET_BIND_SERVICE`), so it MUST bind an unprivileged port and be fronted at public `:80` by the
+orchestrator (the `relay.dig.net` NLB maps `:80` → the container's `:8080`). Binding `:80` directly
+requires root / `CAP_NET_BIND_SERVICE`.
 
 ### 2.1 Listener binding — IPv6-first, IPv4-fallback (normative)
 
@@ -624,3 +629,4 @@ the nightly channel bounds the detection lag to ~24h; widening `ci.yml` to a cro
 is a future hardening.
 
 A change to any behavior in this document MUST update this SPEC in the same unit of work.
+

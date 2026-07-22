@@ -30,11 +30,15 @@ pub const DEFAULT_RELAY_PORT: u16 = 9450;
 /// the load balancer's HTTP health check never collides with relay traffic on an NLB.
 pub const DEFAULT_HEALTH_PORT: u16 = 9451;
 
-/// The default HTTP port for the public peer-stats **dashboard** — port **80** (the well-known HTTP
-/// port), so `http://relay.dig.net/` resolves to a live operations overview of the relay's peer
-/// reservations + connections. Kept off the relay/health/STUN ports (a distinct NLB listener → this
-/// dashboard target port); it is a READ-ONLY HTTP surface and never touches the `RelayMessage` wire.
-pub const DEFAULT_DASHBOARD_PORT: u16 = 80;
+/// The default HTTP port for the public peer-stats **dashboard** — the **unprivileged** port
+/// **8080**, so the relay's non-root service user (the Docker image runs as uid 10001; Fargate does
+/// not grant `NET_BIND_SERVICE`) can bind it directly. The orchestrator fronts it at the public
+/// well-known port (the `relay.dig.net` NLB maps `:80` → the container's `:8080`). Binding the
+/// privileged port `:80` directly requires root / `CAP_NET_BIND_SERVICE`, which the relay does not
+/// have — hence the unprivileged default. Kept off the relay/health/STUN ports (a distinct NLB
+/// listener → this dashboard target port); it is a READ-ONLY HTTP surface and never touches the
+/// `RelayMessage` wire.
+pub const DEFAULT_DASHBOARD_PORT: u16 = 8080;
 
 /// The default STUN (RFC 5389) UDP port: **3478**, the IANA-assigned STUN port, matching the DIG
 /// node peer-network protocol (STUN served at `relay.dig.net:3478`). A NAT'd DIG Node sends a
@@ -145,9 +149,11 @@ pub struct RelayServerConfig {
     pub listen: SocketAddr,
     /// Address the HTTP `/health` listener binds (default `[::]:9451`, dual-stack).
     pub health_listen: SocketAddr,
-    /// Address the plain-HTTP **redirect** listener binds (default `[::]:80`, dual-stack). The relay
-    /// serves content only over HTTPS/WSS, so this port `301`s every request to `https://<host><path>`;
-    /// the dashboard itself (`GET /`, `/stats.json`, `/mascot.png`) is served over TLS on `listen`.
+    /// Address the plain-HTTP **redirect** listener binds (default `[::]:8080`, dual-stack — the
+    /// unprivileged port the non-root service user can bind; the orchestrator fronts it at public
+    /// `:80`, e.g. the `relay.dig.net` NLB maps `:80` → this `:8080`). The relay serves content only
+    /// over HTTPS/WSS, so this port `301`s every request to `https://<host><path>`; the dashboard
+    /// itself (`GET /`, `/stats.json`, `/mascot.png`) is served over TLS on `listen`.
     pub dashboard_listen: SocketAddr,
     /// Address the STUN (RFC 5389) UDP listener binds (default `[::]:3478`, the IANA STUN port,
     /// dual-stack).
@@ -310,8 +316,8 @@ mod tests {
         assert_eq!(c.health_listen.port(), 9451);
         assert_eq!(
             c.dashboard_listen.port(),
-            80,
-            "dashboard = well-known HTTP port 80"
+            8080,
+            "dashboard defaults to the unprivileged port 8080 (non-root bind; fronted at :80)"
         );
         assert_eq!(c.stun_listen.port(), 3478, "STUN = IANA STUN port 3478");
         assert!(

@@ -45,7 +45,8 @@ struct Cli {
     /// Address the HTTP /health listener binds (default [::]:9451, dual-stack IPv6+IPv4).
     #[arg(long, value_name = "ADDR", global = true)]
     health_listen: Option<SocketAddr>,
-    /// Address the HTTP peer-stats dashboard listener binds (default [::]:80, dual-stack IPv6+IPv4).
+    /// Address the plain-HTTP→HTTPS redirect listener binds (default [::]:8080, dual-stack IPv6+IPv4;
+    /// unprivileged so a non-root relay can bind it — front it at public :80 in the orchestrator).
     #[arg(long, value_name = "ADDR", global = true)]
     dashboard_listen: Option<SocketAddr>,
     /// Address the STUN (RFC 5389) UDP listener binds (default [::]:3478, dual-stack IPv6+IPv4).
