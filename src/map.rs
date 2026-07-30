@@ -82,11 +82,22 @@ pub(crate) fn snap(coord: f64, cell_deg: f64) -> f64 {
     ((coord / cell_deg).floor() + 0.5) * cell_deg
 }
 
-/// The first address in `addresses` whose IP is public/dialable in principle — [`GeoResolver`]
-/// itself is responsible for rejecting private/loopback/link-local ranges; this just picks the
-/// candidate to hand it (mirrors `dashboard::peer_row`'s "first dialable address" convention).
-fn first_addr(addresses: &[SocketAddr]) -> Option<IpAddr> {
-    addresses.first().map(|a| a.ip())
+/// The first of `addresses` the resolver can actually locate, or `None` when it can locate none.
+///
+/// This used to be `addresses.first()` while documenting itself as "the first address whose IP is
+/// public/dialable in principle" — the filter was described but never implemented (#1846). A peer
+/// whose FIRST advertised address is private, ULA or link-local therefore handed that address to the
+/// resolver, was rejected, and was silently counted `unknown` even though a perfectly locatable
+/// public address sat later in the same list. That is an ordinary shape, not a contrived one: §5.2
+/// makes peers IPv6-first and dig-nat advertises local candidates alongside public ones.
+///
+/// Asking the resolver in order — rather than re-deriving "is this public?" here — keeps that
+/// judgement in the ONE place that owns it (`geoip::is_public`, behind the injected [`GeoResolver`]),
+/// so the two can never disagree. Lookups are in-memory and deliberately uncached (see
+/// [`crate::geoip::locate`]), and address lists are short, so walking them costs nothing worth
+/// optimising.
+fn first_located(addresses: &[SocketAddr], resolver: &dyn GeoResolver) -> Option<(f64, f64)> {
+    addresses.iter().find_map(|a| resolver.locate(a.ip()))
 }
 
 /// Build a [`MapSnapshot`] from the relay's registered peers. PURE (no I/O, no locks): geo lookups
@@ -107,11 +118,7 @@ pub fn build_map_snapshot(
     let mut unknown_peers = 0usize;
 
     for peer in peers {
-        let Some(ip) = first_addr(&peer.addresses) else {
-            unknown_peers += 1;
-            continue;
-        };
-        let Some((lat, lon)) = resolver.locate(ip) else {
+        let Some((lat, lon)) = first_located(&peer.addresses, resolver) else {
             unknown_peers += 1;
             continue;
         };
@@ -177,6 +184,67 @@ mod tests {
             p.addresses = vec![SocketAddr::new(ip, 9444)];
         }
         p
+    }
+
+    /// A peer advertising SEVERAL addresses, in the order it advertised them.
+    fn peer_with_addrs(id: &str, addrs: &[IpAddr]) -> RelayPeerInfo {
+        let mut p = RelayPeerInfo::new(id.to_string(), "mainnet".to_string(), 1);
+        p.addresses = addrs.iter().map(|ip| SocketAddr::new(*ip, 9444)).collect();
+        p
+    }
+
+    /// #1846: a peer must be located by the first address that CAN be located, not written off
+    /// because the first one it happens to advertise cannot be.
+    ///
+    /// `first_addr` used to take `addresses.first()` while its doc claimed it took the first
+    /// public/dialable one, so a peer leading with a private/ULA/link-local address was silently
+    /// counted `unknown` even with a perfectly locatable public address behind it. That ordering is
+    /// ordinary, not contrived: §5.2 makes peers IPv6-first and dig-nat advertises local candidates
+    /// alongside public ones.
+    #[test]
+    fn a_peer_is_located_by_its_first_locatable_address_not_merely_its_first() {
+        let private = v4(192, 168, 1, 5);
+        let public = v4(81, 2, 69, 142);
+        let resolver = FakeResolver(vec![
+            // Exactly what `geoip::locate` does with a private address.
+            (private, None),
+            (public, Some((51.5, -0.1))),
+        ]);
+
+        let snap = build_map_snapshot(
+            &[peer_with_addrs("p", &[private, public])],
+            &resolver,
+            MAP_CELL_DEG,
+            0,
+        );
+
+        assert_eq!(snap.unknown_peers, 0, "the peer has a locatable address");
+        assert_eq!(snap.located_peers, 1);
+        assert_eq!(snap.cells.len(), 1);
+        assert_eq!((snap.cells[0].lat, snap.cells[0].lon), (52.5, -2.5));
+    }
+
+    /// The control, without which "locate every peer somehow" would satisfy the test above: a peer
+    /// whose addresses are ALL unlocatable must still be counted unknown and fabricate no location.
+    #[test]
+    fn a_peer_whose_addresses_are_all_unlocatable_is_still_unknown() {
+        let private = v4(192, 168, 1, 5);
+        let loopback = v4(127, 0, 0, 1);
+        let resolver = FakeResolver(vec![(private, None), (loopback, None)]);
+
+        let snap = build_map_snapshot(
+            &[peer_with_addrs("p", &[private, loopback])],
+            &resolver,
+            MAP_CELL_DEG,
+            0,
+        );
+
+        assert_eq!(snap.unknown_peers, 1);
+        assert_eq!(snap.located_peers, 0);
+        assert!(
+            snap.cells.is_empty(),
+            "an unlocatable peer must never be given a location"
+        );
     }
 
     #[test]
