@@ -31,6 +31,51 @@ const PREFERS_USER_LEVEL: bool = false;
 #[cfg(not(windows))]
 const PREFERS_USER_LEVEL: bool = true;
 
+/// The scope a caller requests for `install`/`uninstall`/`start`/`stop` — mirrors dig-node's
+/// `--scope` flag exactly (dig_ecosystem#526) so `dig-installer` emits one argument form for both
+/// components. `Auto` (the default, unchanged behaviour) resolves from privilege via
+/// [`resolve_scope`]; `System`/`User` are explicit overrides an operator can force.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScopeChoice {
+    #[default]
+    Auto,
+    System,
+    User,
+}
+
+/// The concrete scope a service ends up registered at, after [`resolve_scope`] applies privilege +
+/// platform constraints to a [`ScopeChoice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceScope {
+    System,
+    User,
+}
+
+/// Decide the concrete [`ServiceScope`] for an install/uninstall/start/stop call. PURE — every input
+/// is a parameter (no `cfg!`, no `geteuid()`, no filesystem), so the full decision table is testable
+/// on any host with no privileges.
+///
+/// - An explicit `System`/`User` choice is AUTHORITATIVE and always wins, on every platform.
+/// - `os_supports_user == false` (Windows, which has no per-user service manager) forces `System`
+///   even under `Auto` — matching the existing SCM-only-at-system-level behaviour.
+/// - `Auto` on a platform that supports user-level services resolves by privilege: `System` when
+///   running as root (an elevated `dig-installer` needs a service that survives reboot with no login
+///   session — systemd `--user`/launchd per-user agents have neither under `sudo`), else `User`
+///   (today's unelevated default, unchanged).
+pub fn resolve_scope(choice: ScopeChoice, os_supports_user: bool, is_root: bool) -> ServiceScope {
+    match choice {
+        ScopeChoice::System => ServiceScope::System,
+        ScopeChoice::User => ServiceScope::User,
+        ScopeChoice::Auto => {
+            if !os_supports_user || is_root {
+                ServiceScope::System
+            } else {
+                ServiceScope::User
+            }
+        }
+    }
+}
+
 /// A human summary + a machine-readable JSON result for a service operation (so the CLI can emit
 /// either pretty text or `--json`).
 #[derive(Debug, Clone)]
@@ -48,20 +93,49 @@ impl Outcome {
     }
 }
 
+/// Is this process running as root? Used to pick `System` scope under `Auto` (dig_ecosystem#526):
+/// an elevated `dig-installer` runs Linux/macOS installs as root, where systemd `--user`/launchd
+/// per-user agents have no session to register into, so `Auto` must resolve to `System` there.
+/// Mirrors [`is_elevated`]'s Administrator check on Windows (where every account able to install a
+/// service is already "system-capable", so `Auto` forces `System` via `os_supports_user` instead —
+/// see [`resolve_scope`]).
+#[cfg(unix)]
+fn is_root() -> bool {
+    // SAFETY: `geteuid` takes no arguments and cannot fail; it is part of the platform's libc,
+    // already linked into every Unix Rust binary.
+    unsafe { geteuid() == 0 }
+}
+#[cfg(unix)]
+extern "C" {
+    fn geteuid() -> u32;
+}
+#[cfg(windows)]
+fn is_root() -> bool {
+    is_elevated()
+}
+
+/// Acquire the native service manager fixed at the given [`ServiceScope`] — used by every
+/// scope-aware call so `install`/`uninstall`/`start`/`stop` all target the same resolved scope
+/// (dig_ecosystem#526). `System` is the manager's baseline level, so it needs no explicit
+/// `set_level` call; `User` calls `set_level(ServiceLevel::User)`, which is a no-op inside `manager`
+/// but here surfaces a real error on a platform with no user-level manager (Windows) instead of
+/// silently installing at system scope under a `User` request.
+fn manager_at(scope: ServiceScope) -> std::io::Result<Box<dyn ServiceManager>> {
+    let mut mgr = <dyn ServiceManager>::native()?;
+    if scope == ServiceScope::User {
+        mgr.set_level(ServiceLevel::User).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("dig-relay: this platform has no user-level service manager: {e}"),
+            )
+        })?;
+    }
+    Ok(mgr)
+}
+
 fn label() -> std::io::Result<ServiceLabel> {
     ServiceLabel::from_str(SERVICE_LABEL)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))
-}
-
-/// Acquire the native service manager at user level where supported (Linux/macOS), else system
-/// (Windows). Returns the manager + whether it operates at user level (for messaging).
-fn manager() -> std::io::Result<(Box<dyn ServiceManager>, bool)> {
-    let mut mgr = <dyn ServiceManager>::native()?;
-    let mut user_level = false;
-    if PREFERS_USER_LEVEL && mgr.set_level(ServiceLevel::User).is_ok() {
-        user_level = true;
-    }
-    Ok((mgr, user_level))
 }
 
 fn current_exe() -> std::io::Result<std::path::PathBuf> {
@@ -105,9 +179,56 @@ fn tls_environment_pairs(config: &RelayServerConfig) -> Vec<(String, String)> {
     }
 }
 
+/// Which scope(s) `uninstall` should remove. PURE, same shape as [`resolve_scope`] — every input is
+/// a parameter, so it is testable with no privileges. `Auto` under root removes BOTH scopes (an
+/// elevated caller can't know which scope a prior install used, and a registration left behind at
+/// the other scope is the dig_ecosystem#1863 defect class); every other combination removes exactly
+/// the one scope [`resolve_scope`] would pick.
+fn uninstall_scopes(
+    choice: ScopeChoice,
+    os_supports_user: bool,
+    is_root: bool,
+) -> Vec<ServiceScope> {
+    if choice == ScopeChoice::Auto && is_root {
+        vec![ServiceScope::System, ServiceScope::User]
+    } else {
+        vec![resolve_scope(choice, os_supports_user, is_root)]
+    }
+}
+
+/// The other [`ServiceScope`] — the one [`install`]'s cross-scope migration deregisters from before
+/// registering at the requested scope.
+fn other_scope(scope: ServiceScope) -> ServiceScope {
+    match scope {
+        ServiceScope::System => ServiceScope::User,
+        ServiceScope::User => ServiceScope::System,
+    }
+}
+
+/// Best-effort remove this service's registration at `scope`, swallowing any error (there may
+/// genuinely be nothing registered there, or the platform may have no manager at that scope). Used
+/// by [`install`]'s cross-scope migration so a host upgrading from a prior install at the other
+/// scope never ends up with two registrations both binding the relay's ports.
+fn deregister_at(scope: ServiceScope) {
+    if let Ok(mgr) = manager_at(scope) {
+        let _ = mgr.stop(ServiceStopCtx {
+            label: label().expect("SERVICE_LABEL is a constant, always parses"),
+        });
+        let _ = mgr.uninstall(ServiceUninstallCtx {
+            label: label().expect("SERVICE_LABEL is a constant, always parses"),
+        });
+    }
+}
+
 /// Install the relay as an auto-starting OS service that runs `dig-relay serve` on the configured
 /// listen addrs. The listen/health addrs are passed as env so the service serves identically.
-pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
+///
+/// `scope` picks WHERE it registers (dig_ecosystem#526): `Auto` resolves to `System` when running
+/// as root (an elevated `dig-installer` needs reboot survival with no login session — see
+/// [`resolve_scope`]) or on Windows (no user-level SCM), else `User` (unchanged default). Before
+/// registering, this best-effort deregisters the OTHER scope so a host upgrading from a prior
+/// install there doesn't end up with two registrations both binding the relay's ports.
+pub fn install(config: &RelayServerConfig, scope: ScopeChoice) -> std::io::Result<Outcome> {
     if cfg!(windows) && !is_elevated() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -116,7 +237,9 @@ pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
         ));
     }
 
-    let (mgr, user_level) = manager()?;
+    let resolved = resolve_scope(scope, PREFERS_USER_LEVEL, is_root());
+    deregister_at(other_scope(resolved));
+    let mgr = manager_at(resolved)?;
     let program = current_exe()?;
 
     let mut environment = vec![
@@ -199,9 +322,9 @@ pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
         autostart: true,
     })?;
 
-    let scope = if user_level { "user" } else { "system" };
+    let scope_str = scope_label(resolved);
     let summary = format!(
-        "dig-relay: installed as a {scope}-level service \"{SERVICE_LABEL}\"\n  \
+        "dig-relay: installed as a {scope_str}-level service \"{SERVICE_LABEL}\"\n  \
          program: {}\n  relay:   ws://{}\n  health:  http://{}\n  \
          Start it now with: dig-relay start",
         program.display(),
@@ -215,7 +338,7 @@ pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
             "registered": true,
             "started": false,
             "label": SERVICE_LABEL,
-            "scope": scope,
+            "scope": scope_str,
             "program": program.display().to_string(),
             "listen": config.listen.to_string(),
             "health_listen": config.health_listen.to_string(),
@@ -223,40 +346,96 @@ pub fn install(config: &RelayServerConfig) -> std::io::Result<Outcome> {
     ))
 }
 
+/// The lowercase scope name used in `Outcome` summaries/JSON — matches dig-node's wording exactly
+/// (dig_ecosystem#526) so tooling parsing either component's output sees one vocabulary.
+fn scope_label(scope: ServiceScope) -> &'static str {
+    match scope {
+        ServiceScope::System => "system",
+        ServiceScope::User => "user",
+    }
+}
+
 /// Uninstall the relay service (best-effort stop first).
-pub fn uninstall() -> std::io::Result<Outcome> {
+///
+/// `Auto` under root removes the service at BOTH scopes — a stale registration silently left
+/// behind at the other scope is the defect class of dig_ecosystem#1863 (it can still bind the
+/// relay's ports even though `dig-relay status` looks clean). Each scope's outcome is best-effort
+/// and reported independently; an explicit `System`/`User` choice removes only that one scope.
+pub fn uninstall(scope: ScopeChoice) -> std::io::Result<Outcome> {
     if cfg!(windows) && !is_elevated() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "dig-relay: uninstalling a Windows service requires an elevated (Administrator) console.",
         ));
     }
-    let (mgr, _user) = manager()?;
-    let _ = mgr.stop(ServiceStopCtx { label: label()? });
-    mgr.uninstall(ServiceUninstallCtx { label: label()? })?;
+
+    let scopes = uninstall_scopes(scope, PREFERS_USER_LEVEL, is_root());
+
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    for s in scopes {
+        match manager_at(s) {
+            Ok(mgr) => {
+                let _ = mgr.stop(ServiceStopCtx {
+                    label: label().expect("SERVICE_LABEL is a constant, always parses"),
+                });
+                match mgr.uninstall(ServiceUninstallCtx { label: label()? }) {
+                    Ok(()) => removed.push(scope_label(s)),
+                    Err(e) => failed.push((scope_label(s), e.to_string())),
+                }
+            }
+            Err(e) => failed.push((scope_label(s), e.to_string())),
+        }
+    }
+
+    let summary = if failed.is_empty() {
+        format!(
+            "dig-relay: uninstalled service \"{SERVICE_LABEL}\" ({} scope(s): {})",
+            removed.len(),
+            removed.join(", ")
+        )
+    } else {
+        format!(
+            "dig-relay: uninstalled \"{SERVICE_LABEL}\" at [{}]; could not remove at [{}]",
+            removed.join(", "),
+            failed
+                .iter()
+                .map(|(s, e)| format!("{s}: {e}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    };
     Ok(Outcome::new(
-        format!("dig-relay: uninstalled service \"{SERVICE_LABEL}\""),
-        json!({ "installed": false, "registered": false, "label": SERVICE_LABEL }),
+        summary,
+        json!({
+            "installed": false,
+            "registered": !removed.is_empty(),
+            "label": SERVICE_LABEL,
+            "removed_scopes": removed,
+            "failed_scopes": failed.iter().map(|(s, e)| json!({"scope": s, "error": e})).collect::<Vec<_>>(),
+        }),
     ))
 }
 
-/// Start the installed service.
-pub fn start() -> std::io::Result<Outcome> {
-    let (mgr, _user) = manager()?;
+/// Start the installed service at the resolved scope.
+pub fn start(scope: ScopeChoice) -> std::io::Result<Outcome> {
+    let resolved = resolve_scope(scope, PREFERS_USER_LEVEL, is_root());
+    let mgr = manager_at(resolved)?;
     mgr.start(ServiceStartCtx { label: label()? })?;
     Ok(Outcome::new(
         format!("dig-relay: start requested for \"{SERVICE_LABEL}\""),
-        json!({ "started": true, "label": SERVICE_LABEL }),
+        json!({ "started": true, "label": SERVICE_LABEL, "scope": scope_label(resolved) }),
     ))
 }
 
-/// Stop the running service.
-pub fn stop() -> std::io::Result<Outcome> {
-    let (mgr, _user) = manager()?;
+/// Stop the running service at the resolved scope.
+pub fn stop(scope: ScopeChoice) -> std::io::Result<Outcome> {
+    let resolved = resolve_scope(scope, PREFERS_USER_LEVEL, is_root());
+    let mgr = manager_at(resolved)?;
     mgr.stop(ServiceStopCtx { label: label()? })?;
     Ok(Outcome::new(
         format!("dig-relay: stop requested for \"{SERVICE_LABEL}\""),
-        json!({ "stopped": true, "label": SERVICE_LABEL }),
+        json!({ "stopped": true, "label": SERVICE_LABEL, "scope": scope_label(resolved) }),
     ))
 }
 
@@ -533,6 +712,79 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// The full `(ScopeChoice x os_supports_user x is_root)` decision table — 12 rows, all runnable
+    /// with no privileges on any host. This is the primary evidence for the scope-resolution
+    /// contract (dig_ecosystem#526): explicit choices are always authoritative, `Auto` follows
+    /// privilege except where the platform has no user-level manager at all.
+    #[test]
+    fn resolve_scope_covers_every_combination() {
+        use ScopeChoice as C;
+        use ServiceScope as S;
+        let cases = [
+            // (choice, os_supports_user, is_root) -> expected
+            (C::Auto, true, true, S::System), // root on a user-capable OS -> system (reboot survival)
+            (C::Auto, true, false, S::User), // unelevated on a user-capable OS -> user (unchanged default)
+            (C::Auto, false, true, S::System), // Windows, root -> system
+            (C::Auto, false, false, S::System), // Windows, unelevated -> system (no user-level SCM)
+            (C::System, true, true, S::System),
+            (C::System, true, false, S::System), // explicit System always wins, even unelevated
+            (C::System, false, true, S::System),
+            (C::System, false, false, S::System),
+            (C::User, true, true, S::User), // explicit User always wins, even as root
+            (C::User, true, false, S::User),
+            (C::User, false, true, S::User), // explicit User wins even where the OS has no user manager
+            (C::User, false, false, S::User),
+        ];
+        for (choice, os_supports_user, is_root, expected) in cases {
+            let actual = resolve_scope(choice, os_supports_user, is_root);
+            assert_eq!(
+                actual, expected,
+                "resolve_scope({choice:?}, os_supports_user={os_supports_user}, is_root={is_root}) \
+                 = {actual:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    /// `Auto` under root is the ONE case that must remove both scopes — a fixture that varies only
+    /// `is_root` (holding choice=Auto, os_supports_user=true) distinguishes it from every
+    /// single-scope path, which is what a wrong "always uninstall both" implementation would miss.
+    #[test]
+    fn uninstall_scopes_removes_both_only_for_auto_as_root() {
+        assert_eq!(
+            uninstall_scopes(ScopeChoice::Auto, true, true),
+            vec![ServiceScope::System, ServiceScope::User],
+            "auto + root must remove both scopes, or a prior install at the other scope survives \
+             uninstall (dig_ecosystem#1863)"
+        );
+        assert_eq!(
+            uninstall_scopes(ScopeChoice::Auto, true, false),
+            vec![ServiceScope::User],
+            "auto + unelevated removes only the scope an unelevated install would have used"
+        );
+        assert_eq!(
+            uninstall_scopes(ScopeChoice::System, true, true),
+            vec![ServiceScope::System],
+            "an explicit scope never widens to both, even under root"
+        );
+        assert_eq!(
+            uninstall_scopes(ScopeChoice::User, true, true),
+            vec![ServiceScope::User],
+            "an explicit User choice removes only User, even under root"
+        );
+    }
+
+    #[test]
+    fn other_scope_is_the_opposite() {
+        assert_eq!(other_scope(ServiceScope::System), ServiceScope::User);
+        assert_eq!(other_scope(ServiceScope::User), ServiceScope::System);
+    }
+
+    #[test]
+    fn scope_label_matches_dig_node_wording() {
+        assert_eq!(scope_label(ServiceScope::System), "system");
+        assert_eq!(scope_label(ServiceScope::User), "user");
     }
 
     #[test]

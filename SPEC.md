@@ -546,6 +546,25 @@ listeners are UNAFFECTED by this setting; only the relay WebSocket listener term
   (launchd); system-level only on Windows (SCM), requiring an elevated console for
   install/uninstall. `status` never hard-errors — an unreachable health endpoint is reported as
   `serving: false`, not a process error.
+- **Scope-explicit registration (`--scope <auto|system|user>`, default `auto`).** `install`,
+  `uninstall`, `start`, and `stop` all accept `--scope`, resolved by the pure decision function
+  `service::resolve_scope(choice, os_supports_user, is_root)`:
+  - An explicit `system`/`user` choice is AUTHORITATIVE on every platform.
+  - `auto` on Windows (no user-level SCM) always resolves to `system` — unchanged from before this
+    flag existed.
+  - `auto` on Linux/macOS resolves to `system` when the caller is root, else `user` (today's
+    unelevated default, unchanged). This exists so an **elevated** `dig-installer` install survives a
+    reboot: root has no systemd `--user`/launchd per-user session to register a user-level unit
+    into, so a user-level registration made under `sudo` does not come back after a reboot. Only a
+    unit under `/etc/systemd/system/` (+ `multi-user.target.wants/`) or `/Library/LaunchDaemons`
+    (`RunAtLoad`) survives with no login session.
+  - `install` best-effort deregisters the service at the OTHER scope before registering at the
+    resolved one, so a host upgrading from a prior install at the other scope never ends up with
+    two registrations both binding the relay's listen/health/dashboard/STUN ports.
+  - `uninstall --scope auto` run as root removes the service at BOTH scopes (system AND user),
+    reporting per-scope success/failure independently — a registration silently left behind at the
+    scope not targeted is a defect (dig_ecosystem#1863's class), not an acceptable partial removal.
+  - No flag == `auto` == today's behaviour; a caller that never passes `--scope` sees no change.
 
 ## 10. Conformance
 
