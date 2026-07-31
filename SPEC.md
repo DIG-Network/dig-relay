@@ -549,21 +549,43 @@ listeners are UNAFFECTED by this setting; only the relay WebSocket listener term
 - **Scope-explicit registration (`--scope <auto|system|user>`, default `auto`).** `install`,
   `uninstall`, `start`, and `stop` all accept `--scope`, resolved by the pure decision function
   `service::resolve_scope(choice, os_supports_user, is_root)`:
-  - An explicit `system`/`user` choice is AUTHORITATIVE on every platform.
-  - `auto` on Windows (no user-level SCM) always resolves to `system` — unchanged from before this
-    flag existed.
+  - Windows (no user-level SCM) always resolves to `system`, for EVERY choice: the platform has
+    exactly one scope, so even an explicit `--scope user` cannot be honoured and resolves to
+    `system` rather than failing. Byte-identical to `dig-node`, so one installer argument form
+    behaves the same for both components.
+  - On a platform WITH a user scope, an explicit `system`/`user` choice is AUTHORITATIVE — never
+    silently overridden by the privilege level.
   - `auto` on Linux/macOS resolves to `system` when the caller is root, else `user` (today's
     unelevated default, unchanged). This exists so an **elevated** `dig-installer` install survives a
     reboot: root has no systemd `--user`/launchd per-user session to register a user-level unit
     into, so a user-level registration made under `sudo` does not come back after a reboot. Only a
     unit under `/etc/systemd/system/` (+ `multi-user.target.wants/`) or `/Library/LaunchDaemons`
     (`RunAtLoad`) survives with no login session.
-  - `install` best-effort deregisters the service at the OTHER scope before registering at the
-    resolved one, so a host upgrading from a prior install at the other scope never ends up with
-    two registrations both binding the relay's listen/health/dashboard/STUN ports.
-  - `uninstall --scope auto` run as root removes the service at BOTH scopes (system AND user),
-    reporting per-scope success/failure independently — a registration silently left behind at the
-    scope not targeted is a defect (dig_ecosystem#1863's class), not an acceptable partial removal.
+  - `install` REFUSES a registration the caller cannot make, BEFORE any side effect: a system-scope
+    install by a non-root caller on Linux/macOS returns `PermissionDenied` naming the alternatives
+    and leaves every existing registration intact. It MUST NOT tear down a working registration
+    ahead of a create that was never going to succeed.
+  - `install` then deregisters the OTHER scope before registering at the resolved one, so a host
+    upgrading from a prior install at the other scope does not end up with two registrations both
+    binding the relay's listen/health/dashboard/STUN ports. That sweep is **probe-gated** (a scope
+    the probe did not positively see is never written to) and **best-effort but REPORTED**: its
+    result is carried in `result.migration` and in the summary. The probe is advisory, not
+    authoritative — a `systemctl --user` / `launchctl print gui/<uid>/…` issued from a root session
+    addresses root's own user domain, so a sweep run under `sudo` may not see (and therefore may not
+    clear) a desktop user's user-level registration. The install reports what it saw; it does not
+    promise the other scope is clean.
+  - `uninstall --scope auto` removes the service at BOTH scopes (system AND user) at EITHER
+    privilege level, resolved scope first: a plain unelevated `dig-relay uninstall` on a host an
+    elevated installer registered at system scope MUST still address that system unit. The named
+    scope is removed unconditionally (the OS delete is authoritative, so a probe false-negative can
+    never make the removal a no-op); the swept second scope is probe-gated.
+  - `uninstall` FAILS LOUDLY on anything less than a complete removal: any scope found-but-not-
+    removed, or whose state could not be determined, returns `PermissionDenied`; nothing removed
+    anywhere returns `NotFound`. A registration silently left behind at the scope not targeted is a
+    defect (dig_ecosystem#1863's class), not an acceptable partial removal, and is never reported
+    through a success exit code or an `ok: true` envelope. On success the JSON reports
+    `registered: false` (the field means "is it still registered") plus `removed_scopes` and a
+    per-scope `scopes` array.
   - No flag == `auto` == today's behaviour; a caller that never passes `--scope` sees no change.
 
 ## 10. Conformance

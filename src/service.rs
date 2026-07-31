@@ -55,25 +55,51 @@ pub enum ServiceScope {
 /// is a parameter (no `cfg!`, no `geteuid()`, no filesystem), so the full decision table is testable
 /// on any host with no privileges.
 ///
-/// - An explicit `System`/`User` choice is AUTHORITATIVE and always wins, on every platform.
-/// - `os_supports_user == false` (Windows, which has no per-user service manager) forces `System`
-///   even under `Auto` — matching the existing SCM-only-at-system-level behaviour.
-/// - `Auto` on a platform that supports user-level services resolves by privilege: `System` when
-///   running as root (an elevated `dig-installer` needs a service that survives reboot with no login
-///   session — systemd `--user`/launchd per-user agents have neither under `sudo`), else `User`
-///   (today's unelevated default, unchanged).
+/// - `os_supports_user == false` (Windows SCM, which has no per-user service manager) ⇒ always
+///   `System`. The platform is checked FIRST: there is exactly one scope, so even an explicit
+///   `--scope user` cannot be honoured — it resolves to `System` rather than hard-failing, so one
+///   installer argument form behaves identically on every OS (dig_ecosystem#526).
+/// - Otherwise an explicit `System`/`User` choice is AUTHORITATIVE and always wins, never silently
+///   overridden by the privilege level. (Whether the caller MAY register there is the separate,
+///   loudly-reported question [`ensure_privilege_for_scope`] answers.)
+/// - `Auto` resolves by privilege: `System` when running as root (an elevated `dig-installer` needs
+///   a service that survives reboot with no login session — systemd `--user`/launchd per-user agents
+///   have neither under `sudo`), else `User` (today's unelevated default, unchanged).
 pub fn resolve_scope(choice: ScopeChoice, os_supports_user: bool, is_root: bool) -> ServiceScope {
+    if !os_supports_user {
+        return ServiceScope::System;
+    }
     match choice {
         ScopeChoice::System => ServiceScope::System,
         ScopeChoice::User => ServiceScope::User,
-        ScopeChoice::Auto => {
-            if !os_supports_user || is_root {
-                ServiceScope::System
-            } else {
-                ServiceScope::User
-            }
-        }
+        ScopeChoice::Auto if is_root => ServiceScope::System,
+        ScopeChoice::Auto => ServiceScope::User,
     }
+}
+
+/// Refuse a system-scope registration the caller cannot actually make, BEFORE anything is written —
+/// rather than failing cryptically deep inside `systemctl`/`launchctl` after the cross-scope
+/// migration has already torn down a working registration, and rather than silently downgrading to
+/// user scope (which on a headless host would not survive a reboot: exactly the defect #526 fixes).
+/// PURE, so the policy is table-tested on any host at any privilege level.
+///
+/// Windows is exempt: it has no user scope, and its elevation requirement is reported by its own SCM
+/// gate ([`is_elevated`]) with Windows-specific advice.
+fn ensure_privilege_for_scope(
+    scope: ServiceScope,
+    os_supports_user: bool,
+    is_root: bool,
+) -> std::io::Result<()> {
+    if !os_supports_user || scope == ServiceScope::User || is_root {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "dig-relay: registering a system-level (machine-wide, boot-started) service requires root. \
+         Re-run with `sudo dig-relay install --scope system`, or install at user scope \
+         (`--scope user`) — noting that a user-scope service only starts with your login session \
+         and so may not come back after a reboot on a headless host.",
+    ))
 }
 
 /// A human summary + a machine-readable JSON result for a service operation (so the CLI can emit
@@ -179,21 +205,25 @@ fn tls_environment_pairs(config: &RelayServerConfig) -> Vec<(String, String)> {
     }
 }
 
-/// Which scope(s) `uninstall` should remove. PURE, same shape as [`resolve_scope`] — every input is
-/// a parameter, so it is testable with no privileges. `Auto` under root removes BOTH scopes (an
-/// elevated caller can't know which scope a prior install used, and a registration left behind at
-/// the other scope is the dig_ecosystem#1863 defect class); every other combination removes exactly
-/// the one scope [`resolve_scope`] would pick.
+/// The scopes `uninstall` must sweep, in the order to sweep them. PURE, same shape as
+/// [`resolve_scope`] — every input is a parameter, so the table is testable with no privileges.
+///
+/// An explicit choice removes exactly what was named. **`Auto` sweeps BOTH scopes** (the resolved
+/// one first) on a user-capable OS, REGARDLESS of privilege: a plain `dig-relay uninstall` run by an
+/// operator or an uninstall script must not exit 0 having left a system unit that keeps auto-starting
+/// at every boot and re-binding the relay's ports (the dig_ecosystem#1863 defect class). Sweeping is
+/// safe because the non-requested scope is PROBED before anything is deleted
+/// ([`RemovalMode::Swept`]), so a scope holding nothing is never written to.
 fn uninstall_scopes(
     choice: ScopeChoice,
     os_supports_user: bool,
     is_root: bool,
 ) -> Vec<ServiceScope> {
-    if choice == ScopeChoice::Auto && is_root {
-        vec![ServiceScope::System, ServiceScope::User]
-    } else {
-        vec![resolve_scope(choice, os_supports_user, is_root)]
+    let requested = resolve_scope(choice, os_supports_user, is_root);
+    if !os_supports_user || choice != ScopeChoice::Auto {
+        return vec![requested];
     }
+    vec![requested, other_scope(requested)]
 }
 
 /// The other [`ServiceScope`] — the one [`install`]'s cross-scope migration deregisters from before
@@ -205,19 +235,364 @@ fn other_scope(scope: ServiceScope) -> ServiceScope {
     }
 }
 
-/// Best-effort remove this service's registration at `scope`, swallowing any error (there may
-/// genuinely be nothing registered there, or the platform may have no manager at that scope). Used
-/// by [`install`]'s cross-scope migration so a host upgrading from a prior install at the other
-/// scope never ends up with two registrations both binding the relay's ports.
-fn deregister_at(scope: ServiceScope) {
-    if let Ok(mgr) = manager_at(scope) {
-        let _ = mgr.stop(ServiceStopCtx {
-            label: label().expect("SERVICE_LABEL is a constant, always parses"),
-        });
-        let _ = mgr.uninstall(ServiceUninstallCtx {
-            label: label().expect("SERVICE_LABEL is a constant, always parses"),
-        });
+/// What to register at a scope: the program the SCM/launchd/systemd runs plus the environment that
+/// reproduces the caller's [`RelayServerConfig`], so the installed service serves identically to the
+/// `serve` that installed it. Separated from the OS call so [`install_at_scope`]'s ORDER is
+/// unit-tested against a recording mock and CI never registers a real service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallPlan {
+    program: std::path::PathBuf,
+    args: Vec<OsString>,
+    environment: Vec<(String, String)>,
+    autostart: bool,
+}
+
+/// The four primitive OS-service operations the scope-aware flows compose. Behind a trait so the
+/// removal policy ([`remove_registration`]) and the migration ORDER ([`install_at_scope`]) are
+/// provable with a mock — the real implementation is [`RelayServiceBackend`].
+trait ServiceBackend {
+    /// Is this service registered at this backend's scope? Advisory — see [`ScopeRemoval`].
+    fn is_installed(&self) -> std::io::Result<bool>;
+    fn stop(&self) -> std::io::Result<()>;
+    fn delete(&self) -> std::io::Result<()>;
+    fn create(&self, plan: &InstallPlan) -> std::io::Result<()>;
+}
+
+/// What a per-scope removal attempt did — the reporting unit for the cross-scope migration
+/// ([`install_at_scope`]) and for [`uninstall`].
+///
+/// `found` (what the PROBE saw) and `removed` (what the OS deregistration actually did) are
+/// deliberately separate, because **the probe is advisory and the deregistration is authoritative**:
+/// `systemctl --user` / `launchctl print gui/<uid>/…` issued from a root session address ROOT's own
+/// user domain, never the desktop user's — so a probe can false-negative on a registration that
+/// genuinely exists. Only `removed` proves anything; `found` explains; `indeterminate` admits when
+/// absence was never established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeRemoval {
+    /// The scope this attempt addressed.
+    pub scope: ServiceScope,
+    /// The probe SAW a registration here. Advisory only — `false` does NOT prove absence.
+    pub found: bool,
+    /// The OS deregistration succeeded. The authoritative signal.
+    pub removed: bool,
+    /// Absence was never established: the probe could not answer AND the removal did not succeed —
+    /// so whether a registration remains is UNKNOWN, and must never be reported as a clean uninstall.
+    pub indeterminate: bool,
+    /// Why the probe or the removal failed, when one did. `None` on success and on a clean
+    /// "nothing registered here".
+    pub error: Option<String>,
+}
+
+impl ScopeRemoval {
+    /// The removal attempt that never ran because the scope could not be addressed at all. A
+    /// [`RemovalMode::Requested`] scope is left INDETERMINATE (the caller asked for it and we cannot
+    /// say what is there); a swept scope is not (a platform with no manager at that scope holds no
+    /// registration there to leave behind).
+    fn unreachable(scope: ServiceScope, mode: RemovalMode, error: String) -> Self {
+        ScopeRemoval {
+            scope,
+            found: false,
+            removed: false,
+            indeterminate: mode == RemovalMode::Requested,
+            error: Some(error),
+        }
     }
+
+    /// A machine-readable record of this attempt for the `--json` envelope (CLAUDE.md §6.2).
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "scope": scope_label(self.scope),
+            "found": self.found,
+            "removed": self.removed,
+            "indeterminate": self.indeterminate,
+            "error": self.error,
+        })
+    }
+}
+
+/// How hard to try at a scope — the distinction that keeps a probe false-negative from turning a
+/// requested removal into a silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalMode {
+    /// The scope the operator NAMED (or that `Auto` resolved to). Deregistered UNCONDITIONALLY: the
+    /// OS removal call is the authority, so a probe that wrongly reports absence can never turn the
+    /// uninstall into a no-op. This is also the pre-#526 behaviour, which always called delete.
+    Requested,
+    /// A scope being swept for a stale registration nobody asked about (the other scope during
+    /// [`install`], the second scope under `uninstall --scope auto`). PROBE-GATED: nothing is written
+    /// unless a registration is actually seen, so a sweep never disturbs an unrelated scope.
+    Swept,
+}
+
+/// Deregister the service at ONE scope, best-effort, reporting exactly what happened.
+///
+/// Never returns `Err`: the caller decides which combination of per-scope outcomes is fatal (a stale
+/// swept registration is not; a named scope left behind is). See [`RemovalMode`] for why a
+/// `Requested` scope is removed without trusting the probe.
+fn remove_registration<B: ServiceBackend + ?Sized>(
+    backend: &B,
+    scope: ServiceScope,
+    mode: RemovalMode,
+) -> ScopeRemoval {
+    let mut removal = ScopeRemoval {
+        scope,
+        found: false,
+        removed: false,
+        indeterminate: false,
+        error: None,
+    };
+    let probe = backend.is_installed();
+    match &probe {
+        Ok(found) => removal.found = *found,
+        Err(e) => {
+            removal.error = Some(format!("could not determine whether it is registered: {e}"))
+        }
+    }
+    // A sweep touches nothing it did not positively see — an unrelated scope must never be written
+    // to on the strength of a guess. A probe FAILURE leaves the swept scope indeterminate: absence
+    // was not established, and the caller reports that rather than assuming it is clean.
+    if mode == RemovalMode::Swept && !removal.found {
+        removal.indeterminate = probe.is_err();
+        return removal;
+    }
+    // Best-effort stop first so nothing keeps holding the relay's ports past the deregistration.
+    let _ = backend.stop();
+    match backend.delete() {
+        Ok(()) => removal.removed = true,
+        Err(e) => {
+            // A failed delete at a scope the probe never saw a registration at is the ordinary
+            // "there was nothing here" case (the OS says so twice) — keep the reason for context,
+            // but only a scope we DID see, or could not read at all, is unresolved.
+            removal.indeterminate = probe.is_err() || removal.found;
+            removal.error = Some(e.to_string());
+        }
+    }
+    removal
+}
+
+/// Register at the requested scope, first clearing any registration at the OTHER scope.
+///
+/// **The other-scope sweep is a placement requirement, not a nicety.** A host upgrading from a prior
+/// user-level install to a system-level one would otherwise end up with TWO registrations, both
+/// starting a relay bound to the same ports; which one wins is a race, and the stale one can. So the
+/// other scope is deregistered BEFORE the requested one is created — never after, which would delete
+/// the registration just made.
+///
+/// The sweep is probe-gated and best-effort, and its result is RETURNED so the caller can report it:
+/// an install that could not clear a stale registration must not claim an unqualified success. The
+/// caller is responsible for refusing an impossible registration ([`ensure_privilege_for_scope`])
+/// BEFORE calling this, so the sweep never tears down a working registration ahead of a create that
+/// was never going to succeed. `other` is `None` where the platform has only one scope (Windows).
+fn install_at_scope<T: ServiceBackend, O: ServiceBackend>(
+    target: &T,
+    other: Option<(&O, ServiceScope)>,
+    plan: &InstallPlan,
+) -> std::io::Result<Option<ScopeRemoval>> {
+    let migration =
+        other.map(|(backend, scope)| remove_registration(backend, scope, RemovalMode::Swept));
+    target.create(plan)?;
+    Ok(migration)
+}
+
+/// Turn per-scope removal results into the `uninstall` [`Outcome`], failing LOUDLY on anything less
+/// than a complete removal. PURE, so every reporting row is table-tested with no OS involved.
+///
+/// * Any scope found-but-not-removed, or left indeterminate ⇒ `Err(PermissionDenied)`: an uninstall
+///   that leaves a registration behind — or cannot tell whether it did — must never report success,
+///   which is how a "removed" relay keeps starting at boot and re-binding 9450/9451.
+/// * Nothing removed anywhere, and nothing unresolved ⇒ `Err(NotFound)`: there was nothing to
+///   uninstall. Any removal error collected along the way is carried as context.
+/// * Otherwise ⇒ success, naming every scope removed. `registered` is then unconditionally `false`
+///   — the field means "is it still registered", which a successful uninstall answers `no`.
+fn uninstall_outcome(removals: Vec<ScopeRemoval>) -> std::io::Result<Outcome> {
+    let removed: Vec<&'static str> = removals
+        .iter()
+        .filter(|r| r.removed)
+        .map(|r| scope_label(r.scope))
+        .collect();
+    let problems: Vec<String> = removals
+        .iter()
+        .filter(|r| r.indeterminate || (r.found && !r.removed))
+        .map(|r| {
+            let why = r.error.as_deref().unwrap_or("removal did not take effect");
+            format!("{} scope: {why}", scope_label(r.scope))
+        })
+        .collect();
+
+    if !problems.is_empty() {
+        let removed_note = if removed.is_empty() {
+            "nothing was removed".to_string()
+        } else {
+            format!("removed at: {}", removed.join(", "))
+        };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "dig-relay: could not fully uninstall service \"{SERVICE_LABEL}\" ({removed_note}). \
+                 Unresolved: {}. Re-run elevated (e.g. `sudo dig-relay uninstall --scope system`) — \
+                 a registration left behind will keep starting the relay.",
+                problems.join("; ")
+            ),
+        ));
+    }
+    if removed.is_empty() {
+        let scopes = removals
+            .iter()
+            .map(|r| scope_label(r.scope))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        let reasons = removals
+            .iter()
+            .filter_map(|r| {
+                r.error
+                    .as_deref()
+                    .map(|e| format!("{} scope: {e}", scope_label(r.scope)))
+            })
+            .collect::<Vec<_>>();
+        let mut msg = format!(
+            "dig-relay: no service registration for \"{SERVICE_LABEL}\" was found at {scopes} \
+             scope — nothing to uninstall."
+        );
+        if !reasons.is_empty() {
+            msg.push_str(&format!(" ({})", reasons.join("; ")));
+        }
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
+    }
+    Ok(Outcome::new(
+        format!(
+            "dig-relay: uninstalled service \"{SERVICE_LABEL}\" at {} scope",
+            removed.join(" + ")
+        ),
+        json!({
+            "installed": false,
+            "registered": false,
+            "label": SERVICE_LABEL,
+            "removed_scopes": removed,
+            "scopes": removals.iter().map(ScopeRemoval::to_json).collect::<Vec<_>>(),
+        }),
+    ))
+}
+
+/// The native service manager pinned to ONE [`ServiceScope`] — every probe/create/delete addresses
+/// that scope only.
+struct RelayServiceBackend {
+    manager: Box<dyn ServiceManager>,
+    scope: ServiceScope,
+}
+
+impl RelayServiceBackend {
+    /// Acquire the native manager fixed at `scope`. A scope this platform cannot address is an
+    /// ERROR naming the scope — never a silent downgrade to the other one, which is how a requested
+    /// boot-surviving registration would quietly become a session-only one (#526).
+    fn new(scope: ServiceScope) -> std::io::Result<Self> {
+        Ok(RelayServiceBackend {
+            manager: manager_at(scope)?,
+            scope,
+        })
+    }
+}
+
+impl ServiceBackend for RelayServiceBackend {
+    fn is_installed(&self) -> std::io::Result<bool> {
+        query_installed(&os_native_service_name(&label()?), self.scope)
+    }
+
+    fn stop(&self) -> std::io::Result<()> {
+        self.manager.stop(ServiceStopCtx { label: label()? })
+    }
+
+    fn delete(&self) -> std::io::Result<()> {
+        self.manager
+            .uninstall(ServiceUninstallCtx { label: label()? })
+    }
+
+    fn create(&self, plan: &InstallPlan) -> std::io::Result<()> {
+        self.manager.install(ServiceInstallCtx {
+            label: label()?,
+            program: plan.program.clone(),
+            args: plan.args.clone(),
+            contents: None,
+            username: None,
+            working_directory: None,
+            environment: Some(plan.environment.clone()),
+            autostart: plan.autostart,
+        })
+    }
+}
+
+/// The identifier [`query_installed`] must probe the OS with — the SAME identifier
+/// `service-manager` registers the service under, which is **NOT uniformly
+/// [`ServiceLabel::to_qualified_name`]**: its Windows (`sc`) and launchd backends use the reverse-DNS
+/// qualified name, but its **systemd** backend derives the unit file name from `to_script_name()`
+/// (`dignetwork-dig-relay`, dropping the `net` qualifier). Probing systemd with the qualified name
+/// looks for a unit that never exists, so the probe would always report `false` and silently defeat
+/// the whole sweep. PURE, so the per-platform choice is asserted without touching the OS.
+fn os_native_service_name(label: &ServiceLabel) -> String {
+    if cfg!(all(unix, not(target_os = "macos"))) {
+        label.to_script_name()
+    } else {
+        label.to_qualified_name()
+    }
+}
+
+/// Probe whether `service_name` is registered AT `scope`. Windows SCM has exactly one scope, so
+/// `scope` carries no information there. An `Err` means the question could not be ANSWERED (the
+/// probe tool could not be run at all) — distinct from `Ok(false)`, "the OS says nothing is here".
+#[cfg(windows)]
+fn query_installed(service_name: &str, _scope: ServiceScope) -> std::io::Result<bool> {
+    // `sc query <name>` exits 0 when the service exists, 1060 (does-not-exist) otherwise.
+    std::process::Command::new("sc.exe")
+        .args(["query", service_name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+}
+
+/// macOS launchd existence probe: `launchctl print <domain>/<label>` exits 0 when the service is
+/// bootstrapped in that scope's domain.
+#[cfg(target_os = "macos")]
+fn query_installed(service_name: &str, scope: ServiceScope) -> std::io::Result<bool> {
+    let domain = if scope == ServiceScope::User {
+        format!("gui/{}/{}", unix_uid().unwrap_or(0), service_name)
+    } else {
+        format!("system/{service_name}")
+    };
+    std::process::Command::new("launchctl")
+        .args(["print", &domain])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+}
+
+/// Linux systemd existence probe: `systemctl [--user] cat <unit>` exits 0 when the unit file exists
+/// in that scope (non-zero "No files found" otherwise). `--user` addresses the per-user manager, its
+/// absence the system manager — the two hold DIFFERENT unit files, so the flag must track the scope
+/// being probed or the probe reports on the wrong registration.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn query_installed(service_name: &str, scope: ServiceScope) -> std::io::Result<bool> {
+    let unit = format!("{service_name}.service");
+    let mut cmd = std::process::Command::new("systemctl");
+    if scope == ServiceScope::User {
+        cmd.arg("--user");
+    }
+    cmd.args(["cat", &unit])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+}
+
+/// The effective uid via `id -u`, or `None` when it cannot be determined (the launchd domain target).
+#[cfg(target_os = "macos")]
+fn unix_uid() -> Option<u32> {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 /// Install the relay as an auto-starting OS service that runs `dig-relay serve` on the configured
@@ -225,9 +600,13 @@ fn deregister_at(scope: ServiceScope) {
 ///
 /// `scope` picks WHERE it registers (dig_ecosystem#526): `Auto` resolves to `System` when running
 /// as root (an elevated `dig-installer` needs reboot survival with no login session — see
-/// [`resolve_scope`]) or on Windows (no user-level SCM), else `User` (unchanged default). Before
-/// registering, this best-effort deregisters the OTHER scope so a host upgrading from a prior
-/// install there doesn't end up with two registrations both binding the relay's ports.
+/// [`resolve_scope`]) or on Windows (no user-level SCM), else `User` (unchanged default).
+///
+/// A registration the caller cannot actually make is refused BEFORE any side effect
+/// ([`ensure_privilege_for_scope`]); only then is the OTHER scope swept (probe-gated,
+/// [`install_at_scope`]) so a host upgrading from a prior install there doesn't end up with two
+/// registrations both binding the relay's ports. The sweep's result is REPORTED in the outcome — an
+/// install that could not clear a stale registration never claims an unqualified success.
 pub fn install(config: &RelayServerConfig, scope: ScopeChoice) -> std::io::Result<Outcome> {
     if cfg!(windows) && !is_elevated() {
         return Err(std::io::Error::new(
@@ -237,9 +616,12 @@ pub fn install(config: &RelayServerConfig, scope: ScopeChoice) -> std::io::Resul
         ));
     }
 
+    // Every fallible pre-condition is settled BEFORE the cross-scope sweep writes anything: an
+    // unprivileged `--scope system` must refuse outright, not first tear down the user-level
+    // registration that was working and then fail inside systemd (dig_ecosystem#526).
     let resolved = resolve_scope(scope, PREFERS_USER_LEVEL, is_root());
-    deregister_at(other_scope(resolved));
-    let mgr = manager_at(resolved)?;
+    ensure_privilege_for_scope(resolved, PREFERS_USER_LEVEL, is_root())?;
+    let target = RelayServiceBackend::new(resolved)?;
     let program = current_exe()?;
 
     let mut environment = vec![
@@ -311,19 +693,28 @@ pub fn install(config: &RelayServerConfig, scope: ScopeChoice) -> std::io::Resul
         "serve"
     };
 
-    mgr.install(ServiceInstallCtx {
-        label: label()?,
+    let plan = InstallPlan {
         program: program.clone(),
         args: vec![OsString::from(entry_arg)],
-        contents: None,
-        username: None,
-        working_directory: None,
-        environment: Some(environment),
+        environment,
         autostart: true,
-    })?;
+    };
+
+    // Only a platform WITH a second scope has anything to sweep; a scope whose manager cannot be
+    // acquired holds no registration this binary could have made, so there is nothing to clear.
+    let other = if PREFERS_USER_LEVEL {
+        RelayServiceBackend::new(other_scope(resolved)).ok()
+    } else {
+        None
+    };
+    let migration = install_at_scope(
+        &target,
+        other.as_ref().map(|b| (b, other_scope(resolved))),
+        &plan,
+    )?;
 
     let scope_str = scope_label(resolved);
-    let summary = format!(
+    let mut summary = format!(
         "dig-relay: installed as a {scope_str}-level service \"{SERVICE_LABEL}\"\n  \
          program: {}\n  relay:   ws://{}\n  health:  http://{}\n  \
          Start it now with: dig-relay start",
@@ -331,6 +722,25 @@ pub fn install(config: &RelayServerConfig, scope: ScopeChoice) -> std::io::Resul
         config.listen,
         config.health_listen,
     );
+    // A cleared stale registration is news, and so is one that could not be cleared — the latter
+    // leaves two registrations racing for the relay's ports, which is exactly what the sweep exists
+    // to prevent, so it must never be invisible.
+    if let Some(m) = &migration {
+        if m.removed {
+            summary.push_str(&format!(
+                "\n  migrated: removed the previous {}-level registration",
+                scope_label(m.scope)
+            ));
+        } else if m.found || m.indeterminate {
+            summary.push_str(&format!(
+                "\n  WARNING: a {}-level registration may still exist and could also bind these \
+                 ports ({}). Remove it with: dig-relay uninstall --scope {}",
+                scope_label(m.scope),
+                m.error.as_deref().unwrap_or("removal did not take effect"),
+                scope_label(m.scope),
+            ));
+        }
+    }
     Ok(Outcome::new(
         summary,
         json!({
@@ -342,6 +752,7 @@ pub fn install(config: &RelayServerConfig, scope: ScopeChoice) -> std::io::Resul
             "program": program.display().to_string(),
             "listen": config.listen.to_string(),
             "health_listen": config.health_listen.to_string(),
+            "migration": migration.as_ref().map(ScopeRemoval::to_json),
         }),
     ))
 }
@@ -357,10 +768,13 @@ fn scope_label(scope: ServiceScope) -> &'static str {
 
 /// Uninstall the relay service (best-effort stop first).
 ///
-/// `Auto` under root removes the service at BOTH scopes — a stale registration silently left
-/// behind at the other scope is the defect class of dig_ecosystem#1863 (it can still bind the
-/// relay's ports even though `dig-relay status` looks clean). Each scope's outcome is best-effort
-/// and reported independently; an explicit `System`/`User` choice removes only that one scope.
+/// `Auto` removes the service at BOTH scopes — a stale registration silently left behind at the
+/// other scope is the defect class of dig_ecosystem#1863 (it can still bind the relay's ports even
+/// though `dig-relay status` looks clean). An explicit `System`/`User` choice removes only that one
+/// scope, unconditionally; the swept second scope is probe-gated ([`RemovalMode`]).
+///
+/// **Fails loudly on anything less than a complete removal** ([`uninstall_outcome`]): found-but-not-
+/// removed, or "cannot tell", is an `Err`, never a success envelope.
 pub fn uninstall(scope: ScopeChoice) -> std::io::Result<Outcome> {
     if cfg!(windows) && !is_elevated() {
         return Err(std::io::Error::new(
@@ -369,52 +783,24 @@ pub fn uninstall(scope: ScopeChoice) -> std::io::Result<Outcome> {
         ));
     }
 
-    let scopes = uninstall_scopes(scope, PREFERS_USER_LEVEL, is_root());
-
-    let mut removed = Vec::new();
-    let mut failed = Vec::new();
-    for s in scopes {
-        match manager_at(s) {
-            Ok(mgr) => {
-                let _ = mgr.stop(ServiceStopCtx {
-                    label: label().expect("SERVICE_LABEL is a constant, always parses"),
-                });
-                match mgr.uninstall(ServiceUninstallCtx { label: label()? }) {
-                    Ok(()) => removed.push(scope_label(s)),
-                    Err(e) => failed.push((scope_label(s), e.to_string())),
-                }
+    // The FIRST scope is the one the caller named (or that `Auto` resolved to) — removed
+    // unconditionally; any further scope is a sweep, so it is probe-gated.
+    let removals = uninstall_scopes(scope, PREFERS_USER_LEVEL, is_root())
+        .into_iter()
+        .enumerate()
+        .map(|(index, s)| {
+            let mode = if index == 0 {
+                RemovalMode::Requested
+            } else {
+                RemovalMode::Swept
+            };
+            match RelayServiceBackend::new(s) {
+                Ok(backend) => remove_registration(&backend, s, mode),
+                Err(e) => ScopeRemoval::unreachable(s, mode, e.to_string()),
             }
-            Err(e) => failed.push((scope_label(s), e.to_string())),
-        }
-    }
-
-    let summary = if failed.is_empty() {
-        format!(
-            "dig-relay: uninstalled service \"{SERVICE_LABEL}\" ({} scope(s): {})",
-            removed.len(),
-            removed.join(", ")
-        )
-    } else {
-        format!(
-            "dig-relay: uninstalled \"{SERVICE_LABEL}\" at [{}]; could not remove at [{}]",
-            removed.join(", "),
-            failed
-                .iter()
-                .map(|(s, e)| format!("{s}: {e}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        )
-    };
-    Ok(Outcome::new(
-        summary,
-        json!({
-            "installed": false,
-            "registered": !removed.is_empty(),
-            "label": SERVICE_LABEL,
-            "removed_scopes": removed,
-            "failed_scopes": failed.iter().map(|(s, e)| json!({"scope": s, "error": e})).collect::<Vec<_>>(),
-        }),
-    ))
+        })
+        .collect();
+    uninstall_outcome(removals)
 }
 
 /// Start the installed service at the resolved scope.
@@ -734,8 +1120,11 @@ mod tests {
             (C::System, false, false, S::System),
             (C::User, true, true, S::User), // explicit User always wins, even as root
             (C::User, true, false, S::User),
-            (C::User, false, true, S::User), // explicit User wins even where the OS has no user manager
-            (C::User, false, false, S::User),
+            // Windows has exactly ONE scope, so even an explicit `--scope user` resolves to system
+            // rather than hard-failing — byte-identical to dig-node, so one installer argument form
+            // behaves the same for both components (dig_ecosystem#526).
+            (C::User, false, true, S::System),
+            (C::User, false, false, S::System),
         ];
         for (choice, os_supports_user, is_root, expected) in cases {
             let actual = resolve_scope(choice, os_supports_user, is_root);
@@ -747,21 +1136,30 @@ mod tests {
         }
     }
 
-    /// `Auto` under root is the ONE case that must remove both scopes — a fixture that varies only
-    /// `is_root` (holding choice=Auto, os_supports_user=true) distinguishes it from every
-    /// single-scope path, which is what a wrong "always uninstall both" implementation would miss.
+    /// `Auto` sweeps BOTH scopes at EITHER privilege level — the resolved one first. The unelevated
+    /// row is the load-bearing one: a plain `dig-relay uninstall` (no flag, no sudo — what an
+    /// operator or an uninstall script actually runs) on a host the elevated dig-installer
+    /// registered at SYSTEM scope must still address that system unit, rather than looking only at
+    /// the user scope, finding nothing, and exiting 0 while the system unit keeps auto-starting at
+    /// every boot and re-binding 9450/9451.
     #[test]
-    fn uninstall_scopes_removes_both_only_for_auto_as_root() {
+    fn uninstall_scopes_sweeps_both_for_auto_at_either_privilege() {
         assert_eq!(
             uninstall_scopes(ScopeChoice::Auto, true, true),
             vec![ServiceScope::System, ServiceScope::User],
-            "auto + root must remove both scopes, or a prior install at the other scope survives \
+            "auto + root must sweep both scopes, or a prior install at the other scope survives \
              uninstall (dig_ecosystem#1863)"
         );
         assert_eq!(
             uninstall_scopes(ScopeChoice::Auto, true, false),
-            vec![ServiceScope::User],
-            "auto + unelevated removes only the scope an unelevated install would have used"
+            vec![ServiceScope::User, ServiceScope::System],
+            "auto + unelevated must still sweep the SYSTEM scope an elevated installer would have \
+             used — resolved scope first, then the sweep"
+        );
+        assert_eq!(
+            uninstall_scopes(ScopeChoice::Auto, false, false),
+            vec![ServiceScope::System],
+            "a platform with only one scope has nothing to sweep"
         );
         assert_eq!(
             uninstall_scopes(ScopeChoice::System, true, true),
@@ -772,6 +1170,335 @@ mod tests {
             uninstall_scopes(ScopeChoice::User, true, true),
             vec![ServiceScope::User],
             "an explicit User choice removes only User, even under root"
+        );
+    }
+
+    /// A system-scope registration an unelevated caller cannot make is refused — and refused as a
+    /// PURE decision, so this runs on any host at any privilege level. Every other row is allowed:
+    /// user scope needs nothing, root may do anything, and Windows (no user scope) has its own SCM
+    /// elevation gate.
+    #[test]
+    fn ensure_privilege_for_scope_refuses_only_unprivileged_system() {
+        let err = ensure_privilege_for_scope(ServiceScope::System, true, false).expect_err(
+            "an unelevated system-scope install must be refused before any side effect",
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("--scope user"),
+            "the refusal must say what to do instead: {err}"
+        );
+        assert!(ensure_privilege_for_scope(ServiceScope::System, true, true).is_ok());
+        assert!(ensure_privilege_for_scope(ServiceScope::User, true, false).is_ok());
+        assert!(ensure_privilege_for_scope(ServiceScope::System, false, false).is_ok());
+    }
+
+    /// A recording [`ServiceBackend`] double: it logs every operation into a SHARED log (so the
+    /// relative ORDER of two backends' calls is observable), and each outcome is independently
+    /// settable — a double that could only vary one field could not express "the probe saw it but
+    /// the delete failed".
+    struct MockBackend {
+        name: &'static str,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        installed: std::io::Result<bool>,
+        delete_result: std::io::Result<()>,
+        create_result: std::io::Result<()>,
+    }
+
+    impl MockBackend {
+        fn new(name: &'static str, log: &std::rc::Rc<std::cell::RefCell<Vec<String>>>) -> Self {
+            MockBackend {
+                name,
+                log: std::rc::Rc::clone(log),
+                installed: Ok(false),
+                delete_result: Ok(()),
+                create_result: Ok(()),
+            }
+        }
+        fn installed(mut self, installed: bool) -> Self {
+            self.installed = Ok(installed);
+            self
+        }
+        fn probe_fails(mut self) -> Self {
+            self.installed = Err(std::io::Error::other("probe unavailable"));
+            self
+        }
+        fn delete_fails(mut self) -> Self {
+            self.delete_result = Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "access denied",
+            ));
+            self
+        }
+        fn record(&self, op: &str) {
+            self.log.borrow_mut().push(format!("{}:{op}", self.name));
+        }
+    }
+
+    /// Clone an `io::Error` shallowly enough for a mock to return it repeatedly.
+    fn same_error(e: &std::io::Error) -> std::io::Error {
+        std::io::Error::new(e.kind(), e.to_string())
+    }
+
+    impl ServiceBackend for MockBackend {
+        fn is_installed(&self) -> std::io::Result<bool> {
+            self.record("probe");
+            match &self.installed {
+                Ok(v) => Ok(*v),
+                Err(e) => Err(same_error(e)),
+            }
+        }
+        fn stop(&self) -> std::io::Result<()> {
+            self.record("stop");
+            Ok(())
+        }
+        fn delete(&self) -> std::io::Result<()> {
+            self.record("delete");
+            match &self.delete_result {
+                Ok(()) => Ok(()),
+                Err(e) => Err(same_error(e)),
+            }
+        }
+        fn create(&self, _plan: &InstallPlan) -> std::io::Result<()> {
+            self.record("create");
+            match &self.create_result {
+                Ok(()) => Ok(()),
+                Err(e) => Err(same_error(e)),
+            }
+        }
+    }
+
+    fn test_plan() -> InstallPlan {
+        InstallPlan {
+            program: std::path::PathBuf::from("/usr/bin/dig-relay"),
+            args: vec![OsString::from("serve")],
+            environment: vec![("DIG_RELAY_LISTEN".into(), "[::]:9450".into())],
+            autostart: true,
+        }
+    }
+
+    /// The migration is a PLACEMENT fix, so it is proven by ORDER against a SECOND actor: the stale
+    /// other-scope registration must be deleted BEFORE the new one is created. Asserting only "the
+    /// new one exists" would pass just as happily if the sweep ran afterwards — and would then be
+    /// deleting the registration it had just made.
+    #[test]
+    fn install_deregisters_the_other_scope_before_creating() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let target = MockBackend::new("target", &log);
+        let stale = MockBackend::new("other", &log).installed(true);
+
+        let migration = install_at_scope(&target, Some((&stale, ServiceScope::User)), &test_plan())
+            .expect("the install itself succeeds")
+            .expect("a migration was attempted");
+
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["other:probe", "other:stop", "other:delete", "target:create"],
+            "the stale registration must be gone before the new one exists"
+        );
+        assert_eq!(migration.scope, ServiceScope::User);
+        assert!(migration.found && migration.removed, "{migration:?}");
+    }
+
+    /// A sweep is PROBE-GATED: a scope the probe did not positively see must never be written to.
+    #[test]
+    fn install_sweep_does_not_touch_a_scope_holding_nothing() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let target = MockBackend::new("target", &log);
+        let other = MockBackend::new("other", &log).installed(false);
+
+        let migration = install_at_scope(&target, Some((&other, ServiceScope::User)), &test_plan())
+            .unwrap()
+            .expect("a migration was attempted");
+
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["other:probe", "target:create"],
+            "a swept scope with nothing in it must be probed and then left alone"
+        );
+        assert!(!migration.found && !migration.removed);
+    }
+
+    /// A sweep that could not clear a stale registration is non-fatal but REPORTED — the install
+    /// still succeeds, and the caller learns two registrations may now race for the relay's ports.
+    #[test]
+    fn install_reports_a_sweep_it_could_not_complete() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let target = MockBackend::new("target", &log);
+        let stale = MockBackend::new("other", &log)
+            .installed(true)
+            .delete_fails();
+
+        let migration =
+            install_at_scope(&target, Some((&stale, ServiceScope::System)), &test_plan())
+                .expect("a failed sweep must not fail the install")
+                .expect("a migration was attempted");
+
+        assert!(migration.found && !migration.removed, "{migration:?}");
+        assert!(
+            migration.error.is_some(),
+            "the reason must reach the caller"
+        );
+        assert!(
+            migration.indeterminate,
+            "a registration we SAW and could not remove is unresolved"
+        );
+        assert!(log.borrow().contains(&"target:create".to_string()));
+    }
+
+    /// The scope the caller NAMED is deregistered unconditionally: the OS delete is the authority,
+    /// so a probe false-negative (a `systemctl --user` issued from a root session cannot see the
+    /// desktop user's units) can never silently turn the uninstall into a no-op.
+    #[test]
+    fn a_requested_scope_is_removed_even_when_the_probe_sees_nothing() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let backend = MockBackend::new("named", &log).installed(false);
+
+        let removal = remove_registration(&backend, ServiceScope::System, RemovalMode::Requested);
+
+        assert!(
+            removal.removed,
+            "the delete must run regardless of the probe: {removal:?}"
+        );
+        assert!(log.borrow().contains(&"named:delete".to_string()));
+    }
+
+    /// A probe that cannot ANSWER leaves a swept scope indeterminate — absence was never
+    /// established, so it must not be reported as clean.
+    #[test]
+    fn a_swept_scope_with_an_unanswerable_probe_is_indeterminate() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let backend = MockBackend::new("swept", &log).probe_fails();
+
+        let removal = remove_registration(&backend, ServiceScope::User, RemovalMode::Swept);
+
+        assert!(removal.indeterminate && !removal.removed, "{removal:?}");
+        assert!(
+            !log.borrow().contains(&"swept:delete".to_string()),
+            "an unreadable scope is still never written to"
+        );
+    }
+
+    /// A complete removal is the ONLY success, and it reports `registered: false` — the field means
+    /// "is it still registered", so a successful uninstall must answer `no`. (Inverting it would
+    /// tell every machine consumer "still registered" exactly when removal WORKED.)
+    #[test]
+    fn uninstall_outcome_success_reports_not_registered() {
+        let outcome = uninstall_outcome(vec![
+            ScopeRemoval {
+                scope: ServiceScope::System,
+                found: true,
+                removed: true,
+                indeterminate: false,
+                error: None,
+            },
+            ScopeRemoval {
+                scope: ServiceScope::User,
+                found: false,
+                removed: false,
+                indeterminate: false,
+                error: None,
+            },
+        ])
+        .expect("everything found was removed");
+        assert_eq!(
+            outcome.result["registered"],
+            json!(false),
+            "a successful uninstall leaves nothing registered"
+        );
+        assert_eq!(outcome.result["installed"], json!(false));
+        assert_eq!(outcome.result["removed_scopes"], json!(["system"]));
+    }
+
+    /// The failure rows an uninstall must NOT report as success. Each varies ONE field away from the
+    /// success case above, so each pins its own reason rather than a shared coincidence.
+    #[test]
+    fn uninstall_outcome_fails_on_anything_less_than_a_complete_removal() {
+        let found_but_not_removed = uninstall_outcome(vec![ScopeRemoval {
+            scope: ServiceScope::System,
+            found: true,
+            removed: false,
+            indeterminate: false,
+            error: Some("access denied".into()),
+        }])
+        .expect_err("a registration left behind is never a success");
+        assert_eq!(
+            found_but_not_removed.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(found_but_not_removed.to_string().contains("access denied"));
+
+        let indeterminate = uninstall_outcome(vec![ScopeRemoval {
+            scope: ServiceScope::User,
+            found: false,
+            removed: false,
+            indeterminate: true,
+            error: None,
+        }])
+        .expect_err("\"cannot tell\" is never a success");
+        assert_eq!(indeterminate.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let nothing_there = uninstall_outcome(vec![ScopeRemoval {
+            scope: ServiceScope::User,
+            found: false,
+            removed: false,
+            indeterminate: false,
+            error: None,
+        }])
+        .expect_err("removing nothing is NotFound, not success");
+        assert_eq!(nothing_there.kind(), std::io::ErrorKind::NotFound);
+
+        // A partial sweep still succeeds when the scope that held something was cleared and the
+        // other was provably empty — the control that keeps the three rows above from passing
+        // merely because the function rejects everything.
+        assert!(uninstall_outcome(vec![
+            ScopeRemoval {
+                scope: ServiceScope::User,
+                found: true,
+                removed: true,
+                indeterminate: false,
+                error: None,
+            },
+            ScopeRemoval {
+                scope: ServiceScope::System,
+                found: false,
+                removed: false,
+                indeterminate: false,
+                error: None,
+            },
+        ])
+        .is_ok());
+    }
+
+    /// A scope whose manager cannot be acquired: the caller ASKED for it, so the answer is unknown
+    /// (an error), whereas a sweep of a scope this platform has no manager for is genuinely clean.
+    #[test]
+    fn an_unreachable_requested_scope_is_indeterminate_but_a_swept_one_is_not() {
+        let requested =
+            ScopeRemoval::unreachable(ServiceScope::User, RemovalMode::Requested, "no mgr".into());
+        assert!(requested.indeterminate);
+        assert!(uninstall_outcome(vec![requested]).is_err());
+
+        let swept =
+            ScopeRemoval::unreachable(ServiceScope::User, RemovalMode::Swept, "no mgr".into());
+        assert!(!swept.indeterminate);
+    }
+
+    /// The systemd unit name `service-manager` actually registers is `to_script_name()`
+    /// (`dignetwork-dig-relay`) — probing the reverse-DNS qualified name there looks for a unit that
+    /// never exists, so the probe would always say "nothing here" and silently defeat every sweep.
+    #[test]
+    fn the_probe_uses_the_name_the_platform_actually_registers() {
+        let l = label().unwrap();
+        let expected = if cfg!(all(unix, not(target_os = "macos"))) {
+            l.to_script_name()
+        } else {
+            l.to_qualified_name()
+        };
+        assert_eq!(os_native_service_name(&l), expected);
+        assert_ne!(
+            l.to_script_name(),
+            l.to_qualified_name(),
+            "the two names differ, which is why picking the wrong one is silent"
         );
     }
 
