@@ -12,6 +12,14 @@ dig-relay serve                       # foreground, all defaults
 dig-relay serve --listen [::]:9450    # override a knob via a flag
 dig-relay install && dig-relay start  # install + run as an OS service (SCM/systemd/launchd)
 dig-relay status                      # probe /health (exit 1 if not serving)
+
+# --scope <auto|system|user> on install/uninstall/start/stop, default auto:
+#  - auto resolves from privilege: root -> system, unelevated -> user (Windows is always system).
+#  - an elevated (root/sudo) install MUST pass --scope system explicitly if you want a reboot-
+#    surviving service without relying on auto-detection — root has no systemd --user/launchd
+#    per-user session, so a user-level unit registered under sudo will not come back after a
+#    reboot (SPEC.md §9).
+sudo dig-relay install --scope system && sudo dig-relay start --scope system
 ```
 
 ## Listeners & core limits

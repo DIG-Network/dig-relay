@@ -38,6 +38,13 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Which scope install/uninstall/start/stop target (default `auto`): `auto` resolves from
+    /// privilege (root -> system, else user; always system on Windows), `system`/`user` force it
+    /// explicitly. An elevated `dig-installer` install needs `system` scope for the service to
+    /// survive a reboot with no login session (dig_ecosystem#526) — matches dig-node's `--scope`.
+    #[arg(long, value_enum, default_value = "auto", global = true)]
+    scope: service::ScopeChoice,
+
     // ---- `serve` flags (also accepted at the top level so bare `dig-relay` serves) ----
     /// Address the relay WebSocket listener binds (default [::]:9450, dual-stack IPv6+IPv4).
     #[arg(long, value_name = "ADDR", global = true)]
@@ -246,10 +253,10 @@ fn main() -> std::process::ExitCode {
     match cli.command.as_ref().unwrap_or(&Command::Serve) {
         Command::Serve => run_serve(config),
         Command::RunService => run_service_entry(config),
-        Command::Install => emit(cli.json, service::install(&config)),
-        Command::Uninstall => emit(cli.json, service::uninstall()),
-        Command::Start => emit(cli.json, service::start()),
-        Command::Stop => emit(cli.json, service::stop()),
+        Command::Install => emit(cli.json, service::install(&config, cli.scope)),
+        Command::Uninstall => emit(cli.json, service::uninstall(cli.scope)),
+        Command::Start => emit(cli.json, service::start(cli.scope)),
+        Command::Stop => emit(cli.json, service::stop(cli.scope)),
         Command::Status => {
             // Status maps serving:false to a non-zero exit so scripts can gate on it.
             match service::status(&config) {
