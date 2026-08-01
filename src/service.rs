@@ -251,8 +251,9 @@ struct InstallPlan {
 /// removal policy ([`remove_registration`]) and the migration ORDER ([`install_at_scope`]) are
 /// provable with a mock — the real implementation is [`RelayServiceBackend`].
 trait ServiceBackend {
-    /// Is this service registered at this backend's scope? Advisory — see [`ScopeRemoval`].
-    fn is_installed(&self) -> std::io::Result<bool>;
+    /// What can this backend establish about a registration at its scope? Three-valued: a scope it
+    /// cannot READ is [`Registration::Unknown`], never absence — see [`ScopeRemoval`].
+    fn registration(&self) -> Registration;
     fn stop(&self) -> std::io::Result<()>;
     fn delete(&self) -> std::io::Result<()>;
     fn create(&self, plan: &InstallPlan) -> std::io::Result<()>;
@@ -264,9 +265,10 @@ trait ServiceBackend {
 /// `found` (what the PROBE saw) and `removed` (what the OS deregistration actually did) are
 /// deliberately separate, because **the probe is advisory and the deregistration is authoritative**:
 /// `systemctl --user` / `launchctl print gui/<uid>/…` issued from a root session address ROOT's own
-/// user domain, never the desktop user's — so a probe can false-negative on a registration that
-/// genuinely exists. Only `removed` proves anything; `found` explains; `indeterminate` admits when
-/// absence was never established.
+/// user domain, never the desktop user's. That unreadable scope arrives here as
+/// [`Registration::Unknown`] and becomes `indeterminate` — never a silent `found: false`. Only
+/// `removed` proves anything; `found` explains; `indeterminate` admits when absence was never
+/// established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeRemoval {
     /// The scope this attempt addressed.
@@ -341,18 +343,19 @@ fn remove_registration<B: ServiceBackend + ?Sized>(
         indeterminate: false,
         error: None,
     };
-    let probe = backend.is_installed();
-    match &probe {
-        Ok(found) => removal.found = *found,
-        Err(e) => {
-            removal.error = Some(format!("could not determine whether it is registered: {e}"))
-        }
+    let probe = backend.registration();
+    removal.found = probe.is_present();
+    if let Some(reason) = probe.unknown_reason() {
+        removal.error = Some(format!(
+            "could not determine whether it is registered: {reason}"
+        ));
     }
     // A sweep touches nothing it did not positively see — an unrelated scope must never be written
-    // to on the strength of a guess. A probe FAILURE leaves the swept scope indeterminate: absence
-    // was not established, and the caller reports that rather than assuming it is clean.
+    // to on the strength of a guess. An UNREADABLE scope leaves the sweep indeterminate: absence was
+    // not established, and the caller reports that rather than assuming it is clean. Only
+    // `Registration::Absent` — the OS positively saying so — closes the scope out as clean.
     if mode == RemovalMode::Swept && !removal.found {
-        removal.indeterminate = probe.is_err();
+        removal.indeterminate = probe.unknown_reason().is_some();
         return removal;
     }
     // Best-effort stop first so nothing keeps holding the relay's ports past the deregistration.
@@ -363,7 +366,7 @@ fn remove_registration<B: ServiceBackend + ?Sized>(
             // A failed delete at a scope the probe never saw a registration at is the ordinary
             // "there was nothing here" case (the OS says so twice) — keep the reason for context,
             // but only a scope we DID see, or could not read at all, is unresolved.
-            removal.indeterminate = probe.is_err() || removal.found;
+            removal.indeterminate = probe.unknown_reason().is_some() || removal.found;
             removal.error = Some(e.to_string());
         }
     }
@@ -493,8 +496,11 @@ impl RelayServiceBackend {
 }
 
 impl ServiceBackend for RelayServiceBackend {
-    fn is_installed(&self) -> std::io::Result<bool> {
-        query_installed(&os_native_service_name(&label()?), self.scope)
+    fn registration(&self) -> Registration {
+        match label() {
+            Ok(l) => query_installed(&os_native_service_name(&l), self.scope),
+            Err(e) => Registration::Unknown(format!("could not build the service label: {e}")),
+        }
     }
 
     fn stop(&self) -> std::io::Result<()> {
@@ -535,53 +541,197 @@ fn os_native_service_name(label: &ServiceLabel) -> String {
     }
 }
 
-/// Probe whether `service_name` is registered AT `scope`. Windows SCM has exactly one scope, so
-/// `scope` carries no information there. An `Err` means the question could not be ANSWERED (the
-/// probe tool could not be run at all) — distinct from `Ok(false)`, "the OS says nothing is here".
+/// What a scope probe established about a registration — THREE-valued on purpose.
+///
+/// A two-valued present/absent answer is the #526 false-negative itself: `systemctl --user` run as
+/// root fails to reach the session bus, and a two-valued probe reads that failure as "nothing is
+/// registered here" — so a live user-level registration is reported as clean and left running.
+/// [`Unknown`](Registration::Unknown) is the honest default: any probe result this code does not
+/// POSITIVELY recognise as absence is uncertainty, never absence.
+///
+/// Byte-identical in semantics to `dig-node`'s `Registration` (`dig-node-service/src/service.rs`),
+/// so one operator-facing story covers both components (dig_ecosystem#526, #1888).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Registration {
+    /// The service manager confirmed a registration at this scope.
+    Present,
+    /// The service manager POSITIVELY reported that nothing is registered at this scope.
+    Absent,
+    /// The scope could not be read; whether a registration exists is UNKNOWN. Carries the tool's own
+    /// reason, which is surfaced to the operator verbatim — it is the only thing that makes the
+    /// state actionable.
+    Unknown(String),
+}
+
+impl Registration {
+    /// The probe positively SAW a registration. `false` covers BOTH absence and uncertainty, so this
+    /// answers only "is there certainly something here" — never "is it safe to assume nothing is".
+    fn is_present(&self) -> bool {
+        matches!(self, Registration::Present)
+    }
+
+    /// The uncertainty, when the scope could not be read at all.
+    fn unknown_reason(&self) -> Option<&str> {
+        match self {
+            Registration::Unknown(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+// The classifiers and their helpers below are PURE and are compiled on EVERY platform on purpose: a
+// `cfg`-gated classifier would be unfalsifiable on the other hosts, so a regression in it could
+// never go red on a developer box or in a single-platform CI leg. Only the callers that SPAWN the
+// tool are platform-specific.
+
+/// PURE: classify a `sc query <name>` result. Exit `1060` is the Windows SCM's
+/// `ERROR_SERVICE_DOES_NOT_EXIST` — the ONLY code that positively means absence. `5`
+/// (`ERROR_ACCESS_DENIED`) and everything else leave the question open.
+#[allow(dead_code)]
+fn classify_sc_probe(succeeded: bool, code: Option<i32>) -> Registration {
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    match (succeeded, code) {
+        (true, _) => Registration::Present,
+        (false, Some(ERROR_SERVICE_DOES_NOT_EXIST)) => Registration::Absent,
+        (false, code) => Registration::Unknown(format!(
+            "`sc query` exited with {} (1060 would mean the service does not exist)",
+            describe_exit(code)
+        )),
+    }
+}
+
+/// PURE: classify a `launchctl print <domain>/<label>` result.
+///
+/// `113` (`Could not find service`) is launchd positively reporting absence. A session with no Aqua
+/// domain instead fails to reach the DOMAIN (`Bootstrap failed`, `Could not find domain`) — the
+/// false-negative this feature exists to survive, and therefore `Unknown` rather than absence.
+#[allow(dead_code)]
+fn classify_launchctl_probe(succeeded: bool, code: Option<i32>, stderr: &str) -> Registration {
+    const COULD_NOT_FIND_SERVICE: i32 = 113;
+    if succeeded {
+        return Registration::Present;
+    }
+    let says_no_such_service = contains_any(
+        stderr,
+        &["could not find service", "no such process", "no such file"],
+    );
+    if code == Some(COULD_NOT_FIND_SERVICE) || says_no_such_service {
+        return Registration::Absent;
+    }
+    Registration::Unknown(format!(
+        "`launchctl print` exited with {} without reporting the service absent: {}",
+        describe_exit(code),
+        summarize_stderr(stderr)
+    ))
+}
+
+/// PURE: classify a `systemctl [--user] cat <unit>` result.
+///
+/// `No files found for <unit>` is systemd positively reporting absence. `Failed to connect to bus` —
+/// what `systemctl --user` says when run as root, the exact condition this feature works around — is
+/// NOT absence, and reporting it as such is what let a live user unit be called "nothing there".
+/// There is deliberately NO exit-code condition here: systemd's absence signal is its message, and
+/// treating any non-zero exit as absence would reinstate the false negative.
+#[allow(dead_code)]
+fn classify_systemctl_probe(succeeded: bool, stderr: &str) -> Registration {
+    if succeeded {
+        return Registration::Present;
+    }
+    if contains_any(stderr, &["no files found for", "could not be found"]) {
+        return Registration::Absent;
+    }
+    Registration::Unknown(format!(
+        "`systemctl cat` failed without reporting the unit absent: {}",
+        summarize_stderr(stderr)
+    ))
+}
+
+/// Case-insensitive SUBSTRING match against the set of recognised OS phrasings — the tools wrap
+/// their messages with the unit name and hints, so neither equality nor a prefix would match.
+#[allow(dead_code)]
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    let haystack = haystack.to_ascii_lowercase();
+    needles.iter().any(|n| haystack.contains(n))
+}
+
+/// A process exit code for an operator-facing message; `None` is a signal-terminated process.
+#[allow(dead_code)]
+fn describe_exit(code: Option<i32>) -> String {
+    code.map_or_else(
+        || "no exit code (terminated by signal)".to_string(),
+        |c| format!("code {c}"),
+    )
+}
+
+/// The tool's own words, trimmed to one readable line — the operator needs WHY, not a transcript.
+#[allow(dead_code)]
+fn summarize_stderr(stderr: &str) -> String {
+    let line = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("(no output)");
+    line.chars().take(200).collect()
+}
+
+/// The verdict when the probe tool could not be RUN at all: the scope is unreadable, which is
+/// uncertainty and not absence.
+#[allow(dead_code)]
+fn probe_tool_unavailable(tool: &str, error: &std::io::Error) -> Registration {
+    Registration::Unknown(format!("could not run `{tool}`: {error}"))
+}
+
+/// Windows SCM existence probe. SCM has exactly one scope, so `scope` carries no information there.
 #[cfg(windows)]
-fn query_installed(service_name: &str, _scope: ServiceScope) -> std::io::Result<bool> {
-    // `sc query <name>` exits 0 when the service exists, 1060 (does-not-exist) otherwise.
-    std::process::Command::new("sc.exe")
+fn query_installed(service_name: &str, _scope: ServiceScope) -> Registration {
+    match std::process::Command::new("sc.exe")
         .args(["query", service_name])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
+        .output()
+    {
+        Ok(out) => classify_sc_probe(out.status.success(), out.status.code()),
+        Err(e) => probe_tool_unavailable("sc.exe", &e),
+    }
 }
 
 /// macOS launchd existence probe: `launchctl print <domain>/<label>` exits 0 when the service is
 /// bootstrapped in that scope's domain.
 #[cfg(target_os = "macos")]
-fn query_installed(service_name: &str, scope: ServiceScope) -> std::io::Result<bool> {
+fn query_installed(service_name: &str, scope: ServiceScope) -> Registration {
     let domain = if scope == ServiceScope::User {
         format!("gui/{}/{}", unix_uid().unwrap_or(0), service_name)
     } else {
         format!("system/{service_name}")
     };
-    std::process::Command::new("launchctl")
+    match std::process::Command::new("launchctl")
         .args(["print", &domain])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
+        .output()
+    {
+        Ok(out) => classify_launchctl_probe(
+            out.status.success(),
+            out.status.code(),
+            &String::from_utf8_lossy(&out.stderr),
+        ),
+        Err(e) => probe_tool_unavailable("launchctl", &e),
+    }
 }
 
 /// Linux systemd existence probe: `systemctl [--user] cat <unit>` exits 0 when the unit file exists
-/// in that scope (non-zero "No files found" otherwise). `--user` addresses the per-user manager, its
-/// absence the system manager — the two hold DIFFERENT unit files, so the flag must track the scope
-/// being probed or the probe reports on the wrong registration.
+/// in that scope. `--user` addresses the per-user manager, its absence the system manager — the two
+/// hold DIFFERENT unit files, so the flag must track the scope being probed or the probe reports on
+/// the wrong registration.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn query_installed(service_name: &str, scope: ServiceScope) -> std::io::Result<bool> {
+fn query_installed(service_name: &str, scope: ServiceScope) -> Registration {
     let unit = format!("{service_name}.service");
     let mut cmd = std::process::Command::new("systemctl");
     if scope == ServiceScope::User {
         cmd.arg("--user");
     }
-    cmd.args(["cat", &unit])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
+    match cmd.args(["cat", &unit]).output() {
+        Ok(out) => {
+            classify_systemctl_probe(out.status.success(), &String::from_utf8_lossy(&out.stderr))
+        }
+        Err(e) => probe_tool_unavailable("systemctl", &e),
+    }
 }
 
 /// The effective uid via `id -u`, or `None` when it cannot be determined (the launchd domain target).
@@ -1199,7 +1349,7 @@ mod tests {
     struct MockBackend {
         name: &'static str,
         log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
-        installed: std::io::Result<bool>,
+        installed: Registration,
         delete_result: std::io::Result<()>,
         create_result: std::io::Result<()>,
     }
@@ -1209,17 +1359,23 @@ mod tests {
             MockBackend {
                 name,
                 log: std::rc::Rc::clone(log),
-                installed: Ok(false),
+                installed: Registration::Absent,
                 delete_result: Ok(()),
                 create_result: Ok(()),
             }
         }
         fn installed(mut self, installed: bool) -> Self {
-            self.installed = Ok(installed);
+            self.installed = if installed {
+                Registration::Present
+            } else {
+                Registration::Absent
+            };
             self
         }
-        fn probe_fails(mut self) -> Self {
-            self.installed = Err(std::io::Error::other("probe unavailable"));
+        /// The scope could not be READ — what `systemctl --user` reports to root. Distinct from
+        /// `installed(false)`, which is the OS positively saying nothing is registered.
+        fn probe_unknown(mut self) -> Self {
+            self.installed = Registration::Unknown("Failed to connect to bus".to_string());
             self
         }
         fn delete_fails(mut self) -> Self {
@@ -1240,12 +1396,9 @@ mod tests {
     }
 
     impl ServiceBackend for MockBackend {
-        fn is_installed(&self) -> std::io::Result<bool> {
+        fn registration(&self) -> Registration {
             self.record("probe");
-            match &self.installed {
-                Ok(v) => Ok(*v),
-                Err(e) => Err(same_error(e)),
-            }
+            self.installed.clone()
         }
         fn stop(&self) -> std::io::Result<()> {
             self.record("stop");
@@ -1362,12 +1515,108 @@ mod tests {
         assert!(log.borrow().contains(&"named:delete".to_string()));
     }
 
-    /// A probe that cannot ANSWER leaves a swept scope indeterminate — absence was never
-    /// established, so it must not be reported as clean.
+    /// THE #526 false negative, at the decision level: `systemctl --user` run as root cannot reach
+    /// the session bus, and its message is NOT an absence signal. Classifying it as `Absent` is what
+    /// let a live user-level registration be reported as "nothing there" — so it must be `Unknown`,
+    /// carrying systemd's own words. Compiled on every host: the classifier is pure.
     #[test]
-    fn a_swept_scope_with_an_unanswerable_probe_is_indeterminate() {
+    fn a_systemd_bus_failure_is_unknown_not_absence() {
+        let verdict = classify_systemctl_probe(
+            false,
+            "Failed to connect to bus: No such file or directory\n",
+        );
+
+        let reason = verdict
+            .unknown_reason()
+            .unwrap_or_else(|| panic!("a bus failure must never be absence: {verdict:?}"));
+        assert!(
+            reason.contains("Failed to connect to bus"),
+            "the operator needs systemd's own words: {reason}"
+        );
+        assert!(!verdict.is_present());
+    }
+
+    /// systemd's absence signals, and ONLY those, close a scope out as clean. Matching is
+    /// case-insensitive SUBSTRING (the tools wrap the phrase in the unit name), and there is
+    /// deliberately NO exit-code condition — a non-zero exit alone proves nothing.
+    #[test]
+    fn systemctl_reports_absence_only_on_its_own_absence_phrasings() {
+        assert_eq!(
+            classify_systemctl_probe(false, "No files found for dignetwork-dig-relay.service."),
+            Registration::Absent
+        );
+        assert_eq!(
+            classify_systemctl_probe(
+                false,
+                "Unit dignetwork-dig-relay.service could not be found."
+            ),
+            Registration::Absent,
+            "matching is substring, not equality or prefix"
+        );
+        assert_eq!(
+            classify_systemctl_probe(false, "NO FILES FOUND FOR dignetwork-dig-relay.service"),
+            Registration::Absent,
+            "matching is case-insensitive"
+        );
+        // launchd-only stderr signals are NOT systemd absence signals.
+        assert!(
+            classify_systemctl_probe(false, "No such process")
+                .unknown_reason()
+                .is_some(),
+            "`no such process` is launchd's phrasing, never systemd's absence proof"
+        );
+        // Success is tested BEFORE any absence test: a unit that exists AND whose text happens to
+        // carry an absence phrase is Present.
+        assert_eq!(
+            classify_systemctl_probe(true, "No files found for something-else.service"),
+            Registration::Present
+        );
+    }
+
+    /// launchd: exit 113 OR one of its own stderr phrasings is absence; a domain it could not reach
+    /// (`Bootstrap failed`, what root sees for a desktop user's GUI domain) is `Unknown`.
+    #[test]
+    fn launchctl_absence_is_exit_113_or_its_own_phrasings() {
+        assert_eq!(
+            classify_launchctl_probe(false, Some(113), ""),
+            Registration::Absent
+        );
+        for stderr in ["Could not find service", "No such process", "no such file"] {
+            assert_eq!(
+                classify_launchctl_probe(false, Some(1), stderr),
+                Registration::Absent,
+                "{stderr}"
+            );
+        }
+        assert!(
+            classify_launchctl_probe(false, Some(5), "Bootstrap failed: 5: Input/output error")
+                .unknown_reason()
+                .is_some(),
+            "an unreachable domain is uncertainty, not absence"
+        );
+        assert_eq!(
+            classify_launchctl_probe(true, Some(0), ""),
+            Registration::Present
+        );
+    }
+
+    /// Windows SCM: `1060` (`ERROR_SERVICE_DOES_NOT_EXIST`) is the ONLY absence code. `5`
+    /// (access denied) leaves the question open — a service you may not read may well exist.
+    #[test]
+    fn sc_absence_is_only_error_service_does_not_exist() {
+        assert_eq!(classify_sc_probe(false, Some(1060)), Registration::Absent);
+        assert!(classify_sc_probe(false, Some(5)).unknown_reason().is_some());
+        assert!(classify_sc_probe(false, None).unknown_reason().is_some());
+        assert_eq!(classify_sc_probe(true, Some(0)), Registration::Present);
+    }
+
+    /// A scope the probe could not READ leaves a swept scope indeterminate — absence was never
+    /// established, so it must not be reported as clean. The fixture is the REAL production state
+    /// (`Registration::Unknown`), not an unreachable spawn error.
+    #[test]
+    fn a_swept_scope_with_an_unreadable_probe_is_indeterminate() {
         let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let backend = MockBackend::new("swept", &log).probe_fails();
+        let backend = MockBackend::new("swept", &log).probe_unknown();
 
         let removal = remove_registration(&backend, ServiceScope::User, RemovalMode::Swept);
 
