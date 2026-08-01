@@ -30,6 +30,12 @@ use crate::wire::{PexMessage, RelayMessage, RelayPeerInfo};
 /// only how often the relay *checks* whether a link is due, so ~1/s is ample and cheap.
 const PEX_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a TRUSTED proxy has to deliver its PROXY protocol v2 header before the connection is
+/// dropped (#1930). A load balancer writes the header in the same flight as the connection, so this
+/// only ever fires on a genuinely stuck peer — short enough that a stall cannot pin an accept task,
+/// generous enough to never trip on a healthy one.
+const PROXY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Stable relay error codes (the `code` field of [`RelayMessage::Error`]). Catalogued so an agent
 /// never has to scrape prose to learn what the relay rejected.
 pub mod errcode {
@@ -487,6 +493,40 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
             }
         };
         let state = state.clone();
+
+        // PROXY protocol v2 (#1930): behind a TLS-terminating load balancer the socket address is
+        // the BALANCER's, identically for every peer on earth — which corrupts the dialable
+        // candidates we hand out (#1929), collapses `/map` onto one point, and makes every per-IP
+        // limit below a single shared bucket. When the connection genuinely comes from a configured
+        // proxy, the header it prefixes carries the real client address; we substitute it here, once,
+        // so everything downstream sees the true source and nothing else needs to know.
+        //
+        // Read ONLY from a trusted source. The default trusts nobody, so this whole branch is
+        // skipped and the accept path is byte-for-byte what it was before.
+        let (stream, peer_addr) = if state.config.trusted_proxies.trusts(peer_addr.ip()) {
+            // A trusted proxy that stalls before sending its header must not pin a task forever.
+            let read = crate::proxy_protocol::read_source_addr(stream);
+            match tokio::time::timeout(PROXY_HEADER_TIMEOUT, read).await {
+                Ok(Ok((declared, stream))) => {
+                    let source = declared.unwrap_or(peer_addr);
+                    (stream, source)
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, %peer_addr, "proxy header read failed");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::debug!(%peer_addr, "proxy header timed out");
+                    continue;
+                }
+            }
+        } else {
+            (
+                crate::proxy_protocol::PrefixedStream::new(Vec::new(), stream),
+                peer_addr,
+            )
+        };
+
         match tls_acceptor.clone() {
             Some(acceptor) => {
                 tokio::spawn(async move {

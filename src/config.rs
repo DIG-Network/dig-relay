@@ -246,6 +246,16 @@ pub struct RelayServerConfig {
     /// The rolling window over which strikes accumulate toward [`ban_threshold`](Self::ban_threshold)
     /// (#1396); strikes older than one window reset. See [`DEFAULT_BAN_STRIKE_WINDOW_SECS`].
     pub ban_strike_window: Duration,
+    /// CIDRs whose PROXY protocol v2 header the relay will BELIEVE (#1930), for a deployment behind
+    /// a TLS-terminating load balancer that would otherwise hide every peer's real source address.
+    ///
+    /// EMPTY (the default) means trust nobody: the relay never reads a PROXY header and every
+    /// connection keeps its observed socket address, exactly as before this setting existed. A
+    /// PROXY header is self-declared by whoever sends it, so honouring one from an untrusted source
+    /// would let any host that can reach the listener forge a source IP — evading the per-IP caps
+    /// and ban list in [`crate::limits`] and poisoning `/map`. Set this ONLY to the addresses of the
+    /// load balancer in front of the relay.
+    pub trusted_proxies: crate::proxy_protocol::TrustedProxies,
 }
 
 impl Default for RelayServerConfig {
@@ -283,6 +293,7 @@ impl Default for RelayServerConfig {
             ban_threshold: DEFAULT_BAN_THRESHOLD,
             ban_duration: Duration::from_secs(DEFAULT_BAN_DURATION_SECS),
             ban_strike_window: Duration::from_secs(DEFAULT_BAN_STRIKE_WINDOW_SECS),
+            trusted_proxies: crate::proxy_protocol::TrustedProxies::default(),
         }
     }
 }

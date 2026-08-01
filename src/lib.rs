@@ -37,6 +37,7 @@ pub mod limits;
 pub mod map;
 pub mod net;
 pub mod pex;
+pub mod proxy_protocol;
 pub mod registry;
 pub mod server;
 pub mod service;
