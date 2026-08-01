@@ -181,6 +181,46 @@ async fn an_untrusted_client_cannot_declare_its_own_source_address() {
 }
 
 #[tokio::test]
+async fn a_stalled_trusted_connection_does_not_block_anyone_elses_accept() {
+    // Regression: the header read once happened inline in the accept loop, so ONE trusted source
+    // that connected and said nothing stopped the relay accepting ANY other peer for the whole
+    // header timeout — a trivial denial of service from inside a trusted CIDR, and plain
+    // head-of-line blocking even without malice. The read now happens per-connection.
+    let config = RelayServerConfig {
+        trusted_proxies: TrustedProxies::parse("127.0.0.0/8").unwrap(),
+        ..Default::default()
+    };
+    let relay = start_relay(config).await;
+
+    // Connect and deliberately send nothing at all; hold the socket open.
+    let _stalled = TcpStream::connect(relay).await.expect("tcp connect");
+
+    // A second peer must get through immediately, not after the header timeout.
+    let started = std::time::Instant::now();
+    let mut honest = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_with_proxy_header(relay, None),
+    )
+    .await
+    .expect("the accept loop must not be blocked by the stalled connection")
+    .expect("handshake");
+    register(&mut honest, &"f".repeat(64)).await;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a second peer waited {:?} behind a stalled one",
+        started.elapsed()
+    );
+    assert!(
+        peers_seen_by(&mut honest)
+            .await
+            .iter()
+            .any(|p| p.peer_id == "f".repeat(64)),
+        "the unblocked peer must register normally"
+    );
+}
+
+#[tokio::test]
 async fn a_peer_that_sends_no_header_through_a_trusted_proxy_still_connects() {
     // Rollout safety: the target group's proxy_protocol flag and the relay deploy cannot flip in the
     // same instant, so for a window a trusted source will connect with NO header. That must keep
