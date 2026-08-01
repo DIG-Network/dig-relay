@@ -569,11 +569,24 @@ listeners are UNAFFECTED by this setting; only the relay WebSocket listener term
     upgrading from a prior install at the other scope does not end up with two registrations both
     binding the relay's listen/health/dashboard/STUN ports. That sweep is **probe-gated** (a scope
     the probe did not positively see is never written to) and **best-effort but REPORTED**: its
-    result is carried in `result.migration` and in the summary. The probe is advisory, not
-    authoritative — a `systemctl --user` / `launchctl print gui/<uid>/…` issued from a root session
-    addresses root's own user domain, so a sweep run under `sudo` may not see (and therefore may not
-    clear) a desktop user's user-level registration. The install reports what it saw; it does not
-    promise the other scope is clean.
+    result is carried in `result.migration` and in the summary.
+  - **The scope probe is THREE-valued and MUST NEVER report absence it did not positively establish.**
+    `present` / `absent` / `unknown` are distinct outcomes, and only the service manager POSITIVELY
+    saying nothing is registered closes a scope out as clean:
+    - systemd (`systemctl [--user] cat <unit>`): `absent` iff stderr contains, case-insensitively,
+      `no files found for` or `could not be found`. There is deliberately NO exit-code condition — a
+      non-zero exit alone proves nothing.
+    - launchd (`launchctl print <domain>/<label>`): `absent` iff the exit code is `113`, or stderr
+      contains (case-insensitively) `could not find service`, `no such process`, or `no such file`.
+    - Windows SCM (`sc query <name>`): `absent` iff the exit code is `1060`
+      (`ERROR_SERVICE_DOES_NOT_EXIST`) — access-denied and every other code do not.
+    A successful probe is `present`, tested BEFORE any absence test. Every other result — notably
+    `Failed to connect to bus`, which is what `systemctl --user` says when run as root, and launchd's
+    `Bootstrap failed` for a domain root cannot reach — is `unknown`, carrying the tool's own message
+    verbatim. An `unknown` scope is NEVER collapsed into "not registered": it is reported as
+    `indeterminate` in `result.migration`/`scopes` and, for `uninstall`, fails the operation loudly.
+    Matching is case-insensitive SUBSTRING, never equality or a prefix. These signal sets are
+    byte-identical in semantics to `dig-node`'s, so one operator-facing story covers both components.
   - `uninstall --scope auto` removes the service at BOTH scopes (system AND user) at EITHER
     privilege level, resolved scope first: a plain unelevated `dig-relay uninstall` on a host an
     elevated installer registered at system scope MUST still address that system unit. The named
