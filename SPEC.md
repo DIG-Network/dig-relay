@@ -599,7 +599,8 @@ listeners are UNAFFECTED by this setting; only the relay WebSocket listener term
     through a success exit code or an `ok: true` envelope. On success the JSON reports
     `registered: false` (the field means "is it still registered") plus `removed_scopes` and a
     per-scope `scopes` array.
-  - No flag == `auto` == today's behaviour; a caller that never passes `--scope` sees no change.
+  - No flag defaults to `--scope auto` (privilege-level resolved); for `uninstall`, both scopes are targeted and indeterminate probes fail loudly—a behaviour change from silent sweep; for other verbs, prior behaviour is preserved.
+  - **Known divergence from dig-node:** `dig-relay` lacks account-enumeration (`sweep_other_accounts_user_scope()`), so root installing at system scope cannot clear other users' user-level registrations, reporting them indeterminate instead (#1906).
 
 ## 10. Conformance
 
