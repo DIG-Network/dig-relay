@@ -41,6 +41,12 @@ jobs:
   deploy:
     name: Build image and roll the service
     runs-on: ubuntu-latest
+    # A from-scratch image build here normally takes ~5 minutes. On v0.16.0 one took 3h28m and the
+    # job then died on expired credentials (below), so the release never rolled the service while
+    # the run still looked alive. Cap the job well above the normal build but far below the point
+    # where a stall becomes a silent multi-hour hole: a pathological build now fails FAST and
+    # visibly instead of burning hours to reach a confusing auth error.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,6 +73,19 @@ jobs:
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # Re-mint the OIDC credentials before the ECS calls. The assumed-role session is short-lived
+      # (~1h) and the image build sits between it and every AWS call below, so a build slower than
+      # the session lifetime leaves the deploy holding an expired token. That is exactly how the
+      # v0.16.0 deploy failed: creds minted at 03:05, a 3h28m build, then DescribeTaskDefinition
+      # returned ExpiredTokenException and the roll steps skipped — a red deploy AFTER a green
+      # image push, so the release looked shipped while the service still ran the old image.
+      # Refreshing here makes the deploy's validity independent of how long the build took.
+      - name: Re-configure AWS credentials (OIDC) for the ECS roll
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::873139760123:role/dig-relay-ci-deploy
+          aws-region: ${{ env.AWS_REGION }}
 
       # Clone the CURRENTLY-DEPLOYED task definition and swap only the image, so infra settings
       # (cpu/memory/roles/ports/log config) are preserved without being duplicated in this repo.
