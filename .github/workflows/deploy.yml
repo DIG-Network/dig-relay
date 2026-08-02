@@ -92,16 +92,25 @@ jobs:
       # workflow anticipates (the dispatch not landing, the apply going red, an approval timing out)
       # happens AFTER the push. Without this check the operator's first instinct, re-running the job,
       # would die at `docker push` and the recovery path would be one step from unusable.
+      #
+      # The skip is deliberately limited to a RE-RUN (`run_attempt > 1`). An unconditional skip would
+      # trade a loud failure for a silent one: someone with write access here could pre-push a
+      # poisoned image under the SHA of an already-reviewed commit, and a later release of that
+      # commit would ship those bytes while git history showed nothing. On a first attempt the push
+      # always happens, so a pre-existing tag collides against ECR's immutability and fails visibly —
+      # which is the behaviour that makes "the tag IS the provenance" true rather than aspirational.
       - name: Build and push image
         id: build
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           IMAGE="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
-          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
-               --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
-            echo "$IMAGE is already in ECR — re-run of an earlier build; not rebuilding."
+          if [ "${RUN_ATTEMPT:-1}" -gt 1 ] \
+             && aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+                  --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "$IMAGE is already in ECR and this is attempt $RUN_ATTEMPT — not rebuilding."
           else
             docker build -t "$IMAGE" .
             docker push "$IMAGE"
