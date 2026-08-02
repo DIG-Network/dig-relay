@@ -165,14 +165,24 @@ jobs:
       # The watch proves a run succeeded; this proves it was OURS and that it landed. Correlating on
       # a run title is good, but the only unambiguous evidence that this release is what the service
       # is running is the service itself. Read-only — this job holds no ECS write permission.
+      #
+      # Ask the SERVICE which revision it is on, then read that revision. Describing the family
+      # (`--task-definition dig-relay`) would return its newest ACTIVE revision, which is a weaker
+      # claim than this step's name makes: a revision can exist without the service being on it.
+      # Today nothing else registers one — that is what this PR establishes — so the two would agree,
+      # but an assertion should measure the thing it is named after rather than rely on an invariant
+      # enforced elsewhere.
       - name: Assert the service is running this commit's image
         run: |
           set -euo pipefail
+          revision="$(aws ecs describe-services \
+            --cluster dig-relay --services dig-relay \
+            --query 'services[0].taskDefinition' --output text)"
           image="$(aws ecs describe-task-definition \
-            --task-definition dig-relay \
+            --task-definition "$revision" \
             --query "taskDefinition.containerDefinitions[?name=='dig-relay'].image | [0]" \
             --output text)"
-          echo "Deployed image: $image"
+          echo "Service is on $revision, running image: $image"
           if [ "${image##*:}" != "$GITHUB_SHA" ]; then
             echo "::error::relay.dig.net is running ${image##*:}, not $GITHUB_SHA."
             echo "The apply reported success but the service did not take this image — another"
