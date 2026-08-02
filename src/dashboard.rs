@@ -292,6 +292,25 @@ pub fn route(
             cache_control: Some("no-store"),
             body: serde_json::to_vec(snapshot).unwrap_or_else(|_| b"{}".to_vec()),
         },
+        // `/health` is served HERE, on the relay's own listener, in addition to the standalone
+        // `:9451` listener (#1930). The load-balancer health check must be able to live on the
+        // TRAFFIC port: when Proxy Protocol v2 is enabled on a target group, this listener is the
+        // one that understands the header, whereas the separate `:9451` axum server does not — so a
+        // health check pointed there could fail the moment the header is switched on and take the
+        // whole target group down. Same body as `health::snapshot`, so either port answers alike.
+        "/health" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "application/json",
+            cache_control: Some("no-store"),
+            body: serde_json::to_vec(&serde_json::json!({
+                "status": "ok",
+                "connected_peers": snapshot.connected_peers,
+                "uptime_secs": snapshot.uptime_secs,
+                "version": env!("CARGO_PKG_VERSION"),
+            }))
+            .unwrap_or_else(|_| b"{}".to_vec()),
+        },
         "/mascot.png" => DashboardResponse {
             status: 200,
             reason: "OK",
@@ -969,6 +988,26 @@ mod tests {
 
         let missing = route("/nope", &snap, &map_snap);
         assert_eq!(missing.status, 404);
+    }
+
+    #[test]
+    fn health_is_served_on_the_traffic_port_too_so_the_check_can_move_there() {
+        // The load-balancer health check must be able to sit on the TRAFFIC port: only this
+        // listener understands a Proxy Protocol v2 header (#1930), so a check left on the separate
+        // :9451 axum server could fail the instant the header is enabled and drop the target group.
+        let snap = build_snapshot(vec![], Counters::default(), 0, 0, false);
+        let map_snap = empty_map_snapshot();
+
+        let health = route("/health", &snap, &map_snap);
+        assert_eq!(health.status, 200);
+        assert_eq!(health.content_type, "application/json");
+
+        let v: serde_json::Value = serde_json::from_slice(&health.body).unwrap();
+        // Same field names the standalone :9451 endpoint returns, so either port answers alike.
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert!(v.get("connected_peers").is_some());
+        assert!(v.get("uptime_secs").is_some());
     }
 
     #[test]
