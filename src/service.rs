@@ -1188,6 +1188,15 @@ pub fn config_from_env() -> RelayServerConfig {
     if let Ok(p) = std::env::var("DIG_RELAY_TLS_KEY_PATH") {
         config.tls_key_path = Some(std::path::PathBuf::from(p));
     }
+    // Trusted PROXY-protocol sources (#1930). A malformed list is REFUSED loudly rather than
+    // silently falling back to the empty default: this setting decides who may declare their own
+    // source IP, and a typo that quietly disables it would restore the exact bug it exists to fix.
+    if let Ok(list) = std::env::var("DIG_RELAY_TRUSTED_PROXY_CIDRS") {
+        match crate::proxy_protocol::TrustedProxies::parse(&list) {
+            Ok(t) => config.trusted_proxies = t,
+            Err(e) => panic!("DIG_RELAY_TRUSTED_PROXY_CIDRS is invalid: {e}"),
+        }
+    }
     config
 }
 

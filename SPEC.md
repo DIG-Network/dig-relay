@@ -77,11 +77,37 @@ IPv4-mapped loopback is not universally supported by every OS/network stack.
 
 Reference: `src/service.rs::loopback_probe_addr` (pure) + `probe_health` (the I/O wrapper).
 
+### 2.9a Observed source address, and PROXY protocol v2 (normative)
+
+The **observed source address** of a connection is the remote address of its TCP socket, EXCEPT when
+the connection arrives from a configured trusted proxy, in which case it is the address that proxy
+declares in a PROXY protocol v2 header.
+
+This exception exists because a TLS-terminating load balancer opens a fresh connection to the relay,
+so the socket address is the BALANCER's — identical for every peer in the world. Without the header
+the relay would publish that one address as every peer's dialable candidate (§2.9), key every per-IP
+limit (§3.0) on a single shared bucket, and locate every peer at one point on `/map` (§7).
+
+- The relay MUST read a PROXY protocol v2 header ONLY from a source inside `trusted_proxies`.
+- `trusted_proxies` MUST default to EMPTY, and with it empty the relay MUST NOT read a header at all:
+  the observed source address is exactly the socket address, unchanged.
+- A header from an untrusted source MUST NOT be honoured. It is self-declared data; honouring it
+  would let any host that can reach the listener choose its own source IP and thereby shed a ban
+  (§3.0), evade the per-IP caps, and place itself anywhere on the map.
+- A `LOCAL` command, an address family other than TCP4/TCP6, or an unparseable header from a trusted
+  proxy MUST leave the observed source address as the socket address rather than failing the
+  connection — a trusted proxy's health check and a header-format disagreement are both legitimate.
+- A trusted source that sends NO header MUST connect normally on its socket address, so the proxy's
+  header setting and a relay deploy can be rolled out in either order without an outage.
+- A trusted source that opens a connection and sends nothing MUST be dropped after a bounded wait.
+
+Reference: `src/proxy_protocol.rs` (pure parse + trust gate) wired at the accept loop in
+`src/server.rs::run`.
+
 ### 2.9 Dialable-address resolution (B1, normative)
 
-On registration the relay observes the peer's reflexive source address (the remote address of its
-outbound WebSocket) — a public IP, but an ephemeral NAT source PORT, not the node's inbound gossip
-listener. A node therefore advertises its gossip LISTEN candidate(s) in `Register.listen_addrs`
+On registration the relay observes the peer's reflexive source address (§2.9a) — a public IP, but an
+ephemeral NAT source PORT, not the node's inbound gossip listener. A node therefore advertises its gossip LISTEN candidate(s) in `Register.listen_addrs`
 (IPv6-first, §2.1), where the useful part is the PORT (a dual-stack node binds the unspecified host
 `[::]`). The relay resolves each advertised candidate into a DIALABLE `RelayPeerInfo.addresses` entry:
 
@@ -460,6 +486,7 @@ coordinate is ever computed into or serialized by this endpoint:
 | `ban_strike_window` | 60 s | Rolling window strikes accumulate over; MUST be > 0 when `ban_threshold` > 0 (§3.0) |
 | `tls_cert_path` | `None` | Optional; MUST be set together with `tls_key_path` (§3.2/§8) |
 | `tls_key_path` | `None` | Optional; MUST be set together with `tls_cert_path` (§3.2/§8) |
+| `trusted_proxies` | empty | CIDRs whose PROXY protocol v2 header is honoured; empty means no header is ever read (§2.9a). Env `DIG_RELAY_TRUSTED_PROXY_CIDRS`, comma-separated; an unparseable list is refused at startup rather than silently ignored |
 
 `validate()` rejects `max_connections == 0`, a zero `idle_timeout`, a zero `outbound_queue_capacity`,
 a zero `max_message_bytes`, a zero `register_timeout`, a zero `health_check_interval` or
