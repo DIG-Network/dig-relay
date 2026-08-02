@@ -212,6 +212,15 @@ impl Registry {
             .map(|(id, p)| (id.clone(), p.tx.clone()))
             .collect()
     }
+
+    /// Every registered peer's sender — the fan-out target for a relay-INITIATED request such as
+    /// RLY-009 `get_dht_records` (#1935), which goes to all peers rather than within one network.
+    pub fn all_senders(&self) -> Vec<(String, mpsc::Sender<RelayMessage>)> {
+        self.peers
+            .iter()
+            .map(|(id, p)| (id.clone(), p.tx.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
