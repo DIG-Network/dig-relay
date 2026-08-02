@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.0] - 2026-08-02
+
+### Features
+- **dht:** /dht + /dht.json — the content layer the connected nodes know about (#24)
+
 ## [0.18.0] - 2026-08-02
 
 ### Features
