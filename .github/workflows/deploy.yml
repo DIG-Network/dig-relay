@@ -1,16 +1,36 @@
-# Fargate deploy for the canonical relay.dig.net.
+# Ship a released dig-relay to the canonical relay.dig.net.
 #
 # The stable binary release (release.yml) publishes per-OS binaries so anyone can run their own
 # relay; THIS workflow additionally ships the same tagged commit to the canonical relay.dig.net
 # ECS/Fargate service, so the hosted relay never drifts behind a stable release (dig_ecosystem
 # #985 — a stale relay lacks resolve_dialable and peer introductions carry no dialable address).
 #
-# Flow (on a `vX.Y.Z` tag, or a manual dispatch): build the container from THIS commit, push it to
-# ECR tagged with the git SHA (matching the deployed-image convention), clone the live task
-# definition onto the new image, and roll the service — waiting for the deployment to stabilise.
+# ── WHAT THIS WORKFLOW OWNS ──────────────────────────────────────────────────────────────────────
+# It owns the relay's VERSION and nothing else. It builds the container image from this commit,
+# pushes it to ECR, and hands the tag to relay.dig.net's terraform, which owns the task definition's
+# SHAPE — ports, container command, log config, and the DIG_RELAY_TRUSTED_PROXY_CIDRS security
+# boundary. This workflow makes no ECS WRITE call; its single ECS call is a read-back after the
+# deploy, asserting the service actually took this release's image.
 #
-# Auth is keyless GitHub OIDC into the least-privilege `dig-relay-ci-deploy` IAM role (ECR push +
-# ecs register/update on the dig-relay service + PassRole for the task-exec role only).
+# It used to. It read the LIVE task definition with `describe-task-definition`, rendered the new image
+# onto it and registered a revision — while relay.dig.net's terraform applied its own idea of the same
+# resource. Two writers, one resource, no arbitration (dig_ecosystem #1938). Two consequences, both
+# real: terraform's recorded revision trailed the running one by eighteen, and because this workflow
+# cloned whatever was live, every hand edit was carried forward forever. That is how
+# `--dashboard-listen`, the 8080 port mapping and DIG_RELAY_TRUSTED_PROXY_CIDRS came to exist in
+# production while being absent from the terraform source — a security boundary living only in a
+# console, reviewable by nobody.
+#
+# Flow (on a `vX.Y.Z` tag, or a manual dispatch): build the container from THIS commit, push it to
+# ECR tagged with the git SHA, then dispatch relay.dig.net's `deploy.yml` with that tag and watch the
+# run — so a failed terraform apply fails this deploy too, rather than leaving a pushed image nobody
+# noticed never shipped.
+#
+# Auth: keyless GitHub OIDC into the `dig-relay-ci-deploy` IAM role, plus `RELEASE_TOKEN` to dispatch
+# the deploy in the other repo. That role MUST hold ECR access and ECS reads only — narrowing it to
+# match (dropping ecs:RegisterTaskDefinition / ecs:UpdateService / iam:PassRole, which this workflow
+# no longer uses) is sequenced after the new flow is proven end-to-end, so the boundary becomes
+# structural rather than conventional.
 
 name: Deploy (relay.dig.net)
 
@@ -32,20 +52,19 @@ permissions:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: dig-relay
-  ECS_CLUSTER: dig-relay
-  ECS_SERVICE: dig-relay
-  ECS_TASK_FAMILY: dig-relay
-  CONTAINER_NAME: dig-relay
+  # The repo whose terraform owns the relay's task definition, and the workflow that applies it.
+  INFRA_REPO: DIG-Network/relay.dig.net
+  INFRA_WORKFLOW: deploy.yml
 
 jobs:
   deploy:
-    name: Build image and roll the service
+    name: Build image and hand it to the infra deploy
     runs-on: ubuntu-latest
     # A from-scratch image build here normally takes ~5 minutes. On v0.16.0 one took 3h28m and the
-    # job then died on expired credentials (below), so the release never rolled the service while
-    # the run still looked alive. Cap the job well above the normal build but far below the point
-    # where a stall becomes a silent multi-hour hole: a pathological build now fails FAST and
-    # visibly instead of burning hours to reach a confusing auth error.
+    # job then died on expired credentials, so the release never shipped while the run still looked
+    # alive. Cap the job well above the normal build but far below the point where a stall becomes a
+    # silent multi-hour hole: a pathological build now fails FAST and visibly. The cap also bounds
+    # the downstream watch below.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -58,57 +77,126 @@ jobs:
           role-to-assume: arn:aws:iam::873139760123:role/dig-relay-ci-deploy
           aws-region: ${{ env.AWS_REGION }}
 
+      # The ECR authorization token is valid for 12 hours — comfortably longer than this job's cap —
+      # so unlike the assumed-role session it cannot expire behind a slow build.
       - name: Log in to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Tag the image with the full git SHA — the same convention the deployed task definition uses,
-      # so an image tag always names the exact source it was built from.
+      # Tag the image with the full git SHA. The tag IS the provenance: relay.dig.net's version gate
+      # resolves it against this repo's history to prove a deploy is a forward step, so it must name
+      # a real commit here.
+      #
+      # Skipping the build when the tag already exists is what makes this job RE-RUNNABLE. The ECR
+      # repo has immutable tags, so a second push of the same tag fails — and every failure this
+      # workflow anticipates (the dispatch not landing, the apply going red, an approval timing out)
+      # happens AFTER the push. Without this check the operator's first instinct, re-running the job,
+      # would die at `docker push` and the recovery path would be one step from unusable.
+      #
+      # The skip is deliberately limited to a RE-RUN (`run_attempt > 1`). An unconditional skip would
+      # trade a loud failure for a silent one: someone with write access here could pre-push a
+      # poisoned image under the SHA of an already-reviewed commit, and a later release of that
+      # commit would ship those bytes while git history showed nothing. On a first attempt the push
+      # always happens, so a pre-existing tag collides against ECR's immutability and fails visibly —
+      # which is the behaviour that makes "the tag IS the provenance" true rather than aspirational.
       - name: Build and push image
         id: build
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
+          set -euo pipefail
           IMAGE="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
-          docker build -t "$IMAGE" .
-          docker push "$IMAGE"
+          if [ "${RUN_ATTEMPT:-1}" -gt 1 ] \
+             && aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+                  --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "$IMAGE is already in ECR and this is attempt $RUN_ATTEMPT — not rebuilding."
+          else
+            docker build -t "$IMAGE" .
+            docker push "$IMAGE"
+          fi
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-      # Re-mint the OIDC credentials before the ECS calls. The assumed-role session is short-lived
-      # (~1h) and the image build sits between it and every AWS call below, so a build slower than
-      # the session lifetime leaves the deploy holding an expired token. That is exactly how the
-      # v0.16.0 deploy failed: creds minted at 03:05, a 3h28m build, then DescribeTaskDefinition
-      # returned ExpiredTokenException and the roll steps skipped — a red deploy AFTER a green
-      # image push, so the release looked shipped while the service still ran the old image.
-      # Refreshing here makes the deploy's validity independent of how long the build took.
-      - name: Re-configure AWS credentials (OIDC) for the ECS roll
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::873139760123:role/dig-relay-ci-deploy
-          aws-region: ${{ env.AWS_REGION }}
-
-      # Clone the CURRENTLY-DEPLOYED task definition and swap only the image, so infra settings
-      # (cpu/memory/roles/ports/log config) are preserved without being duplicated in this repo.
-      - name: Render new task definition
-        id: taskdef
+      # Hand the tag to the terraform that owns the task definition, and watch that run — which is
+      # what makes a failed apply fail THIS release rather than leaving a pushed image nobody
+      # noticed never shipped.
+      #
+      # `gh workflow run` returns no run id, so the run has to be FOUND. "The newest dispatch" is not
+      # good enough: a concurrent release, a manual deploy or a rollback would satisfy it, and this
+      # step would report someone else's result as its own. relay.dig.net's `run-name` carries the
+      # image tag, so the run is matched on the tag THIS job pushed.
+      #
+      # If relay.dig.net's `production` environment ever gains required reviewers, the watch blocks
+      # until the job timeout above — an approval gate on a release path is a deliberate decision,
+      # and this is where it would be felt.
+      - name: Deploy via relay.dig.net terraform
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          aws ecs describe-task-definition \
-            --task-definition "$ECS_TASK_FAMILY" \
-            --query 'taskDefinition' --output json > taskdef.json
-          echo "path=taskdef.json" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
 
-      - name: Fill in new image
-        id: render
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: ${{ steps.taskdef.outputs.path }}
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.build.outputs.image }}
+          # The newest dispatch whose run title names our image tag, or empty.
+          our_run_id() {
+            gh run list --repo "$INFRA_REPO" --workflow "$INFRA_WORKFLOW" \
+              --event workflow_dispatch --limit 20 --json databaseId,displayTitle \
+              --jq "[.[] | select(.displayTitle | contains(\"$IMAGE_TAG\"))] | .[0].databaseId // empty"
+          }
 
-      - name: Deploy to ECS and wait for stability
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-        with:
-          task-definition: ${{ steps.render.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
+          before="$(our_run_id || true)"
+          gh workflow run "$INFRA_WORKFLOW" --repo "$INFRA_REPO" --ref main \
+            -f image_tag="$IMAGE_TAG"
+
+          # `|| true`: a transient API hiccup during the poll must not abort the step under `set -e`.
+          # Aborting here would skip the recovery instructions below and report a failure whose cause
+          # was a rate limit, while the deploy it dispatched carried on unwatched.
+          run_id=""
+          for _ in $(seq 1 40); do
+            sleep 5
+            candidate="$(our_run_id || true)"
+            if [ -n "$candidate" ] && [ "$candidate" != "$before" ]; then
+              run_id="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$run_id" ]; then
+            echo "::error::dispatched $INFRA_REPO $INFRA_WORKFLOW but no run naming $IMAGE_TAG appeared within 200s."
+            echo "The image is already pushed. Re-run this job (the build is skipped when the tag"
+            echo "exists), or dispatch the deploy directly:"
+            echo "  gh workflow run deploy.yml --repo $INFRA_REPO --ref main -f image_tag=$IMAGE_TAG"
+            exit 1
+          fi
+
+          echo "Watching https://github.com/$INFRA_REPO/actions/runs/$run_id"
+          gh run watch "$run_id" --repo "$INFRA_REPO" --exit-status
+
+      # The watch proves a run succeeded; this proves it was OURS and that it landed. Correlating on
+      # a run title is good, but the only unambiguous evidence that this release is what the service
+      # is running is the service itself. Read-only — this job holds no ECS write permission.
+      #
+      # Ask the SERVICE which revision it is on, then read that revision. Describing the family
+      # (`--task-definition dig-relay`) would return its newest ACTIVE revision, which is a weaker
+      # claim than this step's name makes: a revision can exist without the service being on it.
+      # Today nothing else registers one — that is what this PR establishes — so the two would agree,
+      # but an assertion should measure the thing it is named after rather than rely on an invariant
+      # enforced elsewhere.
+      - name: Assert the service is running this commit's image
+        run: |
+          set -euo pipefail
+          revision="$(aws ecs describe-services \
+            --cluster dig-relay --services dig-relay \
+            --query 'services[0].taskDefinition' --output text)"
+          image="$(aws ecs describe-task-definition \
+            --task-definition "$revision" \
+            --query "taskDefinition.containerDefinitions[?name=='dig-relay'].image | [0]" \
+            --output text)"
+          echo "Service is on $revision, running image: $image"
+          if [ "${image##*:}" != "$GITHUB_SHA" ]; then
+            echo "::error::relay.dig.net is running ${image##*:}, not $GITHUB_SHA."
+            echo "The apply reported success but the service did not take this image — another"
+            echo "deploy landed after ours, or the wrong run was watched. Investigate before"
+            echo "re-dispatching; do NOT assume this release shipped."
+            exit 1
+          fi
+          echo "ok: relay.dig.net is running this release."

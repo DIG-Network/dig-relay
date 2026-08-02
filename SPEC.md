@@ -773,5 +773,39 @@ not by PR CI. This is an accepted trade-off (the pure-Rust/rustls graph rarely b
 the nightly channel bounds the detection lag to ~24h; widening `ci.yml` to a cross-OS build matrix
 is a future hardening.
 
+### 11.7 Shipping to relay.dig.net — version here, shape there (normative)
+
+`.github/workflows/deploy.yml` fires on a `vX.Y.Z` tag and ships the released commit to the canonical
+`relay.dig.net` Fargate service. It owns the deployed **version** and nothing else.
+
+- It MUST build the container image from the tagged commit and push it to the `dig-relay` ECR
+  repository tagged with the full git SHA. The tag IS the provenance: `relay.dig.net`'s deploy
+  resolves it against this repo's history to prove a deploy moves forward, so it MUST name a real
+  commit here.
+- It MUST NOT call `register-task-definition` or `update-service`, and MUST NOT use the
+  `amazon-ecs-render-task-definition` / `amazon-ecs-deploy-task-definition` actions. The ECS task
+  definition — ports, container command, log configuration, and the `DIG_RELAY_TRUSTED_PROXY_CIDRS`
+  boundary of §2.9a — is owned solely by `relay.dig.net`'s terraform. The IAM role this workflow
+  assumes MUST grant ECR access and ECS reads only, and MUST NOT grant any ECS write permission.
+  (The live policy is being narrowed to match once the flow is proven end-to-end — dig_ecosystem
+  #1938; until then the constraint is enforced by the workflow shape, not by IAM.)
+- It MUST hand the image tag to `DIG-Network/relay.dig.net`'s `deploy.yml` (`image_tag` input) and
+  watch that run to a terminal state, failing when it fails. A pushed image that never reached the
+  service MUST NOT leave a green release behind it.
+- It MUST identify the run it dispatched by matching that run's title against the image tag it
+  pushed. `gh workflow run` returns no run id, and "the newest dispatch" would match a concurrent
+  release, a manual deploy, or a rollback — reporting another run's outcome as this release's.
+- It MUST read the deployed task definition back after the apply and FAIL when the deployed image
+  tag is not this commit's SHA. A watched run going green proves an apply succeeded, not that this
+  release is serving. This read is the one permitted ECS call.
+- It MUST NOT rebuild an image tag that already exists in ECR. The repository has immutable tags and
+  every anticipated failure occurs after the push, so a re-run must be able to reach the deploy step.
+
+The reason this is normative rather than conventional: two writers of one task definition disagree
+silently. When both existed, terraform's recorded revision trailed the running one by eighteen, and
+because this side rendered onto the LIVE definition, console edits were carried forward indefinitely
+— including the §2.9a trusted-proxy CIDR list, a security boundary that decides whose self-declared
+source address the relay believes. `tests/relay_deploy_workflow_shape.rs` pins these rules.
+
 A change to any behavior in this document MUST update this SPEC in the same unit of work.
 
