@@ -87,7 +87,35 @@ builds `main` HEAD, publishes/refreshes today's `nightly-YYYYMMDD` pre-release, 
 | `nightly-release.yml` | midnight-UTC cron + `workflow_dispatch` | Orchestrator: stable (changelog + tag) + nightly (build + pre-release + prune). |
 | `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag. |
 | `build-binaries.yml` | `workflow_call` | Reusable cross-OS build (both channels call it). |
+| `deploy.yml` | `push: tags: v*` (+ dispatch) | Ships the released commit to `relay.dig.net`: builds + pushes the image, hands the tag to that repo's terraform, watches the apply. |
 | `ci.yml` | PR + push to main | The fmt/clippy/test/coverage gate (pre-merge). NOTE: `ubuntu-latest` only — cross-platform build breaks are first caught by the nightly channel, not PR CI (SPEC §11.6). |
+
+## Shipping to relay.dig.net
+
+The `vX.Y.Z` tag also fires `deploy.yml`, which ships the release to the canonical Fargate service.
+It owns the **version** only: it builds the image, pushes it to ECR tagged with the git SHA, then
+dispatches `DIG-Network/relay.dig.net`'s `deploy.yml` with that `image_tag` and watches the run. A
+failed terraform apply therefore fails this deploy — a pushed image never silently fails to ship.
+
+**This repo does not write the ECS task definition.** Ports, the container command, log config and
+`DIG_RELAY_TRUSTED_PROXY_CIDRS` (the §2.9a security boundary) live in relay.dig.net's terraform, and
+its deploy refuses an image that would move the running version backwards. Both pipelines used to
+write that resource and each could silently undo the other — dig_ecosystem #1938; SPEC §11.7 makes
+the split normative and `tests/relay_deploy_workflow_shape.rs` enforces it.
+
+Nothing here needs a manual step. To ship a specific image or roll back, see
+[relay.dig.net's runbook](https://github.com/DIG-Network/relay.dig.net/blob/main/runbooks/deploy.md).
+
+### If a deploy fails
+
+```bash
+gh run list --repo DIG-Network/dig-relay   --workflow deploy.yml --limit 3
+gh run list --repo DIG-Network/relay.dig.net --workflow deploy.yml --limit 3
+```
+
+The image push and the apply are separate halves. If the push succeeded and the dispatch or apply
+did not, the image is already in ECR — re-dispatch the infra deploy with that SHA rather than
+re-running the build.
 
 ## Local build (dev)
 

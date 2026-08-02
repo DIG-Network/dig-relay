@@ -773,5 +773,29 @@ not by PR CI. This is an accepted trade-off (the pure-Rust/rustls graph rarely b
 the nightly channel bounds the detection lag to ~24h; widening `ci.yml` to a cross-OS build matrix
 is a future hardening.
 
+### 11.7 Shipping to relay.dig.net — version here, shape there (normative)
+
+`.github/workflows/deploy.yml` fires on a `vX.Y.Z` tag and ships the released commit to the canonical
+`relay.dig.net` Fargate service. It owns the deployed **version** and nothing else.
+
+- It MUST build the container image from the tagged commit and push it to the `dig-relay` ECR
+  repository tagged with the full git SHA. The tag IS the provenance: `relay.dig.net`'s deploy
+  resolves it against this repo's history to prove a deploy moves forward, so it MUST name a real
+  commit here.
+- It MUST NOT call `describe-task-definition`, `register-task-definition`, or `update-service`, and
+  MUST NOT use the `amazon-ecs-render-task-definition` / `amazon-ecs-deploy-task-definition` actions.
+  The ECS task definition — ports, container command, log configuration, and the
+  `DIG_RELAY_TRUSTED_PROXY_CIDRS` boundary of §2.9a — is owned solely by `relay.dig.net`'s terraform.
+  Its IAM role grants ECR push only.
+- It MUST hand the image tag to `DIG-Network/relay.dig.net`'s `deploy.yml` (`image_tag` input) and
+  watch that run to a terminal state, failing when it fails. A pushed image that never reached the
+  service MUST NOT leave a green release behind it.
+
+The reason this is normative rather than conventional: two writers of one task definition disagree
+silently. When both existed, terraform's recorded revision trailed the running one by eighteen, and
+because this side rendered onto the LIVE definition, console edits were carried forward indefinitely
+— including the §2.9a trusted-proxy CIDR list, a security boundary that decides whose self-declared
+source address the relay believes. `tests/relay_deploy_workflow_shape.rs` pins these rules.
+
 A change to any behavior in this document MUST update this SPEC in the same unit of work.
 
