@@ -30,6 +30,11 @@ use crate::wire::{PexMessage, RelayMessage, RelayPeerInfo};
 /// only how often the relay *checks* whether a link is due, so ~1/s is ample and cheap.
 const PEX_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often the relay refreshes its cached `/dht` view (RLY-009, #1935). Slow on purpose: this is
+/// observability, the answers change on the timescale of content publication, and every round costs
+/// one frame on every peer's reservation socket.
+const DHT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How long a TRUSTED proxy has to deliver its PROXY protocol v2 header before the connection is
 /// dropped (#1930). A load balancer writes the header in the same flight as the connection, so this
 /// only ever fires on a genuinely stuck peer — short enough that a stall cannot pin an accept task,
@@ -105,6 +110,16 @@ pub struct RelayState {
     /// checks the per-IP registration rate + concurrent-registration cap. The per-connection
     /// message/byte limiter is task-local (a `PerConnLimiter`), not held here.
     pub abuse: crate::limits::AbusePolicy,
+    /// The most recently built `/dht` view (RLY-009, #1935), refreshed by a background sweep.
+    ///
+    /// Served from CACHE rather than fanning out per request: a fan-out on every page load would let
+    /// any anonymous caller make the relay interrogate every connected node, turning a public
+    /// endpoint into an amplifier. The sweep bounds that cost to one round per interval regardless
+    /// of request rate.
+    pub dht_view: std::sync::Mutex<crate::dht_view::DhtView>,
+    /// Answers collected during the current RLY-009 sweep window, drained when the view is rebuilt.
+    /// Bounded by the registered-peer count, which the global connection cap already bounds.
+    pub dht_answers: std::sync::Mutex<Vec<crate::dht_view::PeerAnswer>>,
 }
 
 impl RelayState {
@@ -122,6 +137,8 @@ impl RelayState {
     ) -> Arc<Self> {
         Arc::new(RelayState {
             abuse: crate::limits::AbusePolicy::new(&config),
+            dht_view: std::sync::Mutex::new(crate::dht_view::build_dht_view(&[], 0)),
+            dht_answers: std::sync::Mutex::new(Vec::new()),
             registry: Mutex::new(Registry::new()),
             pex: Mutex::new(PexRelay::new()),
             connected: AtomicU64::new(0),
@@ -346,6 +363,19 @@ fn dispatch(session: &Session, msg: RelayMessage) -> Action {
         ])
         .tap_network(network_id),
 
+        // RLY-009 (#1935): the ANSWER to a request this relay made. `dispatch` is pure, so it only
+        // classifies; the caller records the payload via `record_dht_answer` before calling in.
+        RelayMessage::DhtRecords { .. } => Action::Nothing,
+
+        // A peer must never ASK the relay for DHT records — the relay holds none, and answering
+        // would invite peers to use each other's reservations as a query fan-out. Rejected as a
+        // per-request error (code 2), which by dig-nat's classification does NOT cost the asker its
+        // reservation.
+        RelayMessage::GetDhtRecords { .. } => Action::Error {
+            code: errcode::BAD_MESSAGE,
+            message: "get_dht_records is relay-to-node only (RLY-009)".to_string(),
+        },
+
         // RLY-006: keepalive. A ping is answered with a pong; a pong we receive is ignored.
         RelayMessage::Ping { timestamp } => {
             Action::ReplyToSelf(vec![RelayMessage::Pong { timestamp }])
@@ -476,6 +506,11 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
     // for the (much longer) idle timeout, so a half-open peer stops poisoning introductions + PEX
     // quickly. Runs for the lifetime of the accept loop.
     tokio::spawn(health_sweep(state.clone()));
+
+    // RLY-009 (#1935): periodically ask every registered node for its aggregated DHT records and
+    // cache the union for `/dht`. A background sweep rather than a per-request fan-out, so a public
+    // endpoint can never be used to make the relay interrogate the whole network on demand.
+    tokio::spawn(dht_sweep(state.clone()));
 
     // Optional mTLS termination (SPEC.md §3.2/§8, `src/tls.rs`): when configured, every accepted TCP
     // connection is first wrapped in a client-cert-mandatory TLS handshake; the `peer_id` derived
@@ -797,6 +832,25 @@ where
         // Observational dashboard counters (relayed bytes + hole-punch attempts/outcomes). A cheap
         // no-op for every other kind; done once per parsed frame, before any routing.
         state.record_relayed(&msg);
+
+        // RLY-009 (#1935): record a node's answer into the current sweep window. Done here, beside
+        // the other stateful intercepts, so `dispatch` stays pure. Only accepted from a REGISTERED
+        // peer — an unregistered socket must not be able to seed the public /dht view.
+        if let RelayMessage::DhtRecords {
+            records, truncated, ..
+        } = &msg
+        {
+            if session.peer_id.is_some() {
+                state
+                    .dht_answers
+                    .lock()
+                    .unwrap()
+                    .push(crate::dht_view::PeerAnswer {
+                        records: records.clone(),
+                        truncated: *truncated,
+                    });
+            }
+        }
 
         // GetPeers is handled here (needs a registry read the pure dispatcher can't do).
         if let RelayMessage::GetPeers { network_id } = &msg {
@@ -1279,6 +1333,42 @@ async fn sweep_once(state: &Arc<RelayState>, now: u64) {
 /// connection's own read loop already enforces (strictly longer, `config.rs` validates it) — the
 /// sweep is what stops a half-open peer from poisoning introductions + PEX for the whole idle
 /// window. Runs for the lifetime of the accept loop, same as [`pex_housekeeping`].
+/// How long the relay waits for RLY-009 answers before building the view from whoever replied.
+/// A node that is slow, busy, or simply pre-RLY-009 must not hold the sweep open.
+const DHT_ANSWER_WINDOW: Duration = Duration::from_secs(5);
+
+/// How many content keys each node is asked for. Bounds the per-answer frame on a socket the node
+/// depends on for its own reachability, and keeps the union's cost predictable.
+const DHT_MAX_KEYS_PER_PEER: usize = 500;
+
+/// Periodically refresh the cached `/dht` view (RLY-009, #1935).
+///
+/// Asks every registered peer for its aggregated provider records, waits a bounded window, and
+/// rebuilds the view from whatever arrived. Answers land asynchronously via the connection tasks
+/// (see [`record_dht_answer`]), so a peer that never answers — including every pre-RLY-009 node —
+/// simply does not contribute, which is the soft-fork behaviour the wire promises.
+async fn dht_sweep(state: Arc<RelayState>) {
+    let mut ticker = tokio::time::interval(DHT_SWEEP_INTERVAL);
+    loop {
+        ticker.tick().await;
+        let targets = { state.registry.lock().await.all_senders() };
+        for (_peer_id, tx) in targets {
+            let _ = tx.try_send(RelayMessage::GetDhtRecords {
+                max_keys: DHT_MAX_KEYS_PER_PEER,
+            });
+        }
+        // Give answers time to arrive, then rebuild from what the collector gathered.
+        tokio::time::sleep(DHT_ANSWER_WINDOW).await;
+        let answers = { std::mem::take(&mut *state.dht_answers.lock().unwrap()) };
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let view = crate::dht_view::build_dht_view(&answers, now);
+        *state.dht_view.lock().unwrap() = view;
+    }
+}
+
 async fn health_sweep(state: Arc<RelayState>) {
     let mut ticker = tokio::time::interval(state.config.health_check_interval);
     loop {

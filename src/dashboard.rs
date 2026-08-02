@@ -247,6 +247,13 @@ fn empty_map_snapshot() -> MapSnapshot {
     build_map_snapshot(&[], &LiveGeoResolver, MAP_CELL_DEG, 0)
 }
 
+/// A placeholder `/dht` view for the route tests. Unlike [`empty_map_snapshot`], the serving path
+/// never needs one — `serve_http` always reads the real cached view.
+#[cfg(test)]
+fn empty_dht_view() -> crate::dht_view::DhtView {
+    crate::dht_view::build_dht_view(&[], 0)
+}
+
 /// Current Unix-epoch time in seconds (saturating) — the wall clock for `connected_secs`.
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -276,6 +283,7 @@ pub fn route(
     path: &str,
     snapshot: &StatsSnapshot,
     map_snapshot: &MapSnapshot,
+    dht_view: &crate::dht_view::DhtView,
 ) -> DashboardResponse {
     match path {
         "/" => DashboardResponse {
@@ -331,6 +339,23 @@ pub fn route(
             content_type: "application/json",
             cache_control: Some("no-store"),
             body: serde_json::to_vec(map_snapshot).unwrap_or_else(|_| b"{}".to_vec()),
+        },
+        // RLY-009 (#1935): what the connected nodes collectively know about the CONTENT layer.
+        // Served from the cached sweep — never a per-request fan-out, which would let any anonymous
+        // caller make the relay interrogate every node on the network.
+        "/dht.json" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "application/json",
+            cache_control: Some("no-store"),
+            body: serde_json::to_vec(dht_view).unwrap_or_else(|_| b"{}".to_vec()),
+        },
+        "/dht" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "text/html; charset=utf-8",
+            cache_control: None,
+            body: DHT_HTML.as_bytes().to_vec(),
         },
         "/map/globe.gl.min.js" => DashboardResponse {
             status: 200,
@@ -397,7 +422,8 @@ where
         "/map" | "/map.json" => live_map_snapshot(state).await,
         _ => empty_map_snapshot(),
     };
-    let resp = route(head.path(), &snapshot, &map_snapshot);
+    let dht_view = state.dht_view.lock().unwrap().clone();
+    let resp = route(head.path(), &snapshot, &map_snapshot, &dht_view);
     let mut headers: Vec<(&str, &str)> = vec![("Content-Type", resp.content_type)];
     if let Some(cc) = resp.cache_control {
         headers.push(("Cache-Control", cc));
@@ -599,6 +625,51 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 </body>
 </html>
 "#;
+
+/// The `/dht` page: the CONTENT layer the connected nodes collectively know about (RLY-009, #1935).
+/// Renders `/dht.json` client-side; deliberately plain, because the honest framing matters more than
+/// the chrome — this is a SAMPLE of the DHT taken through the currently-connected peers, not a crawl.
+const DHT_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DIG Network — DHT records</title>
+<style>
+ :root{color-scheme:dark}
+ body{margin:0;background:#0b0b12;color:#e8e8f0;font:14px/1.5 ui-sans-serif,system-ui,sans-serif}
+ main{max-width:900px;margin:0 auto;padding:32px 20px}
+ h1{font-size:20px;margin:0 0 4px}
+ .sub{color:#9a9ab0;margin:0 0 24px}
+ .note{background:#16161f;border-left:3px solid #5800d6;padding:12px 14px;margin:0 0 20px;color:#c8c8d8}
+ table{width:100%;border-collapse:collapse}
+ th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #23232f}
+ th{color:#9a9ab0;font-weight:600}
+ td.k{font-family:ui-monospace,monospace;font-size:12px;color:#b9b9cc;word-break:break-all}
+ td.n{text-align:right;font-variant-numeric:tabular-nums}
+ .empty{color:#9a9ab0;padding:24px 0}
+</style></head><body><main>
+<h1>DHT records</h1>
+<p class="sub" id="sub">loading…</p>
+<p class="note">A <strong>sample</strong>, not a global crawl. The relay is not a DHT node; this is the
+union of what the currently-connected peers report about their own provider stores, so coverage grows
+with the network. Counts are self-reported by untrusted peers and are observability only.</p>
+<div id="out"></div>
+<script>
+fetch('/dht.json').then(r=>r.json()).then(v=>{
+  document.getElementById('sub').textContent =
+    `${v.total_keys} content key(s) from ${v.reporting_peers} reporting peer(s)` +
+    (v.truncated ? ` — showing ${v.keys.length}, view truncated` : '');
+  if(!v.keys || !v.keys.length){
+    document.getElementById('out').innerHTML =
+      '<p class="empty">No records reported yet. Peers answer on the relay’s sweep interval, and only nodes new enough to speak RLY-009 answer at all.</p>';
+    return;
+  }
+  const rows = v.keys.map(k=>
+    `<tr><td class="k">${k.content_key}</td><td class="n">${k.providers}</td><td class="n">${k.reported_by}</td></tr>`).join('');
+  document.getElementById('out').innerHTML =
+    `<table><thead><tr><th>content key</th><th class="n">providers</th><th class="n">reported by</th></tr></thead><tbody>${rows}</tbody></table>`;
+}).catch(e=>{document.getElementById('sub').textContent='failed to load /dht.json: '+e});
+</script>
+</main></body></html>"##;
 
 /// The `/map` globe page. Fully static (the live data arrives from `/map.json`, the WebGL runtime
 /// from the vendored `/map/globe.gl.min.js` + `/map/earth.jpg` — no CDN, matching the dashboard's
@@ -971,23 +1042,72 @@ mod tests {
     fn route_serves_the_three_surfaces_and_404s_the_rest() {
         let snap = build_snapshot(vec![], Counters::default(), 0, 0, false);
         let map_snap = empty_map_snapshot();
-        let html = route("/", &snap, &map_snap);
+        let html = route("/", &snap, &map_snap, &empty_dht_view());
         assert_eq!(html.status, 200);
         assert_eq!(html.content_type, "text/html; charset=utf-8");
         assert!(html.body.starts_with(b"<!DOCTYPE html>"));
 
-        let json = route("/stats.json", &snap, &map_snap);
+        let json = route("/stats.json", &snap, &map_snap, &empty_dht_view());
         assert_eq!(json.status, 200);
         assert_eq!(json.content_type, "application/json");
         assert!(json.body.starts_with(b"{"));
 
-        let png = route("/mascot.png", &snap, &map_snap);
+        let png = route("/mascot.png", &snap, &map_snap, &empty_dht_view());
         assert_eq!(png.status, 200);
         assert_eq!(png.content_type, "image/png");
         assert_eq!(&png.body[..8], b"\x89PNG\r\n\x1a\n");
 
-        let missing = route("/nope", &snap, &map_snap);
+        let missing = route("/nope", &snap, &map_snap, &empty_dht_view());
         assert_eq!(missing.status, 404);
+    }
+
+    #[test]
+    fn dht_routes_serve_the_page_and_its_machine_readable_view() {
+        let snap = build_snapshot(vec![], Counters::default(), 0, 0, false);
+        let map_snap = empty_map_snapshot();
+        let view = crate::dht_view::build_dht_view(
+            &[crate::dht_view::PeerAnswer {
+                records: vec![crate::wire::DhtRecordEntry {
+                    content_key: "ab".repeat(32),
+                    providers: 3,
+                }],
+                truncated: false,
+            }],
+            42,
+        );
+
+        let json = route("/dht.json", &snap, &map_snap, &view);
+        assert_eq!(json.status, 200);
+        assert_eq!(json.content_type, "application/json");
+        let v: serde_json::Value = serde_json::from_slice(&json.body).unwrap();
+        assert_eq!(v["schema_version"], crate::dht_view::DHT_SCHEMA_VERSION);
+        assert_eq!(v["reporting_peers"], 1);
+        assert_eq!(v["keys"][0]["providers"], 3);
+
+        let page = route("/dht", &snap, &map_snap, &view);
+        assert_eq!(page.status, 200);
+        assert_eq!(page.content_type, "text/html; charset=utf-8");
+        assert!(page.body.starts_with(b"<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn dht_json_never_exposes_a_peer_identity() {
+        // The same contract /map is held to. A provider record is (peer_id, content_key); this
+        // endpoint publishes counts, so no identity may reach the wire.
+        let snap = build_snapshot(vec![], Counters::default(), 0, 0, false);
+        let view = crate::dht_view::build_dht_view(
+            &[crate::dht_view::PeerAnswer {
+                records: vec![crate::wire::DhtRecordEntry {
+                    content_key: "cd".repeat(32),
+                    providers: 2,
+                }],
+                truncated: false,
+            }],
+            42,
+        );
+        let body = route("/dht.json", &snap, &empty_map_snapshot(), &view).body;
+        let raw = String::from_utf8(body).unwrap();
+        assert!(!raw.contains("peer_id"), "{raw}");
     }
 
     #[test]
@@ -998,7 +1118,7 @@ mod tests {
         let snap = build_snapshot(vec![], Counters::default(), 0, 0, false);
         let map_snap = empty_map_snapshot();
 
-        let health = route("/health", &snap, &map_snap);
+        let health = route("/health", &snap, &map_snap, &empty_dht_view());
         assert_eq!(health.status, 200);
         assert_eq!(health.content_type, "application/json");
 
@@ -1015,18 +1135,18 @@ mod tests {
         let snap = build_snapshot(vec![], Counters::default(), 0, 0, false);
         let map_snap = build_map_snapshot(&[], &LiveGeoResolver, MAP_CELL_DEG, 0);
 
-        let html = route("/map", &snap, &map_snap);
+        let html = route("/map", &snap, &map_snap, &empty_dht_view());
         assert_eq!(html.status, 200);
         assert_eq!(html.content_type, "text/html; charset=utf-8");
         assert!(html.body.starts_with(b"<!DOCTYPE html>"));
 
-        let json = route("/map.json", &snap, &map_snap);
+        let json = route("/map.json", &snap, &map_snap, &empty_dht_view());
         assert_eq!(json.status, 200);
         assert_eq!(json.content_type, "application/json");
         let expected = serde_json::to_vec(&map_snap).unwrap();
         assert_eq!(json.body, expected);
 
-        let js = route("/map/globe.gl.min.js", &snap, &map_snap);
+        let js = route("/map/globe.gl.min.js", &snap, &map_snap, &empty_dht_view());
         assert_eq!(js.status, 200);
         assert_eq!(js.content_type, "application/javascript; charset=utf-8");
         assert!(
@@ -1039,7 +1159,7 @@ mod tests {
             "vendored, versioned assets are cached immutably"
         );
 
-        let jpg = route("/map/earth.jpg", &snap, &map_snap);
+        let jpg = route("/map/earth.jpg", &snap, &map_snap, &empty_dht_view());
         assert_eq!(jpg.status, 200);
         assert_eq!(jpg.content_type, "image/jpeg");
         assert_eq!(

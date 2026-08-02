@@ -159,6 +159,42 @@ pub enum RelayMessage {
     /// Relay → Client: error notification.
     #[serde(rename = "error")]
     Error { code: u32, message: String },
+
+    // -- RLY-009: DHT record observability (dig_ecosystem #1935) --
+    /// Relay → Client: ask this node for an AGGREGATED view of its DHT provider records.
+    ///
+    /// The relay is not a DHT node and holds no records, but it keeps a live reservation to every
+    /// registered peer — and a Kademlia node stores records for keys near its OWN `peer_id`, so its
+    /// store describes MANY OTHER peers' content. Asking each connected node yields a broad slice of
+    /// the real DHT without the relay joining it.
+    ///
+    /// `max_keys` bounds the answer. Additive (NC-6 soft-fork): a pre-RLY-009 node does not
+    /// recognise this `type` and never answers, which the relay treats as "no data", not an error.
+    #[serde(rename = "get_dht_records")]
+    GetDhtRecords { max_keys: usize },
+
+    /// Client → Relay: the aggregated view requested by [`RelayMessage::GetDhtRecords`].
+    ///
+    /// Carries COUNTS, never provider identities — a provider record is a `(peer_id, content_key)`
+    /// pair, and publishing that linkage is exactly what `/map`'s privacy contract forbids.
+    #[serde(rename = "dht_records")]
+    DhtRecords {
+        records: Vec<DhtRecordEntry>,
+        /// Keys with a live provider BEFORE `max_keys` was applied, so the relay can report
+        /// "showing N of M" instead of presenting a truncated view as complete.
+        total_keys: usize,
+        truncated: bool,
+    },
+}
+
+/// One content key in a [`RelayMessage::DhtRecords`] answer: the key and how many live providers the
+/// answering node knows for it. Deliberately carries no provider identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DhtRecordEntry {
+    /// The 64-hex content key.
+    pub content_key: String,
+    /// How many non-expired providers the answering node holds a record for.
+    pub providers: usize,
 }
 
 /// Peer info as tracked by the relay server.

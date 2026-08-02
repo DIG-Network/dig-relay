@@ -77,6 +77,34 @@ IPv4-mapped loopback is not universally supported by every OS/network stack.
 
 Reference: `src/service.rs::loopback_probe_addr` (pure) + `probe_health` (the I/O wrapper).
 
+### 2.9b RLY-009 — the DHT content view (`/dht`, normative)
+
+The relay is not a DHT node and holds no provider records. RLY-009 lets it ASK the nodes it already
+holds reservations to: because a Kademlia node stores records for keys near its OWN `peer_id`, each
+answer describes MANY OTHER peers' content, so the union across connected nodes is a broad slice of
+the real DHT (dig_ecosystem #1935).
+
+- The relay MAY send `get_dht_records { max_keys }` to registered peers and aggregates the
+  `dht_records` answers into the view served at `GET /dht.json` (machine) and `GET /dht` (human).
+- **The view MUST be served from a CACHE refreshed by a background sweep, never a per-request
+  fan-out.** `/dht` is public and unauthenticated; fanning out per request would let any anonymous
+  caller make the relay interrogate every node on the network on demand.
+- **An answer is accepted only from a REGISTERED peer.** An unregistered socket MUST NOT be able to
+  seed the public view.
+- **A peer MUST NOT ask the relay for DHT records.** `get_dht_records` is relay-to-node only; an
+  inbound one is refused with `2 BAD_MESSAGE`, which is per-request and so does not cost the asker
+  its reservation (§2.9a's classification, dig-nat #1932).
+- **Counts, never identities.** The view publishes `content_key` → provider count, upholding the same
+  contract as `/map`: no `peer_id`, no raw IP.
+- **Overlapping reports take the MAX, never a sum.** Nodes near the same key hold overlapping
+  provider sets, so summing would double-count one provider per node that knows it and invent
+  replication that does not exist. The max is an honest lower bound.
+- **The published size MUST be bounded independently of what peers report**, and ordering MUST favour
+  the best-corroborated keys, so a Sybil inventing many single-node keys cannot displace genuinely
+  replicated content from the view.
+- **The view MUST state what it is a view OF** — `reporting_peers`, the true pre-truncation
+  `total_keys`, and `truncated` — so a small sample is never presented as the global DHT.
+
 ### 2.9a Observed source address, and PROXY protocol v2 (normative)
 
 The **observed source address** of a connection is the remote address of its TCP socket, EXCEPT when

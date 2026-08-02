@@ -29,6 +29,7 @@
 
 pub mod config;
 pub mod dashboard;
+pub mod dht_view;
 pub mod dial;
 pub mod geoip;
 pub mod health;
