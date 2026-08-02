@@ -24,23 +24,73 @@
 
 use std::path::PathBuf;
 
-/// The relay.dig.net deploy workflow. `dig-relay` is a single-package repo, so
-/// `CARGO_MANIFEST_DIR` IS the repo root.
+/// `dig-relay` is a single-package repo, so `CARGO_MANIFEST_DIR` IS the repo root.
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The relay.dig.net deploy workflow.
 fn deploy_workflow() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = repo_root()
         .join(".github")
         .join("workflows")
         .join("deploy.yml");
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
-/// Every way this workflow could write the ECS task definition or roll the service itself — the
-/// AWS CLI calls, and the official actions that wrap them.
+/// EVERY workflow in the repo, as `(filename, contents)`.
+///
+/// The failure class is "a second pipeline appears", not "deploy.yml regresses" — a writer re-added
+/// in `release.yml`, `nightly-release.yml`, or some new `roll.yml` would be just as invisible and
+/// just as damaging. Scanning one file would have watched the wrong thing.
+fn all_workflows() -> Vec<(String, String)> {
+    let dir = repo_root().join(".github").join("workflows");
+    let entries = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("unreadable directory entry").path())
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yml" | "yaml")
+            )
+        });
+
+    let workflows: Vec<(String, String)> = entries
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            (name, body)
+        })
+        .collect();
+
+    assert!(
+        !workflows.is_empty(),
+        "found no workflows in {} — this guard would pass vacuously",
+        dir.display()
+    );
+    workflows
+}
+
+/// Lines that are not comments and not blank, paired with their 1-based line number.
+fn executable_lines(body: &str) -> impl Iterator<Item = (usize, &str)> {
+    body.lines()
+        .enumerate()
+        .map(|(index, line)| (index + 1, line))
+        .filter(|(_, line)| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+}
+
+/// Every way this workflow could WRITE the ECS task definition or roll the service itself — the AWS
+/// CLI calls, and the official actions that wrap them.
+///
+/// `describe-task-definition` is deliberately absent: reading is not writing. The harm was never the
+/// read, it was rendering an image onto what was read and registering the result — which is what
+/// carried console edits forward forever. The workflow now reads the definition once, AFTER the
+/// deploy, to assert the service actually took this release's image.
 const ECS_WRITE_MARKERS: &[(&str, &str)] = &[
-    (
-        "describe-task-definition",
-        "reading the LIVE task definition is how hand edits were carried forward forever",
-    ),
     (
         "register-task-definition",
         "only relay.dig.net's terraform may register a task-definition revision",
@@ -60,21 +110,47 @@ const ECS_WRITE_MARKERS: &[(&str, &str)] = &[
 ];
 
 #[test]
-fn deploy_never_writes_the_ecs_task_definition() {
-    let workflow = deploy_workflow();
-    for (marker, why) in ECS_WRITE_MARKERS {
-        // The rationale lives in this file's header, so a match inside a comment is expected and
-        // must not fail the test — only an actual step may not use it.
-        let used_in_a_step = workflow
-            .lines()
-            .filter(|line| !line.trim_start().starts_with('#'))
-            .any(|line| line.contains(marker));
-        assert!(
-            !used_in_a_step,
-            "deploy.yml uses `{marker}` outside a comment: {why}. \
-             relay.dig.net's terraform is the single writer of the task definition (#1938); this \
-             workflow builds the image and hands the tag over."
-        );
+fn no_workflow_writes_the_ecs_task_definition() {
+    for (name, body) in all_workflows() {
+        for (marker, why) in ECS_WRITE_MARKERS {
+            // The rationale lives in this file's header and in the workflows' own comments, so a
+            // match inside a comment is expected — only an executable line is a finding.
+            if let Some((line_number, _)) =
+                executable_lines(&body).find(|(_, line)| line.contains(marker))
+            {
+                panic!(
+                    "{name}:{line_number} uses `{marker}`: {why}. relay.dig.net's terraform is the \
+                     single writer of the task definition (#1938); this repo builds the image and \
+                     hands the tag over."
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn no_workflow_touches_ecs_except_the_one_permitted_read() {
+    // Enumerating spellings is a losing game — `aws ecs \` split across a YAML continuation, an
+    // `aws ecs "$VERB"`, a third-party `ecs-deploy` action, or boto3 all walk around a marker list
+    // while doing exactly the forbidden thing. So the rule is inverted: NOTHING here may mention
+    // ECS at all, except the single read-back that proves the service took this release's image.
+    // Re-introducing a writer then has to consciously edit this test, which is the whole point.
+    const PERMITTED_READ: &str = "describe-task-definition";
+
+    for (name, body) in all_workflows() {
+        for (line_number, line) in executable_lines(&body) {
+            let mentions_ecs = line.to_ascii_lowercase().contains("ecs");
+            if mentions_ecs && !line.contains(PERMITTED_READ) {
+                panic!(
+                    "{name}:{line_number} mentions ECS outside the one permitted call:\n  {}\n\
+                     Only `aws ecs {PERMITTED_READ}` — the post-deploy read-back — is allowed in \
+                     this repo. Everything else about the ECS service, including rolling it, is \
+                     relay.dig.net's terraform to do (#1938). If this line is genuinely benign, \
+                     widen this test deliberately rather than working around it.",
+                    line.trim()
+                );
+            }
+        }
     }
 }
 
@@ -116,5 +192,49 @@ fn deploy_fails_when_the_infra_deploy_fails() {
         "deploy.yml must watch the dispatched relay.dig.net run with `--exit-status`. Without it a \
          failed terraform apply leaves this release green over a service that never took the new \
          image — the pushed-but-never-shipped hole #1938 set out to close."
+    );
+}
+
+#[test]
+fn deploy_watches_the_run_it_dispatched_and_not_merely_the_newest() {
+    let workflow = deploy_workflow();
+    // `gh workflow run` returns no run id, so the run must be FOUND. Matching "the newest dispatch"
+    // silently latches onto a concurrent release, a manual deploy or a rollback, and reports that
+    // run's result as this release's. relay.dig.net's `run-name` carries the image tag; the search
+    // must filter on it.
+    assert!(
+        workflow.contains("displayTitle") && workflow.contains("IMAGE_TAG"),
+        "the dispatched run must be identified by matching its title against this job's image tag, \
+         not by taking the most recent workflow_dispatch run."
+    );
+}
+
+#[test]
+fn deploy_asserts_the_service_actually_took_this_image() {
+    let workflow = deploy_workflow();
+    // A watched run going green proves an apply succeeded, not that OUR image is serving. The only
+    // unambiguous evidence is the service itself, so the release ends by reading it back.
+    assert!(
+        workflow.contains("describe-task-definition"),
+        "deploy.yml must read the deployed task definition back after the apply to prove the \
+         service is running this commit's image."
+    );
+    assert!(
+        workflow.contains("!= \"$GITHUB_SHA\"") || workflow.contains("!= \"${GITHUB_SHA}\""),
+        "the read-back must COMPARE the deployed image tag with this commit's SHA and fail on a \
+         mismatch — printing it is not an assertion."
+    );
+}
+
+#[test]
+fn deploy_is_rerunnable_after_the_image_is_pushed() {
+    let workflow = deploy_workflow();
+    // The ECR repo has immutable tags, and every failure this workflow anticipates happens AFTER
+    // the push. Without a skip-if-present guard the operator's first instinct — re-run the job —
+    // dies at `docker push`, leaving the documented recovery path unusable.
+    assert!(
+        workflow.contains("ecr describe-images"),
+        "deploy.yml must skip the build when the image tag is already in ECR, or a re-run after a \
+         failed deploy cannot get past `docker push` (the repo has immutable tags)."
     );
 }
