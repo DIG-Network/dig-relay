@@ -60,6 +60,17 @@ jobs:
   deploy:
     name: Build image and hand it to the infra deploy
     runs-on: ubuntu-latest
+    # REQUIRED for the OIDC assume to succeed, not decorative. `dig-relay-ci-deploy`'s trust policy
+    # admits exactly two subjects: `…:ref:refs/tags/v*` and `…:environment:production`. Without this
+    # line a `workflow_dispatch` run carries `…:ref:refs/heads/main`, matches neither, and dies at
+    # AssumeRoleWithWebIdentity — which is what happened the first time the manual path was used, and
+    # had been latent since this workflow first declared `workflow_dispatch`.
+    #
+    # Declaring the environment (rather than adding `refs/heads/main` to the trust policy) keeps the
+    # role reachable from THIS job only, instead of from every workflow that runs on main. The
+    # environment has no protection rules, so it gates nothing today — it is an identity and an
+    # audit trail.
+    environment: production
     # A from-scratch image build here normally takes ~5 minutes. On v0.16.0 one took 3h28m and the
     # job then died on expired credentials, so the release never shipped while the run still looked
     # alive. Cap the job well above the normal build but far below the point where a stall becomes a
