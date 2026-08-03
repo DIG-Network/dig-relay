@@ -292,6 +292,21 @@ fn deploy_asserts_the_service_actually_took_this_image() {
 }
 
 #[test]
+fn deploy_declares_the_environment_its_oidc_role_trusts() {
+    let workflow = deploy_workflow();
+    // Not decorative. `dig-relay-ci-deploy` trusts exactly `…:ref:refs/tags/v*` and
+    // `…:environment:production`. A `workflow_dispatch` run carries `…:ref:refs/heads/main`, so
+    // without the environment the manual path dies at AssumeRoleWithWebIdentity — as it did the
+    // first time anyone used it, having been latent since the trigger was added. The recovery
+    // procedure in runbooks/release.md depends on that path working.
+    assert!(
+        workflow.contains("environment: production"),
+        "the deploy job must declare `environment: production`: it is the only OIDC subject the \
+         deploy role trusts besides a v* tag, so a manual dispatch cannot authenticate without it."
+    );
+}
+
+#[test]
 fn deploy_is_rerunnable_after_the_image_is_pushed() {
     let workflow = deploy_workflow();
     // The ECR repo has immutable tags, and every failure this workflow anticipates happens AFTER
