@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.2] - 2026-08-03
+
+### Bug Fixes
+- **deploy:** Declare environment: production so a manual dispatch can authenticate (#26)
+
+### CI
+- **deploy:** Stop writing the ECS task definition; hand the image tag to terraform (#25)
+
 ## [0.19.0] - 2026-08-02
 
 ### Features
