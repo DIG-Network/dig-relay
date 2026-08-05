@@ -36,6 +36,16 @@ jobs:
         run: cargo nextest run --all --locked --retries 2
       - name: build (release)
         run: cargo build --release --locked
+      # The glibc-floor gate is a shell script, not Rust, so it needs its own test run to stay
+      # honest — a rotted gate would silently stop defending the linux-x64 floor (#2185).
+      - name: scripts/tests (shell gates)
+        run: |
+          set -eu
+          for t in scripts/tests/*.test.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done
 
   coverage:
     runs-on: ubuntu-latest
