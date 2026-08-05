@@ -218,3 +218,50 @@ jobs:
           name: dig-relay-${{ matrix.out_name }}
           path: dist/*
           if-no-files-found: error
+
+  # PROOF, not inference: start the published Linux binary on the OLDEST distros it claims to
+  # support. `check-glibc-floor.sh` on the builder says what the binary was linked against; only
+  # executing it on the target says it STARTS there (dig-node's #1736 was found by a binary that
+  # died at exec time, which a symbol-table check cannot catch). Ports dig-node's `verify-linux-floor`
+  # job (#2200) — dig-relay ships only linux-x64, so the matrix is the three x64 baselines.
+  #
+  # WHY `--version`: it is the one invocation that touches no config, no network, no filesystem
+  # state and no service manager, so it isolates "does the dynamic loader resolve this binary".
+  verify-linux-floor:
+    name: verify (${{ matrix.out_name }} on ${{ matrix.image }})
+    needs: build-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The three oldest supported baselines (glibc 2.34–2.36), each on the x64 runner so the
+          # binary executes natively rather than under emulation.
+          - runner: ubuntu-latest
+            out_name: linux-x64
+            image: ubuntu:22.04
+          - runner: ubuntu-latest
+            out_name: linux-x64
+            image: debian:12
+          - runner: ubuntu-latest
+            out_name: linux-x64
+            image: amazonlinux:2023
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dig-relay-${{ matrix.out_name }}
+          path: dist
+      - name: Run the binary on ${{ matrix.image }}
+        run: |
+          set -eu
+          chmod +x dist/*
+          bin="dig-relay-${{ inputs.version }}-${{ matrix.out_name }}"
+          echo "::group::$bin on ${{ matrix.image }}"
+          # `ldd` FIRST and unconditionally: the dynamic loader names only the FIRST unsatisfied
+          # library, so a partial fix reads as a brand-new regression. Logging the full dependency
+          # set makes the real remaining gap visible in one run.
+          docker run --rm -v "$PWD/dist:/dist:ro" "${{ matrix.image }}" \
+            sh -c "ldd /dist/$bin || true"
+          docker run --rm -v "$PWD/dist:/dist:ro" "${{ matrix.image }}" \
+            /dist/$bin --version
+          echo "::endgroup::"
