@@ -83,10 +83,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             bin: dig-relay.exe
             out_name: windows-x64.exe
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin: dig-relay
-            out_name: linux-x64
           - os: macos-14 # Apple silicon (arm64)
             target: aarch64-apple-darwin
             bin: dig-relay
@@ -131,6 +127,91 @@ jobs:
           # `out_name` already carries the .exe on Windows; unix has no extension.
           cp "$SRC" "dist/dig-relay-${VER}-${{ matrix.out_name }}"
           ls -la dist
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dig-relay-${{ matrix.out_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  # The LINUX target, built NATIVELY inside a pinned old-glibc container so the supported-OS floor is
+  # a decision rather than a side effect of whatever image `ubuntu-latest` points at this month
+  # (#2185 — ports dig-node's proven #1736 pattern). A -gnu binary runs on its BUILD glibc and
+  # anything newer, never anything older, so building on Ubuntu 24.04 (glibc 2.39) silently broke
+  # Ubuntu 22.04 (2.35), Debian 12 (2.36) and Amazon Linux 2023 (2.34). Building in debian:11
+  # (glibc 2.31) fixes the floor; the assertion step below keeps it from drifting back.
+  build-linux:
+    name: build (${{ matrix.out_name }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            out_name: linux-x64
+    runs-on: ubuntu-latest
+    # Debian 11 = glibc 2.31 = the floor declared by `.github/actions/setup-linux-build`, which
+    # asserts the two agree — so bumping this image without bumping the floor fails the build
+    # instead of silently shipping a higher floor.
+    container: debian:11
+    steps:
+      # Bootstrap only what `actions/checkout` itself needs in a bare container; the full toolchain
+      # (and the floor assertion) comes from the local composite action, which cannot run until the
+      # repository is on disk.
+      - name: Bootstrap the container for checkout
+        run: |
+          set -eux
+          apt-get update -qq
+          apt-get install -y --no-install-recommends ca-certificates curl git
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Trust the checkout (git runs as root in the container)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - id: setup
+        uses: ./.github/actions/setup-linux-build
+      - run: rustc --version && cargo --version
+      - name: Add the Rust target
+        run: rustup target add ${{ matrix.target }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # The glibc floor is part of the cache key: artifacts built against a different glibc must
+          # never be restored into a build that claims a different floor.
+          key: linux-glibc${{ steps.setup.outputs.glibc-floor }}-relay-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-glibc${{ steps.setup.outputs.glibc-floor }}-relay-build-${{ matrix.target }}-
+      - name: Build release binary
+        # The triple is the HOST's here (native build, no cross-compilation), but it is passed
+        # explicitly anyway so the output lands in `target/<triple>/release/` — the path the staging
+        # step below reads, matching the other-OS jobs.
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-relay
+      - name: Stage artifact
+        shell: bash
+        run: |
+          VER="${{ inputs.version }}"
+          mkdir -p dist
+          SRC="target/${{ matrix.target }}/release/dig-relay"
+          test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
+          cp "$SRC" "dist/dig-relay-${VER}-${{ matrix.out_name }}"
+          ls -la dist
+      - name: Assert the glibc floor of the produced binary
+        # The gate that makes the floor durable (the CI check #2185 requires).
+        run: |
+          set -eu
+          bin="dist/dig-relay-${{ inputs.version }}-${{ matrix.out_name }}"
+          bash scripts/check-glibc-floor.sh "$bin" "${{ steps.setup.outputs.glibc-floor }}"
+          # Prove the gate is not a no-op against a REAL binary, not just the unit tests' stub
+          # readelf: every ELF references at least the base glibc version (2.2.5 on x86_64), so a
+          # floor of 2.0 MUST be rejected. A gate that cannot fail is a rubber stamp.
+          if bash scripts/check-glibc-floor.sh "$bin" 2.0 >/dev/null 2>&1; then
+            echo "::error::check-glibc-floor.sh accepted an impossible 2.0 floor for $bin — the gate is not working"
+            exit 1
+          fi
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:

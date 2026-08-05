@@ -756,6 +756,17 @@ paths can never diverge on HOW a binary is produced. It builds the `dig-relay` b
 `windows-x64`, `linux-x64`, `macos-arm64`, and `macos-x64`, stamping the caller's `version` into
 each artifact filename (`dig-relay-<ver>-<os-arch>[.exe]`).
 
+The `linux-x64` target builds NATIVELY inside a pinned `container: debian:11` (glibc 2.31), not on
+`ubuntu-latest`. A glibc-linked binary runs on its build glibc and anything newer but never anything
+older, so the builder image alone sets the supported-OS floor; building on Ubuntu 24.04 (glibc 2.39)
+silently breaks Ubuntu 22.04 (2.35), Debian 12 (2.36) and Amazon Linux 2023 (2.34). The declared
+floor is **glibc 2.31**, sourced once from `.github/actions/setup-linux-build` (which asserts the
+container's own glibc equals it), and `scripts/check-glibc-floor.sh` runs against the produced
+`linux-x64` binary to FAIL the build if any required glibc symbol exceeds the floor — so the floor
+cannot drift back up unnoticed. Raising the floor is a deliberate act: change the value in the
+composite action, the `container:` image, and this section together. The other three targets carry
+no glibc floor and build on their native host runners.
+
 ### 11.5 RELEASE_TOKEN posture (both channels)
 
 Releasing uses the `RELEASE_TOKEN` org PAT, not the default `GITHUB_TOKEN`: a tag pushed by
