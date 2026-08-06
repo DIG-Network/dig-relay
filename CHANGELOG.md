@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.4] - 2026-08-06
+
+### Bug Fixes
+- **build:** Build linux-x64 in a debian:11 (glibc 2.31) container + floor gate (#27)
+
+### CI
+- **release:** Add verify-linux-floor execution proof on AL2023/Ubuntu-22.04/Debian-12 (#2200)
+
 ## [0.19.2] - 2026-08-03
 
 ### Bug Fixes
