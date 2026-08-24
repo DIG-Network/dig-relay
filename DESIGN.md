@@ -217,7 +217,7 @@ reply to a non-STUN packet). STUN is stateless, so it needs none of the relay's 
 
 - **Listen address/port:** configurable (`--listen`, default `[::]:9450` =
   `dig_gossip` `DEFAULT_RELAY_PORT`, IPv6-first + dual-stack — see "Listener binding" below). The
-  relay endpoint clients use is `wss://relay.dig.net:9450`.
+  relay endpoint clients use is `wss://relay.dig.net:443`.
 - **Limits:** configurable max concurrent connections and max reservations (so a single relay can be
   sized to its instance), and a per-connection keepalive/idle timeout.
 - **Health:** an HTTP **`/health`** endpoint (separate small HTTP listener, default
