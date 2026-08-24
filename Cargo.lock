@@ -320,18 +320,20 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "dig-ip"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04c144a0a675a27cc8db65af861bb05db828335545e7969cf2b44e44d0458175"
+checksum = "0c9d0dd76d4fa9a133bd25ff24e10173d7769a8ccd32d79cbc44715d5f78de0a"
 dependencies = [
  "futures",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "dig-pex"
-version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-pex#7a11ebaceecd51e1d7d6a1da7fa875251c3675e1"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7058e5d32c8f335e6d3494fbceb261328367df76bb2913509beaeab12386e815"
 dependencies = [
  "rand",
  "serde",
@@ -341,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "dig-relay"
-version = "0.19.4"
+version = "0.19.5"
 dependencies = [
  "axum",
  "clap",
@@ -426,7 +428,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -776,7 +778,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

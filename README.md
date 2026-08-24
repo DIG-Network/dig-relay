@@ -5,7 +5,7 @@ dial each other directly; `dig-relay` is a publicly-reachable rendezvous point t
 register a constant reservation, discover peers, coordinate hole-punching, and bridge connections via
 relayed transport when a direct path can't be established.
 
-- **Default relay:** `relay.dig.net` (WebSocket on port `9450`).
+- **Default relay:** `wss://relay.dig.net:443` (canonical `dig_constants::DIG_RELAY_URL`; the public NLB terminates TLS on `:443` and forwards to the relay's `:9450` container port).
 - A DIG Node maintains a **constant connection / reservation** with a relay so it stays reachable to
   peers behind NAT.
 - Installable as an optional component via the DIG installer (run your own relay).
