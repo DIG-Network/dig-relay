@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.5] - 2026-08-25
+
+### Bug Fixes
+- **docs:** Client relay endpoint is wss://relay.dig.net:443, not :9450 (#30)
+
 ## [0.19.4] - 2026-08-06
 
 ### Bug Fixes
