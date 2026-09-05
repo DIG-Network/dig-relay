@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.7] - 2026-09-05
+
+### Bug Fixes
+- **stun:** Fold a v4-mapped IPv6 peer to V4 before selecting XOR-MAPPED-ADDRESS family (#36)
+
 ## [0.19.6] - 2026-09-05
 
 ### Documentation
