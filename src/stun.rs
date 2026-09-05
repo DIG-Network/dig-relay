@@ -153,6 +153,19 @@ pub fn build_binding_response(transaction_id: &TransactionId, reflexive: SocketA
 /// - X-Address (IPv4) = address XOR the magic cookie.
 /// - X-Address (IPv6) = address XOR (magic cookie ‖ transaction id).
 fn xor_mapped_address_value(transaction_id: &TransactionId, addr: SocketAddr) -> Vec<u8> {
+    // Fold a v4-mapped IPv6 peer (`::ffff:a.b.c.d`) to its canonical V4 form BEFORE selecting which
+    // family to encode. The STUN listener binds dual-stack with `IPV6_V6ONLY=false` (`crate::net`),
+    // so `socket.recv_from()` hands back exactly this form for EVERY IPv4-originated datagram — never
+    // a native `SocketAddr::V4` — and a raw `match` on the enum variant tagged a genuine IPv4 caller's
+    // answer as IPv6 (dig-relay#35), which a strict RFC 5389 client rejects as unrelated to itself.
+    // `to_canonical()` is the same fold this file already applies to the rate limiter's per-source-IP
+    // key just below (`StunRateLimiter::allow`) — one dual-stack-socket problem, one idiom. It folds
+    // only the v4-mapped form, not the long-deprecated IPv4-compatible form (`::a.b.c.d`, RFC 4291
+    // §2.5.5.1); no modern OS's `recv_from()` ever produces the latter, so that narrower scope covers
+    // every address this socket can actually hand back (`dig_nat::stun::is_usable_reflexive_addr`
+    // uses the broader `to_ipv4()` for the same reason, for a caller that must also reject that dead
+    // legacy form outright rather than merely never observing it).
+    let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
     let xport = addr.port() ^ (MAGIC_COOKIE >> 16) as u16;
     match addr {
         SocketAddr::V4(v4) => {
@@ -190,6 +203,11 @@ fn xor_mapped_address_value(transaction_id: &TransactionId, addr: SocketAddr) ->
 /// This is the client-side reverse of [`xor_mapped_address_value`]; the server never needs it, but
 /// it is the natural way to unit-test that the server encoded a recoverable address, so it lives here
 /// (and is available to any in-crate STUN client/test). Returns `None` on a malformed value.
+///
+/// Unlike the encoder, this dispatches on the WIRE family byte (`fam`, read from the attribute
+/// bytes) rather than on a local `SocketAddr` enum variant, so it carries none of the v4-mapped-vs-
+/// native ambiguity that [`xor_mapped_address_value`] had to fold away (dig-relay#35): whatever
+/// family the encoder actually wrote onto the wire is exactly the family decoded back here.
 pub fn decode_xor_mapped_address(
     transaction_id: &TransactionId,
     value: &[u8],
@@ -498,8 +516,13 @@ mod tests {
         assert_eq!(stated, resp.len() - HEADER_LEN);
     }
 
+    /// Covers a genuine NATIVE `SocketAddr::V4` input (e.g. an explicit IPv4-only bind — see
+    /// `crate::net`, which skips dual-stack setup entirely for an explicit IPv4 address). The
+    /// default `[::]` dual-stack listener never hands the encoder this variant for an IPv4 peer; see
+    /// [`ipv4_mapped_v6_peer_encodes_identically_to_native_ipv4`] below for the actual production
+    /// path (dig-relay#35) — this test alone cannot see a regression there.
     #[test]
-    fn ipv4_reflexive_address_round_trips_through_xor_mapped_address() {
+    fn native_ipv4_socketaddr_round_trips_through_xor_mapped_address() {
         let addr = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 17), 40000));
         let resp = build_binding_response(&TID, addr);
         let value = find_xor_mapped_address(&resp).expect("response carries XOR-MAPPED-ADDRESS");
@@ -507,6 +530,52 @@ mod tests {
         assert_eq!(
             decoded, addr,
             "the client recovers exactly its reflexive addr"
+        );
+    }
+
+    /// The production fixture (dig-relay#35): the STUN listener binds dual-stack with
+    /// `IPV6_V6ONLY=false` (`crate::net`), so `socket.recv_from()` hands back a v4-mapped
+    /// `SocketAddr::V6` (`::ffff:a.b.c.d`) for EVERY IPv4-originated datagram — never a native
+    /// `SocketAddr::V4`. The property under test is exactly what separates a correct encoder from
+    /// the nearest wrong one (today's, pre-fix): the SAME real peer must produce the SAME response
+    /// regardless of which `SocketAddr` variant the local socket happened to hand it back in. A test
+    /// that only builds a literal `SocketAddr::V4` (above) cannot exercise this — that value is not
+    /// one `recv_from()` on this socket can ever produce.
+    #[test]
+    fn ipv4_mapped_v6_peer_encodes_identically_to_native_ipv4() {
+        let v4 = Ipv4Addr::new(198, 51, 100, 17);
+        let port = 40000;
+        let native = SocketAddr::from((v4, port));
+        let mapped = SocketAddr::from((v4.to_ipv6_mapped(), port));
+        assert!(
+            mapped.is_ipv6(),
+            "fixture sanity: this must really be a V6 SocketAddr, matching what recv_from() returns"
+        );
+
+        let native_resp = build_binding_response(&TID, native);
+        let mapped_resp = build_binding_response(&TID, mapped);
+        assert_eq!(
+            native_resp, mapped_resp,
+            "a v4-mapped V6 peer and the equivalent native V4 peer must produce byte-identical \
+             responses — the local socket's representation is not part of the peer's identity"
+        );
+
+        let value =
+            find_xor_mapped_address(&mapped_resp).expect("response carries XOR-MAPPED-ADDRESS");
+        assert_eq!(
+            value[1],
+            family::IPV4,
+            "a same-family IPv4 peer must be tagged IPv4 (0x01), never IPv6 (0x02)"
+        );
+        assert_eq!(
+            value.len(),
+            8,
+            "an IPv4 XOR-MAPPED-ADDRESS value is reserved+family+port+4-byte address = 8 bytes"
+        );
+        let decoded = decode_xor_mapped_address(&TID, value).expect("value decodes");
+        assert_eq!(
+            decoded, native,
+            "the client recovers the real IPv4 address+port, never the ::ffff:-wrapped form"
         );
     }
 
