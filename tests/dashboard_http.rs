@@ -72,11 +72,16 @@ async fn start_seeded_dashboard() -> std::net::SocketAddr {
 
 /// Make a raw HTTP/1.1 GET and return the full response text (headers + body).
 async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+    http_get_with_host(addr, path, "relay.dig.net").await
+}
+
+/// Same as [`http_get`], but with a caller-chosen `Host` header — needed to prove the STUN vhost
+/// (relay.dig.net#stun-usage-page) is selected by the REQUEST's Host, not by which listener answered.
+async fn http_get_with_host(addr: std::net::SocketAddr, path: &str, host: &str) -> String {
     let mut stream = TcpStream::connect(addr)
         .await
         .expect("connect to dashboard");
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: relay.dig.net\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
@@ -147,7 +152,7 @@ async fn plain_http_redirects_to_https() {
     // The dedicated redirect listener (the `--dashboard-listen` port) 301s every plain-HTTP request
     // to the https origin — the relay serves content only over HTTPS/WSS (#1041).
     let addr = free_addr().await;
-    tokio::spawn(async move { dig_relay::dashboard::run_redirect(addr).await });
+    tokio::spawn(async move { dig_relay::dashboard::run_redirect(addr, 3478).await });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let response = http_get(addr, "/stats.json?full=1").await;
@@ -159,4 +164,89 @@ async fn plain_http_redirects_to_https() {
         response.contains("Location: https://relay.dig.net/stats.json?full=1"),
         "must redirect to the https origin preserving host + path, got:\n{response}"
     );
+}
+
+// ---- STUN vhost (relay.dig.net#stun-usage-page) ----
+//
+// `GET http://stun.relay.dig.net/` must return a usage document — on BOTH listeners the relay
+// exposes: the TLS-terminated wire listener (`serve_http`, reachable today over IPv6 since
+// `stun.<domain>`'s AAAA record already aliases the same dualstack load balancer) and the plain-HTTP
+// redirect listener (`run_redirect`, the ONLY listener an IPv4-only caller can reach on this vhost,
+// once relay.dig.net wires a `:80` listener to it — dig-relay's own job here is just to answer
+// correctly once reached).
+
+#[tokio::test]
+async fn wire_listener_serves_the_stun_page_by_host_not_by_listener() {
+    // One running listener, two Hosts, two different pages — the property under test is that the
+    // SAME accept loop discriminates on the request, not that a STUN-only listener exists.
+    let addr = start_seeded_dashboard().await;
+
+    let stun = http_get_with_host(addr, "/", "stun.relay.dig.net").await;
+    assert!(stun.contains("200 OK"), "got:\n{stun}");
+    assert!(stun.contains("RFC 5389"));
+    assert!(
+        !stun.contains("Connected peers"),
+        "the STUN vhost must not show the peer-stats dashboard: {stun}"
+    );
+
+    let dashboard = http_get_with_host(addr, "/", "relay.dig.net").await;
+    assert!(dashboard.contains("200 OK"));
+    assert!(dashboard.contains("Connected peers"));
+    assert!(
+        !dashboard.contains("RFC 5389"),
+        "the ordinary dashboard must not show the STUN usage page: {dashboard}"
+    );
+
+    // A hostname that merely CONTAINS "stun." but does not START with it is not the STUN vhost —
+    // the discriminator that would fail under a `contains` implementation.
+    let false_prefix = http_get_with_host(addr, "/", "xstun.relay.dig.net").await;
+    assert!(false_prefix.contains("Connected peers"));
+}
+
+#[tokio::test]
+async fn wire_listener_serves_stun_json_with_the_live_configured_port() {
+    let addr = free_addr().await;
+    let config = RelayServerConfig {
+        listen: addr,
+        stun_listen: "0.0.0.0:4242".parse().unwrap(),
+        ..Default::default()
+    };
+    let state = seeded_state(config).await;
+    tokio::spawn(async move { server::run(state).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let response = http_get_with_host(addr, "/stun.json", "stun.relay.dig.net").await;
+    assert!(response.contains("200 OK"));
+    assert!(response.contains("application/json"));
+    assert!(response.contains("\"host\":\"stun.relay.dig.net\""));
+    assert!(
+        response.contains("\"port\":4242"),
+        "must report the ACTUAL configured stun_listen port, got:\n{response}"
+    );
+    assert!(response.contains("\"transport\":\"udp\""));
+}
+
+#[tokio::test]
+async fn plain_http_serves_the_stun_page_directly_but_still_redirects_every_other_host() {
+    // This is the literal request: `GET http://stun.relay.dig.net/` returns a usage document — not
+    // a 301 that then dead-ends, because the IPv4-only STUN load balancer this vhost answers over
+    // has no `:443` listener to redirect to (relay.dig.net's main.tf).
+    let addr = free_addr().await;
+    tokio::spawn(async move { dig_relay::dashboard::run_redirect(addr, 3478).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let stun = http_get_with_host(addr, "/", "stun.relay.dig.net").await;
+    assert!(
+        stun.contains("200 OK"),
+        "plain http:// on the STUN vhost must be served directly, got:\n{stun}"
+    );
+    assert!(stun.contains("RFC 5389"));
+    assert!(
+        !stun.contains("301"),
+        "must not be a redirect, got:\n{stun}"
+    );
+
+    // Every other host on the SAME listener keeps redirecting — unchanged from before this feature.
+    let other = http_get_with_host(addr, "/", "relay.dig.net").await;
+    assert!(other.contains("301 Moved Permanently"), "got:\n{other}");
 }

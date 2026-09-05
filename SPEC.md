@@ -23,14 +23,16 @@ bindable:
 |---|---|---|---|---|
 | Relay WebSocket + dashboard | TCP | `[::]:9450` | `listen` / `--listen` | `RelayMessage`/PEX wire (§3) AND the peer-stats dashboard (§6.1) — a WebSocket upgrade is the wire, any other `GET` is the dashboard |
 | Health | TCP (HTTP) | `[::]:9451` | `health_listen` / `--health-listen` | Load-balancer target-group check |
-| HTTP→HTTPS redirect | TCP (HTTP) | `[::]:8080` | `dashboard_listen` / `--dashboard-listen` | 301 every plain-HTTP request to `https://` (§6.1) |
+| HTTP→HTTPS redirect | TCP (HTTP) | `[::]:8080` | `dashboard_listen` / `--dashboard-listen` | 301 every plain-HTTP request to `https://`, EXCEPT the STUN vhost (§6.1a) |
 | STUN | UDP | `[::]:3478` | `stun_listen` / `--stun-listen` | RFC 5389 Binding responder |
 
 Port 9450 matches `dig_gossip::constants::DEFAULT_RELAY_PORT`. Port 3478 is the IANA-assigned STUN
 port. The relay serves content ONLY over HTTPS/WSS: the dashboard shares the wire listener (TLS is
 terminated upstream at the load balancer, so `https://relay.dig.net/` and `wss://relay.dig.net/` both
-arrive on the wire port), and the redirect listener exists solely to bounce plain HTTP to the secure
-origin. The redirect listener defaults to the **unprivileged** port `8080` (not the privileged `80`):
+arrive on the wire port), and the redirect listener otherwise exists only to bounce plain HTTP to the
+secure origin — its ONE exception is the STUN vhost (§6.1a), served directly and unencrypted since it
+carries no secrets. The redirect listener defaults to the **unprivileged** port `8080` (not the
+privileged `80`):
 the relay's service user is non-root (the Docker image runs as uid 10001; Fargate grants no
 `CAP_NET_BIND_SERVICE`), so it MUST bind an unprivileged port and be fronted at public `:80` by the
 orchestrator (the `relay.dig.net` NLB maps `:80` → the container's `:8080`). Binding `:80` directly
@@ -383,12 +385,12 @@ the wire handshake byte-for-byte unchanged; any other request is served the dash
 is built entirely from the relay's EXISTING in-memory state (the peer registry + cheap atomic
 counters); it never mutates state and never disturbs the wire.
 
-Plain HTTP is redirect-only: the `dashboard_listen` port (default `[::]:80`) responds to every request
-with `301 Moved Permanently → https://<host><path>` (using the request's `Host`). Because it binds a
-privileged port, this redirect listener is NON-FATAL: if it cannot bind (e.g. `:80` on an unprivileged
-self-hosted relay), the relay logs a warning and keeps serving the wire/health/STUN listeners normally
-(point `--dashboard-listen` at a high port to enable it there). The dashboard itself is always
-available on the wire port regardless.
+Plain HTTP is redirect-only for every host EXCEPT the STUN vhost (§6.1a): the `dashboard_listen` port
+(default `[::]:80`) responds with `301 Moved Permanently → https://<host><path>` (using the request's
+`Host`). Because it binds a privileged port, this redirect listener is NON-FATAL: if it cannot bind
+(e.g. `:80` on an unprivileged self-hosted relay), the relay logs a warning and keeps serving the
+wire/health/STUN listeners normally (point `--dashboard-listen` at a high port to enable it there).
+The dashboard itself is always available on the wire port regardless.
 
 - `GET /` → an HTML overview page (auto-refreshing ~every 5 s) that fetches `/stats.json` and renders
   it, handling the loading / error / empty / success states.
@@ -434,6 +436,50 @@ public SHA-256 identity hash, not PII) and only the ADDRESS FAMILY of each peer 
 the dashboard does not publish the network's dialable topology. By default `peer_id` is TRUNCATED to a
 short prefix; the query `?full=1` returns the un-truncated `peer_id`. No key material or payload is
 ever exposed (the relay is an untrusted forwarder and holds none).
+
+## 6.1a STUN vhost — usage page (relay.dig.net#stun-usage-page)
+
+`GET http://stun.<domain>/` and `GET https://stun.<domain>/` both return a usage document for this
+relay's STUN responder (§5), instead of the ordinary peer-stats dashboard — on BOTH the wire listener
+(`listen`, TLS-terminated upstream) and the plain-HTTP redirect listener (`dashboard_listen`). This is
+the one deliberate exception to "plain HTTP is redirect-only" (§6.1): the STUN vhost is served
+directly and unencrypted, because it carries no secrets and a redirect-then-refetch-over-TLS round
+trip cannot complete for an IPv4-only caller (the IPv4-only STUN load balancer this vhost's `A` record
+resolves to has no `:443` listener at all — see `relay.dig.net`'s `main.tf`).
+
+**Vhost matching (normative) is a hostname PREFIX, not a hardcoded domain:** a request's `Host` header
+(a trailing `:port` stripped, matched case-insensitively) selects the STUN vhost whenever it starts
+with `stun.` — so a self-hosted relay's own `stun.<their-domain>` gets this treatment automatically,
+the same way `https_location` (§6.1) already treats `Host` as caller-supplied.
+
+Three routes, all read-only:
+
+- `GET /` → an HTML usage page: what the endpoint is (RFC 5389 STUN Binding responder), the endpoint
+  itself (`<host>:3478/udp`) and why one hostname answers correctly over both address families, a
+  copyable example command, what the endpoint is NOT (not a general-purpose public STUN service, not
+  a proxy, not a destination for non-Binding traffic), and today's authorization state (none required).
+- `GET /stun.json` → the same facts machine-readable:
+
+  ```json
+  {
+    "schema_version": 1,
+    "host": "<the request's own Host, verbatim>",
+    "port": <u16, the relay's ACTUAL configured stun_listen port>,
+    "transport": "udp",
+    "families": ["A", "AAAA"],
+    "scope": "<a short, honest scope statement>"
+  }
+  ```
+
+  `host` and `port` are read from the request/live config, never a hardcoded literal — a self-hosted
+  relay running `--stun-listen` on a nonstandard port reports the truth. Additive fields do NOT bump
+  `schema_version`, mirroring `/stats.json`'s contract (§6.1).
+- `GET /mascot.png` → the same embedded mascot the ordinary dashboard serves, so the page's favicon
+  resolves even when reached over plain HTTP with no TLS available on that path.
+
+Any other path on this vhost returns `404`. No authentication or signed request is required as of this
+writing; a signed-request requirement for relay endpoints generally is tracked separately and, if it
+lands, will supersede this paragraph rather than the page silently going stale.
 
 ## 6.2 Peer globe (`/map`) — coarse, privacy-first geo visualization
 
