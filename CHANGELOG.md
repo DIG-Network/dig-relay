@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.20.0] - 2026-09-05
+
+### Features
+- **dashboard:** Serve a STUN usage page on the stun.<domain> vhost (#39)
+
+### CI
+- **bootstrap:** Fix Debian bullseye pool-index mismatch with snapshot.debian.org (#37)
+
 ## [0.19.7] - 2026-09-05
 
 ### Bug Fixes
