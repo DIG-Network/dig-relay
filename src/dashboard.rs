@@ -42,6 +42,16 @@ const PEER_ID_PREFIX_LEN: usize = 12;
 /// Served immutably at `GET /mascot.png`.
 const MASCOT_PNG: &[u8] = include_bytes!("../assets/minion-dighub.png");
 
+/// The `/stun.json` schema version (mirrors [`STATS_SCHEMA_VERSION`]'s contract: bumped only on a
+/// BREAKING change to this shape; additive fields never bump it).
+pub const STUN_INFO_SCHEMA_VERSION: u32 = 1;
+
+/// The STUN usage page, an external asset rather than an inline Rust string literal — `cargo fmt`
+/// silently collapses `\` line-continuations inside a `const &str` into runs of spaces, and
+/// `--check` is satisfied by its own reformatted output, so a large inline HTML literal is a real
+/// trap here. Two tokens are substituted at request time (see [`stun_html`]); nothing else varies.
+const STUN_USAGE_HTML: &str = include_str!("../assets/stun_usage.html");
+
 /// The self-contained `globe.gl` UMD build (bundles three.js + three-globe + three-render-objects)
 /// that renders the `/map` globe entirely client-side with no CDN fetch. Provenance + license in
 /// `assets/map/PROVENANCE.md`. Served immutably at `GET /map/globe.gl.min.js`.
@@ -381,6 +391,108 @@ pub fn route(
     }
 }
 
+/// Machine-readable facts about this relay's STUN (RFC 5389) responder — the `/stun.json` body
+/// served on the STUN vhost (§ [`is_stun_host`]), alongside the human-readable page at the same
+/// path. A script that wants to dial this relay's STUN responder reads this instead of scraping
+/// the HTML.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StunInfo {
+    /// The `/stun.json` schema version ([`STUN_INFO_SCHEMA_VERSION`]).
+    pub schema_version: u32,
+    /// The hostname this response was served under — copied verbatim from the request's own `Host`
+    /// header, so a self-hosted relay's `/stun.json` never asserts a domain that isn't its own.
+    pub host: String,
+    /// The STUN Binding responder's UDP port — the relay's actual configured
+    /// [`crate::config::RelayServerConfig::stun_listen`] port, not a hardcoded default, so a
+    /// self-hosted relay running `--stun-listen` on a nonstandard port reports the truth.
+    pub port: u16,
+    /// Always `"udp"` — STUN is a UDP-only protocol at this relay; there is no TCP fallback.
+    pub transport: &'static str,
+    /// The address families this hostname answers over — both `A` (IPv4) and `AAAA` (IPv6) resolve
+    /// for it, each routed to a same-family responder (see the usage page for why that matters).
+    pub families: [&'static str; 2],
+    /// A short, honest scope statement, so a machine reading only the JSON (never the prose) still
+    /// gets the "not a general-purpose STUN service" boundary.
+    pub scope: &'static str,
+}
+
+/// Build the [`StunInfo`] for one request. Pure (no I/O) — `host` and `stun_port` are read from the
+/// caller's own request/config, never invented here, so the answer is honest for any deployment.
+fn stun_info(host: &str, stun_port: u16) -> StunInfo {
+    StunInfo {
+        schema_version: STUN_INFO_SCHEMA_VERSION,
+        host: host.to_string(),
+        port: stun_port,
+        transport: "udp",
+        families: ["A", "AAAA"],
+        scope: "RFC 5389 STUN Binding responder for the DIG Network — not a general-purpose public \
+                STUN service, not a proxy, and not a destination for anything but a Binding request.",
+    }
+}
+
+/// Render the STUN usage page for `host`, substituting the two dynamic tokens the static asset
+/// carries: the full endpoint (`{{HOST}}`, e.g. `stun.relay.dig.net`) and the sibling domain the
+/// ordinary peer-stats dashboard lives on (`{{RELAY_DOMAIN}}`, derived by stripping the leading
+/// `stun.` label — so this keeps working for a self-hosted relay under any domain, not just
+/// `relay.dig.net`).
+fn stun_html(host: &str) -> Vec<u8> {
+    let relay_domain = host.strip_prefix("stun.").unwrap_or(host);
+    STUN_USAGE_HTML
+        .replace("{{HOST}}", host)
+        .replace("{{RELAY_DOMAIN}}", relay_domain)
+        .into_bytes()
+}
+
+/// Whether a request's `Host` header names the dedicated STUN vhost (relay.dig.net#stun-usage-page)
+/// rather than the ordinary peer-stats dashboard. Matches a `stun.` PREFIX — not merely a substring,
+/// and not a hardcoded `stun.relay.dig.net` — so a self-hosted relay's own `stun.<their-domain>`
+/// gets the usage page automatically, the same way [`https_location`] already treats `Host` as
+/// caller-supplied rather than assuming `relay.dig.net`. A trailing `:port` (Host headers may carry
+/// one) is stripped before matching; the comparison is case-insensitive.
+fn is_stun_host(host: Option<&str>) -> bool {
+    let Some(host) = host else { return false };
+    let host = host.split(':').next().unwrap_or(host);
+    host.to_ascii_lowercase().starts_with("stun.")
+}
+
+/// Route a request already known to be on the STUN vhost ([`is_stun_host`]): `/` → the usage page,
+/// `/stun.json` → the same facts machine-readable, `/mascot.png` → the same embedded mascot the
+/// ordinary dashboard serves (so the favicon resolves even when this vhost is reached over plain
+/// HTTP with no TLS, e.g. the IPv4-only STUN load balancer's `:80` listener), anything else → 404.
+fn route_stun(path: &str, host: &str, stun_port: u16) -> DashboardResponse {
+    match path {
+        "/" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "text/html; charset=utf-8",
+            cache_control: None,
+            body: stun_html(host),
+        },
+        "/stun.json" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "application/json",
+            cache_control: Some("no-store"),
+            body: serde_json::to_vec(&stun_info(host, stun_port))
+                .unwrap_or_else(|_| b"{}".to_vec()),
+        },
+        "/mascot.png" => DashboardResponse {
+            status: 200,
+            reason: "OK",
+            content_type: "image/png",
+            cache_control: Some("public, max-age=31536000, immutable"),
+            body: MASCOT_PNG.to_vec(),
+        },
+        _ => DashboardResponse {
+            status: 404,
+            reason: "Not Found",
+            content_type: "text/plain; charset=utf-8",
+            cache_control: None,
+            body: b"not found\n".to_vec(),
+        },
+    }
+}
+
 /// Build the live stats snapshot from the relay's registry + counters (locks the registry briefly).
 /// Shared by the `/stats.json` route and the HTML page's data.
 pub async fn live_snapshot(state: &RelayState, full: bool) -> StatsSnapshot {
@@ -403,9 +515,31 @@ pub async fn live_map_snapshot(state: &RelayState) -> MapSnapshot {
     build_map_snapshot(&peers, &LiveGeoResolver, MAP_CELL_DEG, now_secs())
 }
 
+/// Write a [`DashboardResponse`] to an already-accepted stream — shared by every caller of
+/// [`route`]/[`route_stun`] so the header-building (`Content-Type` + optional `Cache-Control`)
+/// lives in exactly one place.
+async fn write_dashboard_response<S>(
+    stream: &mut S,
+    resp: &DashboardResponse,
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let mut headers: Vec<(&str, &str)> = vec![("Content-Type", resp.content_type)];
+    if let Some(cc) = resp.cache_control {
+        headers.push(("Cache-Control", cc));
+    }
+    crate::http_serve::write_response(stream, resp.status, resp.reason, &headers, &resp.body).await
+}
+
 /// Serve ONE dashboard HTTP request over an already-accepted (TLS-terminated-upstream) stream — the
 /// non-WebSocket branch of the relay's `:443` listener. `head` is the request the wire accept loop
 /// already peeked; this reads the live stats, routes the path, and writes the response.
+///
+/// A request whose `Host` names the STUN vhost ([`is_stun_host`]) is served the STUN usage page
+/// instead of the ordinary dashboard — this is the same vhost this relay's peer-stats dashboard
+/// already answers on today (over IPv6, since `stun.<domain>`'s `AAAA` record aliases the same
+/// dualstack load balancer), just serving the RIGHT content for that hostname now.
 pub async fn serve_http<S>(
     state: &RelayState,
     stream: &mut S,
@@ -414,6 +548,13 @@ pub async fn serve_http<S>(
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
+    if let Some(host) = head.host.as_deref() {
+        if is_stun_host(Some(host)) {
+            let resp = route_stun(head.path(), host, state.config.stun_listen.port());
+            return write_dashboard_response(stream, &resp).await;
+        }
+    }
+
     // The map snapshot needs its own registry read + geo resolution, so only build it for the two
     // routes that actually use it — every other route (`/`, `/stats.json`, `/mascot.png`, the
     // vendored globe assets) skips that work entirely.
@@ -424,11 +565,7 @@ where
     };
     let dht_view = state.dht_view.lock().unwrap().clone();
     let resp = route(head.path(), &snapshot, &map_snapshot, &dht_view);
-    let mut headers: Vec<(&str, &str)> = vec![("Content-Type", resp.content_type)];
-    if let Some(cc) = resp.cache_control {
-        headers.push(("Cache-Control", cc));
-    }
-    crate::http_serve::write_response(stream, resp.status, resp.reason, &headers, &resp.body).await
+    write_dashboard_response(stream, &resp).await
 }
 
 /// The absolute `https://` URL a plain-HTTP request should be redirected to. Uses the request's own
@@ -439,10 +576,36 @@ pub fn https_location(head: &RequestHead) -> String {
     format!("https://{host}{}", head.target)
 }
 
+/// What the plain-HTTP listener does with one request: either serve content directly, or bounce the
+/// caller to the HTTPS origin. Pure (no I/O) so the decision is unit-testable without a real socket —
+/// [`run_redirect`] is the thin I/O shell that calls this and writes whichever variant comes back.
+enum RedirectAction {
+    /// Serve this response body directly, over plain HTTP, no redirect.
+    Serve(DashboardResponse),
+    /// `301 Moved Permanently` to this absolute `https://` URL.
+    Redirect(String),
+}
+
+/// Decide how the plain-HTTP (`:80`→[`RelayServerConfig::dashboard_listen`](crate::config::RelayServerConfig::dashboard_listen))
+/// listener answers one request. Every host is bounced to HTTPS EXCEPT the STUN vhost
+/// ([`is_stun_host`]), which is served directly and unencrypted: it carries no secrets, and serving
+/// it here is what makes `GET http://stun.<domain>/` work for an IPv4-only caller, since the
+/// IPv4-only STUN load balancer has no `:443` listener at all (see relay.dig.net's `main.tf`) — a
+/// redirect-then-refetch-over-TLS round trip would dead-end there.
+fn decide_redirect(head: &RequestHead, stun_port: u16) -> RedirectAction {
+    if let Some(host) = head.host.as_deref() {
+        if is_stun_host(Some(host)) {
+            return RedirectAction::Serve(route_stun(head.path(), host, stun_port));
+        }
+    }
+    RedirectAction::Redirect(https_location(head))
+}
+
 /// Run the plain-HTTP redirect listener on `listen` (dual-stack): every request gets a
-/// `301 → https://<host><path>`. The relay supports only HTTPS/WSS, so `:80` exists solely to bounce
-/// browsers to the secure origin — it never serves content.
-pub async fn run_redirect(listen: SocketAddr) -> std::io::Result<()> {
+/// `301 → https://<host><path>`, EXCEPT the STUN vhost, which is served its usage page directly
+/// (see [`decide_redirect`]). `stun_port` is the relay's actual configured STUN port, threaded
+/// through so the STUN vhost's `/stun.json` never has to guess it.
+pub async fn run_redirect(listen: SocketAddr, stun_port: u16) -> std::io::Result<()> {
     let listener = bind_tcp_dual_stack(listen)?;
     tracing::info!(addr = %listen, "dig-relay http→https redirect listening");
     loop {
@@ -455,15 +618,21 @@ pub async fn run_redirect(listen: SocketAddr) -> std::io::Result<()> {
         };
         tokio::spawn(async move {
             if let Ok((head, _)) = crate::http_serve::read_request_head(&mut stream).await {
-                let location = https_location(&head);
-                let _ = crate::http_serve::write_response(
-                    &mut stream,
-                    301,
-                    "Moved Permanently",
-                    &[("Location", &location)],
-                    b"",
-                )
-                .await;
+                match decide_redirect(&head, stun_port) {
+                    RedirectAction::Serve(resp) => {
+                        let _ = write_dashboard_response(&mut stream, &resp).await;
+                    }
+                    RedirectAction::Redirect(location) => {
+                        let _ = crate::http_serve::write_response(
+                            &mut stream,
+                            301,
+                            "Moved Permanently",
+                            &[("Location", &location)],
+                            b"",
+                        )
+                        .await;
+                    }
+                }
             }
         });
     }
@@ -1262,5 +1431,145 @@ mod tests {
             DASHBOARD_HTML.contains("https://hub.dig.net"),
             "links to hub.dig.net"
         );
+    }
+
+    // ---- STUN vhost (relay.dig.net#stun-usage-page) ----
+
+    #[test]
+    fn is_stun_host_matches_only_a_genuine_stun_prefix() {
+        // The real cases an operator will actually see.
+        assert!(is_stun_host(Some("stun.relay.dig.net")));
+        assert!(is_stun_host(Some("STUN.RELAY.DIG.NET")), "case-insensitive");
+        assert!(
+            is_stun_host(Some("stun.relay.dig.net:8080")),
+            "a Host header's trailing :port must not defeat the match"
+        );
+        // Domain-agnostic: a self-hosted relay under ANY domain gets the same treatment — this is
+        // the whole reason the check is a prefix match rather than a hardcoded "relay.dig.net".
+        assert!(is_stun_host(Some("stun.example.org")));
+
+        // Not a match: the ordinary dashboard host, and no Host header at all.
+        assert!(!is_stun_host(Some("relay.dig.net")));
+        assert!(!is_stun_host(None));
+
+        // The discriminating cases: "stun." must be a PREFIX, not merely a substring. A `contains`
+        // implementation would wrongly accept both of these.
+        assert!(!is_stun_host(Some("xstun.relay.dig.net")));
+        assert!(!is_stun_host(Some("my-stun.relay.dig.net")));
+    }
+
+    #[test]
+    fn stun_info_echoes_the_caller_supplied_host_and_port_not_a_constant() {
+        // Two different call sites must come back with two different answers — proving the fields
+        // are genuinely threaded through rather than a hardcoded literal that happens to match one
+        // of them.
+        let a = stun_info("stun.alpha.example", 4001);
+        let b = stun_info("stun.beta.example", 4002);
+
+        assert_eq!(a.host, "stun.alpha.example");
+        assert_eq!(a.port, 4001);
+        assert_eq!(b.host, "stun.beta.example");
+        assert_eq!(b.port, 4002);
+        assert_ne!(a.host, b.host);
+        assert_ne!(a.port, b.port);
+
+        assert_eq!(a.transport, "udp");
+        assert_eq!(a.families, ["A", "AAAA"]);
+        assert_eq!(a.schema_version, STUN_INFO_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn route_stun_serves_usage_json_mascot_and_404s_the_rest() {
+        let html = route_stun("/", "stun.relay.dig.net", 3478);
+        assert_eq!(html.status, 200);
+        assert_eq!(html.content_type, "text/html; charset=utf-8");
+        let body = String::from_utf8(html.body).unwrap();
+        assert!(
+            body.contains("stun.relay.dig.net:3478"),
+            "the page must show the ACTUAL endpoint, not a placeholder: {body}"
+        );
+        assert!(
+            !body.contains("{{HOST}}") && !body.contains("{{RELAY_DOMAIN}}"),
+            "every template placeholder must have been substituted: {body}"
+        );
+        assert!(body.contains("RFC 5389"));
+
+        let json = route_stun("/stun.json", "stun.relay.dig.net", 3478);
+        assert_eq!(json.status, 200);
+        assert_eq!(json.content_type, "application/json");
+        let v: serde_json::Value = serde_json::from_slice(&json.body).unwrap();
+        assert_eq!(v["host"], "stun.relay.dig.net");
+        assert_eq!(v["port"], 3478);
+        assert_eq!(v["transport"], "udp");
+        assert_eq!(v["families"], serde_json::json!(["A", "AAAA"]));
+
+        let mascot = route_stun("/mascot.png", "stun.relay.dig.net", 3478);
+        assert_eq!(mascot.status, 200);
+        assert_eq!(mascot.content_type, "image/png");
+        assert_eq!(
+            mascot.body, MASCOT_PNG,
+            "the STUN vhost's favicon must be the SAME embedded mascot, not a copy"
+        );
+
+        let missing = route_stun("/nope", "stun.relay.dig.net", 3478);
+        assert_eq!(missing.status, 404);
+    }
+
+    #[test]
+    fn stun_vhost_page_is_not_the_generic_dashboard_and_vice_versa() {
+        // The discriminating property: a request for `/` on the STUN vhost must NOT be the same
+        // content as `/` on the ordinary dashboard host, in EITHER direction — this is what catches
+        // an implementation that ignores Host and always serves one page regardless.
+        let snap = build_snapshot(vec![], Counters::default(), 0, 0, false);
+        let dashboard = route("/", &snap, &empty_map_snapshot(), &empty_dht_view());
+        let stun = route_stun("/", "stun.relay.dig.net", 3478);
+
+        let dashboard_body = String::from_utf8(dashboard.body).unwrap();
+        let stun_body = String::from_utf8(stun.body).unwrap();
+
+        assert!(dashboard_body.contains("Connected peers"));
+        assert!(!dashboard_body.contains("RFC 5389"));
+
+        assert!(stun_body.contains("RFC 5389"));
+        assert!(!stun_body.contains("Connected peers"));
+    }
+
+    #[test]
+    fn decide_redirect_serves_stun_but_redirects_every_other_host() {
+        let stun_head = RequestHead {
+            method: "GET".into(),
+            target: "/".into(),
+            host: Some("stun.relay.dig.net".into()),
+            is_websocket_upgrade: false,
+        };
+        match decide_redirect(&stun_head, 3478) {
+            RedirectAction::Serve(resp) => {
+                assert_eq!(resp.status, 200);
+                assert!(String::from_utf8(resp.body).unwrap().contains("RFC 5389"));
+            }
+            RedirectAction::Redirect(_) => panic!("the STUN vhost must be served, not redirected"),
+        }
+
+        let ordinary_head = RequestHead {
+            host: Some("relay.dig.net".into()),
+            ..stun_head.clone()
+        };
+        match decide_redirect(&ordinary_head, 3478) {
+            RedirectAction::Redirect(location) => {
+                assert_eq!(location, "https://relay.dig.net/");
+            }
+            RedirectAction::Serve(_) => panic!("every non-STUN host keeps redirecting to https"),
+        }
+
+        // No Host header at all falls back to the redirect path too (matches https_location's own
+        // no-Host fallback) — `is_stun_host(None)` is false, so there is no special case to miss.
+        let no_host = RequestHead {
+            host: None,
+            ..ordinary_head
+        };
+        assert!(matches!(
+            decide_redirect(&no_host, 3478),
+            RedirectAction::Redirect(_)
+        ));
     }
 }

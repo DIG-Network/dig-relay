@@ -98,14 +98,16 @@ pub async fn serve_with_shutdown(
 
     // The relay supports only HTTPS/WSS (dig_ecosystem #1041): the peer-stats dashboard is served
     // over TLS on the wire listener itself (a browser `GET /` on `:443`; a WS upgrade is the peer
-    // wire), and THIS listener — the `--dashboard-listen` port (default `:80`) — only bounces plain
-    // HTTP to `https://`. It must NEVER be able to tear down the relay's peer wire, and an
+    // wire), and THIS listener — the `--dashboard-listen` port (default `:80`) — bounces plain HTTP
+    // to `https://` for every host EXCEPT the STUN vhost, which it serves directly (relay.dig.net's
+    // STUN usage page). It must NEVER be able to tear down the relay's peer wire, and an
     // unprivileged host may not bind `:80`, so it runs as a background task whose failure is a logged
     // warning, not a fatal serve error (unlike the wire/health/STUN listeners below).
     tokio::spawn({
         let redirect_listen = state.config.dashboard_listen;
+        let stun_port = state.config.stun_listen.port();
         async move {
-            if let Err(e) = dashboard::run_redirect(redirect_listen).await {
+            if let Err(e) = dashboard::run_redirect(redirect_listen, stun_port).await {
                 tracing::warn!(error = %e, "dig-relay http→https redirect listener stopped (relay wire unaffected)");
             }
         }

@@ -5,3 +5,4 @@
 *.pdb
 .env
 .DS_Store
+.gitnexus
