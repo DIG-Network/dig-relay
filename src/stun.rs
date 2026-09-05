@@ -7,267 +7,40 @@
 //! **Binding Success Response** carrying an **XOR-MAPPED-ADDRESS** attribute — the source address of
 //! the request as observed by the server.
 //!
-//! This module implements the SERVER side of RFC 5389 (§6 message format, §15.2 XOR-MAPPED-ADDRESS).
-//! It is intentionally minimal: the only request type it answers is the Binding Request; every other
-//! well-formed request gets nothing (silently ignored, per the RFC's "unknown method" latitude for a
-//! stateless server) and a malformed datagram is rejected without a reply. The relay does not do
-//! authentication, `FINGERPRINT`, `SOFTWARE`, or the deprecated (non-XOR) MAPPED-ADDRESS — a DIG Node
-//! only needs its reflexive address, and every modern STUN client reads XOR-MAPPED-ADDRESS.
+//! The RFC 5389 Binding wire format (both directions) is owned by the `dig_stun` crate — the DIG
+//! ecosystem's one home for this codec, shared with `dig-nat`'s STUN client so the two can never
+//! diverge on it again. They already had: dig-relay's own encoder used to raw-match on the local
+//! `SocketAddr` enum variant, which tagged a genuine IPv4 caller's answer as IPv6 whenever the
+//! dual-stack socket handed it back as `::ffff:a.b.c.d` (dig-relay#35) — a strict RFC 5389 client
+//! rejects that response as unrelated to itself. `dig_stun::encode_binding_success` folds the peer's
+//! IP to its canonical family BEFORE encoding, so that class of defect has exactly one place left to
+//! recur, and this file's own test suite (below) still stands watch over it.
 //!
-//! Layering mirrors the rest of the crate: the codec ([`parse_binding_request`],
-//! [`build_binding_response`]) is PURE and fully unit-tested; [`run`] is the thin UDP serve loop that
-//! wires the codec to a socket. The STUN listener binds its own UDP port ([`crate::config`]
-//! `stun_listen`, default `[::]:3478` = the IANA-assigned STUN port, matching the DIG node
-//! peer-network protocol) alongside the WebSocket (9450) and health (9451) listeners, dual-stack
-//! (see [`crate::net`]) so it answers both IPv6 and IPv4 Binding Requests on the one socket.
+//! This module owns only what is genuinely dig-relay's: [`run`], the thin UDP serve loop that wires
+//! the codec to a socket, and [`StunRateLimiter`], the per-source-IP + global response budget that
+//! keeps the relay from being an open UDP reflector (SECURITY_AUDIT_P2P dig-relay #2). The STUN
+//! listener binds its own UDP port ([`crate::config`] `stun_listen`, default `[::]:3478` = the
+//! IANA-assigned STUN port, matching the DIG node peer-network protocol) alongside the WebSocket
+//! (9450) and health (9451) listeners, dual-stack (see [`crate::net`]) so it answers both IPv6 and
+//! IPv4 Binding Requests on the one socket.
+//!
+//! Server behaviour, unchanged by the adoption: the only request type answered is the Binding
+//! Request; every other well-formed request gets nothing (silently ignored, per the RFC's "unknown
+//! method" latitude for a stateless server) and a malformed datagram is rejected without a reply.
+//! The relay does not do authentication, `FINGERPRINT`, `SOFTWARE`, or the deprecated (non-XOR)
+//! MAPPED-ADDRESS — a DIG Node only needs its reflexive address, and every modern STUN client reads
+//! XOR-MAPPED-ADDRESS.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use dig_stun::{encode_binding_success, parse_binding_request};
 
 use crate::limits::{TokenBucket, MAX_TRACKED_IPS};
 use crate::net::bind_udp_dual_stack;
 use crate::server::RelayState;
-
-/// The STUN magic cookie (RFC 5389 §6): a fixed 32-bit value in bytes 4..8 of every STUN message.
-/// Its top 16 bits also key the XOR of XOR-MAPPED-ADDRESS.
-pub const MAGIC_COOKIE: u32 = 0x2112_A442;
-
-/// STUN method+class values we handle (RFC 5389 §6, message-type field).
-/// The 14-bit message type encodes a method + a class; for Binding these are:
-pub mod msgtype {
-    /// Binding Request (method Binding = 0x001, class Request = 0b00).
-    pub const BINDING_REQUEST: u16 = 0x0001;
-    /// Binding Success Response (method Binding = 0x001, class Success Response = 0b10).
-    pub const BINDING_SUCCESS_RESPONSE: u16 = 0x0101;
-}
-
-/// STUN attribute type values (RFC 5389 §18.2).
-pub mod attr {
-    /// XOR-MAPPED-ADDRESS (RFC 5389 §15.2) — the reflexive address, XOR-obfuscated.
-    pub const XOR_MAPPED_ADDRESS: u16 = 0x0020;
-}
-
-/// Address family byte inside a (XOR-)MAPPED-ADDRESS attribute (RFC 5389 §15.1).
-mod family {
-    pub const IPV4: u8 = 0x01;
-    pub const IPV6: u8 = 0x02;
-}
-
-/// The fixed STUN header length in bytes (RFC 5389 §6).
-const HEADER_LEN: usize = 20;
-
-/// The 96-bit transaction id that ties a STUN response to its request (RFC 5389 §6).
-///
-/// The server echoes the request's transaction id back verbatim in the response, and — together
-/// with the magic cookie — it is the key material for the XOR-MAPPED-ADDRESS obfuscation.
-pub type TransactionId = [u8; 12];
-
-/// A parsed, validated STUN Binding Request: just the transaction id (the only field the server
-/// needs to echo). Produced by [`parse_binding_request`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BindingRequest {
-    /// The request's 96-bit transaction id, echoed verbatim in the response.
-    pub transaction_id: TransactionId,
-}
-
-/// Why a datagram was rejected as not a STUN Binding Request. Catalogued (like the relay's
-/// [`crate::server::errcode`]) so behaviour is documented, not guessed. A rejected datagram gets NO
-/// reply (a STUN server must never answer a non-STUN packet).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StunError {
-    /// Fewer than the 20 header bytes, or the stated attribute length overruns the datagram.
-    Truncated,
-    /// Bytes 4..8 are not the STUN magic cookie — not a STUN message.
-    BadMagicCookie,
-    /// The two most-significant bits of byte 0 are not zero (not a STUN message per §6).
-    NotStun,
-    /// A valid STUN message, but not a Binding Request (e.g. a response, or another method). The
-    /// stateless server simply ignores these.
-    NotBindingRequest,
-}
-
-/// Parse and validate a datagram as a STUN **Binding Request** (RFC 5389 §6, §7.3).
-///
-/// Checks, in order: the two leading zero bits (STUN marker), the 20-byte minimum, the magic
-/// cookie, the message type (must be Binding Request), and that the declared message length does not
-/// overrun the datagram. Returns the transaction id on success. PURE — no I/O — so it is exhaustively
-/// unit-testable.
-pub fn parse_binding_request(datagram: &[u8]) -> Result<BindingRequest, StunError> {
-    if datagram.len() < HEADER_LEN {
-        return Err(StunError::Truncated);
-    }
-    // RFC 5389 §6: the most-significant two bits of a STUN message MUST be zero.
-    if datagram[0] & 0xC0 != 0 {
-        return Err(StunError::NotStun);
-    }
-    let message_type = u16::from_be_bytes([datagram[0], datagram[1]]);
-    let message_length = u16::from_be_bytes([datagram[2], datagram[3]]) as usize;
-    let cookie = u32::from_be_bytes([datagram[4], datagram[5], datagram[6], datagram[7]]);
-    if cookie != MAGIC_COOKIE {
-        return Err(StunError::BadMagicCookie);
-    }
-    // The stated length must not claim more attribute bytes than the datagram actually carries.
-    if HEADER_LEN + message_length > datagram.len() {
-        return Err(StunError::Truncated);
-    }
-    if message_type != msgtype::BINDING_REQUEST {
-        return Err(StunError::NotBindingRequest);
-    }
-
-    let mut transaction_id = [0u8; 12];
-    transaction_id.copy_from_slice(&datagram[8..20]);
-    Ok(BindingRequest { transaction_id })
-}
-
-/// Build a STUN **Binding Success Response** carrying the XOR-MAPPED-ADDRESS of `reflexive`
-/// (RFC 5389 §6, §15.2).
-///
-/// `reflexive` is the address the server observed the request come FROM — i.e. the client's public
-/// reflexive address. The response echoes `transaction_id` and contains exactly one attribute
-/// (XOR-MAPPED-ADDRESS). PURE — returns the bytes to send — so the encoding is unit-testable.
-pub fn build_binding_response(transaction_id: &TransactionId, reflexive: SocketAddr) -> Vec<u8> {
-    let attr_value = xor_mapped_address_value(transaction_id, reflexive);
-    let attr_len = attr_value.len();
-    // Message length = attribute header (4) + attribute value. STUN attributes are 4-byte aligned;
-    // our value is already a multiple of 4 (IPv4 = 8, IPv6 = 20), so no padding is needed.
-    let message_length = (4 + attr_len) as u16;
-
-    let mut out = Vec::with_capacity(HEADER_LEN + 4 + attr_len);
-    out.extend_from_slice(&msgtype::BINDING_SUCCESS_RESPONSE.to_be_bytes());
-    out.extend_from_slice(&message_length.to_be_bytes());
-    out.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-    out.extend_from_slice(transaction_id);
-    // XOR-MAPPED-ADDRESS attribute: type, length, value.
-    out.extend_from_slice(&attr::XOR_MAPPED_ADDRESS.to_be_bytes());
-    out.extend_from_slice(&(attr_len as u16).to_be_bytes());
-    out.extend_from_slice(&attr_value);
-    out
-}
-
-/// Encode the VALUE of an XOR-MAPPED-ADDRESS attribute (RFC 5389 §15.2): the reserved byte, the
-/// address family, the X-Port, and the X-Address.
-///
-/// - X-Port = port XOR the 16 most-significant bits of the magic cookie.
-/// - X-Address (IPv4) = address XOR the magic cookie.
-/// - X-Address (IPv6) = address XOR (magic cookie ‖ transaction id).
-fn xor_mapped_address_value(transaction_id: &TransactionId, addr: SocketAddr) -> Vec<u8> {
-    // Fold a v4-mapped IPv6 peer (`::ffff:a.b.c.d`) to its canonical V4 form BEFORE selecting which
-    // family to encode. The STUN listener binds dual-stack with `IPV6_V6ONLY=false` (`crate::net`),
-    // so `socket.recv_from()` hands back exactly this form for EVERY IPv4-originated datagram — never
-    // a native `SocketAddr::V4` — and a raw `match` on the enum variant tagged a genuine IPv4 caller's
-    // answer as IPv6 (dig-relay#35), which a strict RFC 5389 client rejects as unrelated to itself.
-    // `to_canonical()` is the same fold this file already applies to the rate limiter's per-source-IP
-    // key just below (`StunRateLimiter::allow`) — one dual-stack-socket problem, one idiom. It folds
-    // only the v4-mapped form, not the long-deprecated IPv4-compatible form (`::a.b.c.d`, RFC 4291
-    // §2.5.5.1); no modern OS's `recv_from()` ever produces the latter, so that narrower scope covers
-    // every address this socket can actually hand back (`dig_nat::stun::is_usable_reflexive_addr`
-    // uses the broader `to_ipv4()` for the same reason, for a caller that must also reject that dead
-    // legacy form outright rather than merely never observing it).
-    let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
-    let xport = addr.port() ^ (MAGIC_COOKIE >> 16) as u16;
-    match addr {
-        SocketAddr::V4(v4) => {
-            let mut value = Vec::with_capacity(8);
-            value.push(0x00); // reserved
-            value.push(family::IPV4);
-            value.extend_from_slice(&xport.to_be_bytes());
-            let xaddr = u32::from(*v4.ip()) ^ MAGIC_COOKIE;
-            value.extend_from_slice(&xaddr.to_be_bytes());
-            value
-        }
-        SocketAddr::V6(v6) => {
-            let mut value = Vec::with_capacity(20);
-            value.push(0x00); // reserved
-            value.push(family::IPV6);
-            value.extend_from_slice(&xport.to_be_bytes());
-            // XOR key for IPv6 = magic cookie (4 bytes) followed by the 12-byte transaction id.
-            let mut key = [0u8; 16];
-            key[0..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
-            key[4..16].copy_from_slice(transaction_id);
-            let addr_bytes = v6.ip().octets();
-            let xaddr: Vec<u8> = addr_bytes
-                .iter()
-                .zip(key.iter())
-                .map(|(a, k)| a ^ k)
-                .collect();
-            value.extend_from_slice(&xaddr);
-            value
-        }
-    }
-}
-
-/// Decode an XOR-MAPPED-ADDRESS attribute value back into a `SocketAddr` (RFC 5389 §15.2).
-///
-/// This is the client-side reverse of [`xor_mapped_address_value`]; the server never needs it, but
-/// it is the natural way to unit-test that the server encoded a recoverable address, so it lives here
-/// (and is available to any in-crate STUN client/test). Returns `None` on a malformed value.
-///
-/// Unlike the encoder, this dispatches on the WIRE family byte (`fam`, read from the attribute
-/// bytes) rather than on a local `SocketAddr` enum variant, so it carries none of the v4-mapped-vs-
-/// native ambiguity that [`xor_mapped_address_value`] had to fold away (dig-relay#35): whatever
-/// family the encoder actually wrote onto the wire is exactly the family decoded back here.
-pub fn decode_xor_mapped_address(
-    transaction_id: &TransactionId,
-    value: &[u8],
-) -> Option<SocketAddr> {
-    if value.len() < 4 {
-        return None;
-    }
-    let fam = value[1];
-    let xport = u16::from_be_bytes([value[2], value[3]]);
-    let port = xport ^ (MAGIC_COOKIE >> 16) as u16;
-    match fam {
-        family::IPV4 => {
-            if value.len() < 8 {
-                return None;
-            }
-            let xaddr = u32::from_be_bytes([value[4], value[5], value[6], value[7]]);
-            let ip = Ipv4Addr::from(xaddr ^ MAGIC_COOKIE);
-            Some(SocketAddr::from((ip, port)))
-        }
-        family::IPV6 => {
-            if value.len() < 20 {
-                return None;
-            }
-            let mut key = [0u8; 16];
-            key[0..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
-            key[4..16].copy_from_slice(transaction_id);
-            let mut octets = [0u8; 16];
-            for (i, o) in octets.iter_mut().enumerate() {
-                *o = value[4 + i] ^ key[i];
-            }
-            Some(SocketAddr::from((Ipv6Addr::from(octets), port)))
-        }
-        _ => None,
-    }
-}
-
-/// Locate the XOR-MAPPED-ADDRESS attribute value inside a STUN message (walks the TLV attribute
-/// list). Server never needs this; it exists so tests (and any in-crate client) can read a response.
-/// Returns `None` if the attribute is absent or the message is malformed.
-pub fn find_xor_mapped_address(message: &[u8]) -> Option<&[u8]> {
-    if message.len() < HEADER_LEN {
-        return None;
-    }
-    let mut offset = HEADER_LEN;
-    while offset + 4 <= message.len() {
-        let attr_type = u16::from_be_bytes([message[offset], message[offset + 1]]);
-        let attr_len = u16::from_be_bytes([message[offset + 2], message[offset + 3]]) as usize;
-        let value_start = offset + 4;
-        let value_end = value_start + attr_len;
-        if value_end > message.len() {
-            return None;
-        }
-        if attr_type == attr::XOR_MAPPED_ADDRESS {
-            return Some(&message[value_start..value_end]);
-        }
-        // Attributes are padded to a 4-byte boundary.
-        offset = value_start + attr_len.div_ceil(4) * 4;
-    }
-    None
-}
 
 /// Rate limiter for STUN responses (SECURITY_AUDIT_P2P dig-relay #2): a per-source-IP token bucket
 /// plus a single global token bucket. `allow(src, now)` returns whether the relay may send a Binding
@@ -379,13 +152,14 @@ fn now_ms() -> u64 {
 
 /// Serve STUN Binding Requests over UDP until the socket errors.
 ///
-/// Binds `state.config.stun_listen`, then loops: receive a datagram, parse it as a Binding Request,
-/// and — on success AND within the response-rate budget — reply with a Binding Success Response
-/// carrying the sender's reflexive address. A datagram that is not a valid Binding Request is dropped
-/// without a reply (a STUN server must never answer a non-STUN packet, and a stateless server ignores
-/// requests it doesn't handle). A valid request that exceeds the per-source-IP or global response
-/// budget ([`StunRateLimiter`]) is also dropped without a reply, so the relay can never be an
-/// unlimited open UDP reflector (SECURITY_AUDIT_P2P dig-relay #2).
+/// Binds `state.config.stun_listen`, then loops: receive a datagram, parse it as a Binding Request
+/// (`dig_stun::parse_binding_request`), and — on success AND within the response-rate budget — reply
+/// with a Binding Success Response (`dig_stun::encode_binding_success`) carrying the sender's
+/// reflexive address. A datagram that is not a valid Binding Request is dropped without a reply (a
+/// STUN server must never answer a non-STUN packet, and a stateless server ignores requests it
+/// doesn't handle). A valid request that exceeds the per-source-IP or global response budget
+/// ([`StunRateLimiter`]) is also dropped without a reply, so the relay can never be an unlimited open
+/// UDP reflector (SECURITY_AUDIT_P2P dig-relay #2).
 pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
     // IPv6-first, IPv4-fallback: dual-stack bind (see `crate::net`) so the default `[::]` STUN
     // socket answers both native-IPv6 and IPv4 Binding Requests on the one UDP port.
@@ -412,7 +186,7 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
             }
         };
         match parse_binding_request(&buf[..n]) {
-            Ok(req) => {
+            Ok(transaction_id) => {
                 // Rate-limit BEFORE building/sending the response so an over-budget (possibly spoofed)
                 // source produces no outbound datagram at all — the relay never reflects past budget.
                 if !limiter.allow(src.ip(), now_ms()) {
@@ -425,7 +199,7 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
                 state
                     .stun_requests
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let response = build_binding_response(&req.transaction_id, src);
+                let response = encode_binding_success(&transaction_id, src);
                 if let Err(e) = socket.send_to(&response, src).await {
                     tracing::debug!(error = %e, %src, "STUN response send failed");
                 }
@@ -440,13 +214,29 @@ pub async fn run(state: Arc<RelayState>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use dig_stun::{
+        parse_binding_response, StunError, TransactionId, BINDING_REQUEST, BINDING_SUCCESS,
+        MAGIC_COOKIE,
+    };
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     /// A minimal well-formed Binding Request: header only (no attributes), given a transaction id.
     fn binding_request(tid: TransactionId) -> Vec<u8> {
-        let mut m = Vec::with_capacity(HEADER_LEN);
-        m.extend_from_slice(&msgtype::BINDING_REQUEST.to_be_bytes());
+        let mut m = Vec::with_capacity(20);
+        m.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
         m.extend_from_slice(&0u16.to_be_bytes()); // length 0
+        m.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        m.extend_from_slice(&tid);
+        m
+    }
+
+    /// A minimal well-formed Binding SUCCESS response carrying NO attributes at all — used to prove
+    /// `parse_binding_response` reports [`StunError::NoMappedAddress`] rather than mis-decoding when
+    /// the (XOR-)MAPPED-ADDRESS attribute is simply absent.
+    fn binding_success_with_no_attributes(tid: TransactionId) -> Vec<u8> {
+        let mut m = Vec::with_capacity(20);
+        m.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        m.extend_from_slice(&0u16.to_be_bytes()); // length 0: no attributes
         m.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
         m.extend_from_slice(&tid);
         m
@@ -454,10 +244,15 @@ mod tests {
 
     const TID: TransactionId = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
+    // ---- Codec correctness, now exercised against `dig_stun` (the codec's owner). These are the
+    // same properties dig-relay's own local codec used to prove; porting them (rather than deleting
+    // them) means a future `dig_stun` regression is still caught here, at the point of use, not only
+    // in that crate's own suite. ----
+
     #[test]
     fn parses_a_well_formed_binding_request() {
         let got = parse_binding_request(&binding_request(TID)).expect("valid request parses");
-        assert_eq!(got.transaction_id, TID);
+        assert_eq!(got, TID);
     }
 
     #[test]
@@ -472,19 +267,30 @@ mod tests {
         assert_eq!(parse_binding_request(&m), Err(StunError::BadMagicCookie));
     }
 
+    /// dig-relay's own (now-deleted) parser reported this as a distinct `NotStun` variant; `dig_stun`
+    /// folds it into the same exact-type-match check as "wrong method/class"
+    /// ([`StunError::UnexpectedType`]) — a nonzero leading bit changes the 16-bit message-type field
+    /// to a value other than [`BINDING_REQUEST`], so it is still rejected, just under one shared
+    /// variant instead of two. The server's observable behaviour is identical either way: no reply.
     #[test]
     fn rejects_a_message_with_nonzero_leading_bits() {
         let mut m = binding_request(TID);
-        m[0] |= 0x80; // set the top bit → not a STUN message
-        assert_eq!(parse_binding_request(&m), Err(StunError::NotStun));
+        m[0] |= 0x80; // set the top bit → no longer equals BINDING_REQUEST's own encoding
+        assert!(matches!(
+            parse_binding_request(&m),
+            Err(StunError::UnexpectedType(_))
+        ));
     }
 
     #[test]
     fn rejects_a_non_binding_request_message_type() {
         let mut m = binding_request(TID);
         // Turn it into a Binding Success Response (a response, not a request).
-        m[0..2].copy_from_slice(&msgtype::BINDING_SUCCESS_RESPONSE.to_be_bytes());
-        assert_eq!(parse_binding_request(&m), Err(StunError::NotBindingRequest));
+        m[0..2].copy_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        assert_eq!(
+            parse_binding_request(&m),
+            Err(StunError::UnexpectedType(BINDING_SUCCESS))
+        );
     }
 
     #[test]
@@ -498,12 +304,9 @@ mod tests {
     #[test]
     fn response_has_the_correct_header_and_echoes_the_transaction_id() {
         let addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 5), 54321));
-        let resp = build_binding_response(&TID, addr);
+        let resp = encode_binding_success(&TID, addr);
         // Message type = Binding Success Response.
-        assert_eq!(
-            u16::from_be_bytes([resp[0], resp[1]]),
-            msgtype::BINDING_SUCCESS_RESPONSE
-        );
+        assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), BINDING_SUCCESS);
         // Magic cookie present.
         assert_eq!(
             u32::from_be_bytes([resp[4], resp[5], resp[6], resp[7]]),
@@ -513,7 +316,7 @@ mod tests {
         assert_eq!(&resp[8..20], &TID);
         // Stated message length matches the actual attribute bytes.
         let stated = u16::from_be_bytes([resp[2], resp[3]]) as usize;
-        assert_eq!(stated, resp.len() - HEADER_LEN);
+        assert_eq!(stated, resp.len() - 20);
     }
 
     /// Covers a genuine NATIVE `SocketAddr::V4` input (e.g. an explicit IPv4-only bind — see
@@ -524,9 +327,8 @@ mod tests {
     #[test]
     fn native_ipv4_socketaddr_round_trips_through_xor_mapped_address() {
         let addr = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 17), 40000));
-        let resp = build_binding_response(&TID, addr);
-        let value = find_xor_mapped_address(&resp).expect("response carries XOR-MAPPED-ADDRESS");
-        let decoded = decode_xor_mapped_address(&TID, value).expect("value decodes");
+        let resp = encode_binding_success(&TID, addr);
+        let decoded = parse_binding_response(&resp, Some(&TID)).expect("response decodes cleanly");
         assert_eq!(
             decoded, addr,
             "the client recovers exactly its reflexive addr"
@@ -537,10 +339,12 @@ mod tests {
     /// `IPV6_V6ONLY=false` (`crate::net`), so `socket.recv_from()` hands back a v4-mapped
     /// `SocketAddr::V6` (`::ffff:a.b.c.d`) for EVERY IPv4-originated datagram — never a native
     /// `SocketAddr::V4`. The property under test is exactly what separates a correct encoder from
-    /// the nearest wrong one (today's, pre-fix): the SAME real peer must produce the SAME response
-    /// regardless of which `SocketAddr` variant the local socket happened to hand it back in. A test
-    /// that only builds a literal `SocketAddr::V4` (above) cannot exercise this — that value is not
-    /// one `recv_from()` on this socket can ever produce.
+    /// the nearest wrong one (dig-relay's own, pre-fix): the SAME real peer must produce the SAME
+    /// response regardless of which `SocketAddr` variant the local socket happened to hand it back
+    /// in. A test that only builds a literal `SocketAddr::V4` (above) cannot exercise this — that
+    /// value is not one `recv_from()` on this socket can ever produce. This is now a standing
+    /// regression guard on `dig_stun::encode_binding_success` itself, not a comparison against a
+    /// second implementation — the second implementation is exactly what this adoption removes.
     #[test]
     fn ipv4_mapped_v6_peer_encodes_identically_to_native_ipv4() {
         let v4 = Ipv4Addr::new(198, 51, 100, 17);
@@ -552,27 +356,26 @@ mod tests {
             "fixture sanity: this must really be a V6 SocketAddr, matching what recv_from() returns"
         );
 
-        let native_resp = build_binding_response(&TID, native);
-        let mapped_resp = build_binding_response(&TID, mapped);
+        let native_resp = encode_binding_success(&TID, native);
+        let mapped_resp = encode_binding_success(&TID, mapped);
         assert_eq!(
             native_resp, mapped_resp,
             "a v4-mapped V6 peer and the equivalent native V4 peer must produce byte-identical \
              responses — the local socket's representation is not part of the peer's identity"
         );
+        assert_eq!(
+            mapped_resp.len(),
+            32,
+            "an IPv4-family response is header(20)+attr-header(4)+value(8) = 32 bytes — a 44-byte \
+             (IPv6-family) response here would mean the peer was tagged the wrong family"
+        );
 
-        let value =
-            find_xor_mapped_address(&mapped_resp).expect("response carries XOR-MAPPED-ADDRESS");
-        assert_eq!(
-            value[1],
-            family::IPV4,
-            "a same-family IPv4 peer must be tagged IPv4 (0x01), never IPv6 (0x02)"
+        let decoded =
+            parse_binding_response(&mapped_resp, Some(&TID)).expect("response decodes cleanly");
+        assert!(
+            decoded.is_ipv4(),
+            "a same-family IPv4 peer must decode back to an IPv4 SocketAddr, never IPv6"
         );
-        assert_eq!(
-            value.len(),
-            8,
-            "an IPv4 XOR-MAPPED-ADDRESS value is reserved+family+port+4-byte address = 8 bytes"
-        );
-        let decoded = decode_xor_mapped_address(&TID, value).expect("value decodes");
         assert_eq!(
             decoded, native,
             "the client recovers the real IPv4 address+port, never the ::ffff:-wrapped form"
@@ -582,9 +385,8 @@ mod tests {
     #[test]
     fn ipv6_reflexive_address_round_trips_through_xor_mapped_address() {
         let addr = SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1234), 41234));
-        let resp = build_binding_response(&TID, addr);
-        let value = find_xor_mapped_address(&resp).expect("response carries XOR-MAPPED-ADDRESS");
-        let decoded = decode_xor_mapped_address(&TID, value).expect("value decodes");
+        let resp = encode_binding_success(&TID, addr);
+        let decoded = parse_binding_response(&resp, Some(&TID)).expect("response decodes cleanly");
         assert_eq!(
             decoded, addr,
             "IPv6 reflexive addr round-trips (uses tid in the XOR key)"
@@ -594,24 +396,23 @@ mod tests {
     #[test]
     fn xor_mapped_address_actually_obfuscates_the_port() {
         // The X-Port must differ from the raw port (proves the XOR is applied, per RFC 5389 §15.2).
+        // `encode_binding_success` writes exactly one attribute (XOR-MAPPED-ADDRESS) as the first and
+        // only attribute, so its value begins right after the 20-byte header + 4-byte attribute TLV
+        // header, at a fixed offset: reserved(1) + family(1) then X-Port at bytes [26..28).
         let addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 1), 0x1234));
-        let resp = build_binding_response(&TID, addr);
-        let value = find_xor_mapped_address(&resp).unwrap();
-        let xport = u16::from_be_bytes([value[2], value[3]]);
+        let resp = encode_binding_success(&TID, addr);
+        let xport = u16::from_be_bytes([resp[26], resp[27]]);
         assert_ne!(xport, 0x1234, "the port is XOR-obfuscated, not raw");
         assert_eq!(xport, 0x1234 ^ (MAGIC_COOKIE >> 16) as u16);
     }
 
     #[test]
-    fn find_xor_mapped_address_returns_none_when_absent() {
-        // A bare header with no attributes has no XOR-MAPPED-ADDRESS.
-        assert!(find_xor_mapped_address(&binding_request(TID)).is_none());
-    }
-
-    // ---- STUN rate limiter (SECURITY_AUDIT_P2P dig-relay #2) ----
-
-    fn ip(s: &str) -> IpAddr {
-        s.parse().unwrap()
+    fn parse_binding_response_reports_no_mapped_address_when_none_is_present() {
+        // A Binding Success response with no attributes at all has no (XOR-)MAPPED-ADDRESS to find.
+        assert_eq!(
+            parse_binding_response(&binding_success_with_no_attributes(TID), Some(&TID)),
+            Err(StunError::NoMappedAddress)
+        );
     }
 
     /// The response never amplifies beyond a small class bound: a Binding Success Response must be a
@@ -620,8 +421,8 @@ mod tests {
     #[test]
     fn response_size_is_a_small_bounded_multiple_of_the_request() {
         let req_len = binding_request(TID).len(); // 20 (minimal)
-        let v4 = build_binding_response(&TID, SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 5)));
-        let v6 = build_binding_response(
+        let v4 = encode_binding_success(&TID, SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 5)));
+        let v6 = encode_binding_success(
             &TID,
             SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 5)),
         );
@@ -629,6 +430,13 @@ mod tests {
         assert_eq!(v6.len(), 44, "IPv6 response is header(20)+attr(24)");
         // Amplification factor stays under ~2.5x even against the smallest possible request.
         assert!((v6.len() as f64) / (req_len as f64) < 2.5);
+    }
+
+    // ---- STUN rate limiter (SECURITY_AUDIT_P2P dig-relay #2) — genuinely dig-relay's own, and
+    // untouched by the codec adoption above. ----
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
     }
 
     /// A single source IP is capped at its per-second budget; the (N+1)th response in the same second

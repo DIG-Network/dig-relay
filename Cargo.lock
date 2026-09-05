@@ -343,12 +343,13 @@ dependencies = [
 
 [[package]]
 name = "dig-relay"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "axum",
  "clap",
  "dig-ip",
  "dig-pex",
+ "dig-stun",
  "futures-util",
  "maxminddb",
  "rcgen",
@@ -366,6 +367,17 @@ dependencies = [
  "tracing-subscriber",
  "windows-service",
  "x509-parser",
+]
+
+[[package]]
+name = "dig-stun"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6a980e520a5ceccc776b01e860bae3e0fe0e64037ee01b97774d20e385fb025"
+dependencies = [
+ "ring",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
@@ -428,7 +440,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -778,7 +790,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

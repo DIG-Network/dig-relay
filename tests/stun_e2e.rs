@@ -8,16 +8,20 @@
 
 use std::time::Duration;
 
-use dig_relay::stun::{self, TransactionId};
 use dig_relay::RelayServerConfig;
+use dig_stun::{
+    parse_binding_response, TransactionId, BINDING_REQUEST, BINDING_SUCCESS, MAGIC_COOKIE,
+};
 use tokio::net::UdpSocket;
 
-/// Build a bare STUN Binding Request (header only) with the given transaction id.
+/// Build a bare STUN Binding Request (header only) with the given transaction id. The wire codec
+/// this test drives lives in `dig_stun` (dig-relay's own copy was retired in favour of it,
+/// dig_ecosystem#3204) — dig-relay wires it to a socket; it does not own the bytes.
 fn binding_request(tid: &TransactionId) -> Vec<u8> {
     let mut m = Vec::with_capacity(20);
-    m.extend_from_slice(&stun::msgtype::BINDING_REQUEST.to_be_bytes());
+    m.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
     m.extend_from_slice(&0u16.to_be_bytes()); // no attributes
-    m.extend_from_slice(&stun::MAGIC_COOKIE.to_be_bytes());
+    m.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
     m.extend_from_slice(tid);
     m
 }
@@ -66,12 +70,11 @@ async fn stun_binding_request_returns_the_clients_reflexive_address() {
     // The response must be a Binding Success Response echoing our transaction id.
     assert_eq!(
         u16::from_be_bytes([response[0], response[1]]),
-        stun::msgtype::BINDING_SUCCESS_RESPONSE
+        BINDING_SUCCESS
     );
     assert_eq!(&response[8..20], &tid, "transaction id echoed");
 
-    let value = stun::find_xor_mapped_address(response).expect("has XOR-MAPPED-ADDRESS");
-    let reflexive = stun::decode_xor_mapped_address(&tid, value).expect("decodes");
+    let reflexive = parse_binding_response(response, Some(&tid)).expect("response decodes cleanly");
     assert_eq!(
         reflexive, client_addr,
         "the relay reflects the client's own source address"
