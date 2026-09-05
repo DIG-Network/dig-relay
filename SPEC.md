@@ -328,7 +328,10 @@ a thin I/O adapter.
 
 ## 5. STUN (RFC 5389)
 
-`src/stun.rs` implements a minimal RFC 5389 Binding responder over UDP on `stun_listen` (§2):
+`src/stun.rs` implements a minimal RFC 5389 Binding responder over UDP on `stun_listen` (§2). The
+wire codec (encode/parse, both directions) is owned by the `dig_stun` crate — the DIG ecosystem's
+one shared home for it, also used by `dig-nat`'s STUN client — so this file wires that codec to a
+socket and owns only the two things below it that are genuinely dig-relay's:
 
 - Accepts only a well-formed **Binding Request** (correct magic cookie `0x2112A442`, 20-byte header,
   message-length-consistent attribute region); anything else (malformed, wrong magic cookie, other
