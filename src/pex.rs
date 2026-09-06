@@ -564,7 +564,10 @@ mod tests {
 
         let json = serde_json::to_value(&e).expect("PeerEntry serializes");
         assert!(
-            json.as_object().expect("entry serializes as an object").get("payment").is_none(),
+            json.as_object()
+                .expect("entry serializes as an object")
+                .get("payment")
+                .is_none(),
             "introducer entries must not carry a payment key on the wire, got {json}"
         );
     }
