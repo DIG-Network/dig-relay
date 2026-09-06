@@ -1,6 +1,6 @@
 [package]
 name = "dig-relay"
-version = "0.20.2"
+version = "0.20.3"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Relay — NAT-traversal rendezvous + circuit relay so DIG Nodes establish peer connections across NAT."
@@ -62,7 +62,7 @@ service-manager = "0.7"
 # WebSocket as RLY-008 (see `src/pex.rs` + DESIGN.md "RLY-008"). dig-pex is standalone with a minimal
 # dependency surface (serde + serde_json + tokio + rand), so unlike dig-gossip it drops in cleanly.
 # Git-pinned in the bare form (tracks the crate's default branch) like the ecosystem's other DIG deps.
-dig-pex = "0.1"
+dig-pex = "0.2"
 # IPv6-first, IPv4-fallback (dig_ecosystem hard rule): the TCP/UDP listeners default-bind the IPv6
 # unspecified address `[::]`, and `socket2` is how we clear `IPV6_V6ONLY` on that socket before
 # `tokio` takes it over, so the one `[::]` listener stays dual-stack (see `src/net.rs`). Already a

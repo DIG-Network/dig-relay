@@ -550,4 +550,25 @@ mod tests {
         assert_eq!(e.addresses[0].port, 5555);
         assert!(e.flags.iter().any(|f| f == FLAG_RELAY_ONLY));
     }
+
+    /// The relay builds every introducer entry itself from a registration — it never receives a
+    /// registrant's signed `PaymentClaim` over PEX, so it must never assert a payee on the
+    /// registrant's behalf. Pins that `payment` stays absent from the wire (dig-pex 0.2's
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` keeps this byte-identical to the 0.1.x
+    /// wire when unset).
+    #[test]
+    fn introducer_entry_carries_no_payment_claim() {
+        let a = hex(0x0a);
+        let e = introducer_entry(&a, "net", addr(5555), 1000);
+        assert!(e.payment.is_none());
+
+        let json = serde_json::to_value(&e).expect("PeerEntry serializes");
+        assert!(
+            json.as_object()
+                .expect("entry serializes as an object")
+                .get("payment")
+                .is_none(),
+            "introducer entries must not carry a payment key on the wire, got {json}"
+        );
+    }
 }
