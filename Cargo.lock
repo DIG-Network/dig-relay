@@ -331,13 +331,15 @@ dependencies = [
 
 [[package]]
 name = "dig-pex"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89fd9bcf019e8e30f411dff7284caeb8612547f53380b4fc4b1c2b27224017c7"
+checksum = "ae351562975d1c4eb9a2550062ff1f1128929c38b87bdf1a753a075cb9f6ab18"
 dependencies = [
+ "base64",
  "rand",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
