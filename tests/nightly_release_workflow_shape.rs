@@ -63,6 +63,112 @@ fn triggers_block(workflow: &str) -> String {
     lines.join("\n")
 }
 
+/// Extract a single top-level job's YAML block: from `  <job>:` (exactly 2-space indent) up to
+/// the next 2-space-indented sibling job key, or end of file. Mirrors `triggers_block`'s
+/// text-based approach for the same reason — no external YAML dependency, and a failure message
+/// that points at the literal lines a maintainer reads.
+fn job_block(workflow: &str, job: &str) -> String {
+    let start_marker = format!("  {job}:");
+    let mut in_job = false;
+    let mut lines: Vec<&str> = Vec::new();
+    for line in workflow.lines() {
+        if line == start_marker {
+            in_job = true;
+            lines.push(line);
+            continue;
+        }
+        if in_job {
+            // A sibling job key: exactly 2-space indent, ending the line (a bare `name:` job
+            // header), never a 4-plus-space field nested inside the current job.
+            let is_sibling_job_key = line.starts_with("  ")
+                && !line.starts_with("   ")
+                && line.trim_end().ends_with(':')
+                && line != start_marker;
+            if is_sibling_job_key {
+                break;
+            }
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
+/// Extract the VALUE of a job's `if:` field only — the `if:` line itself plus every following
+/// line indented strictly more than it (the block-scalar continuation), stopping at the next
+/// sibling field (e.g. `runs-on:`) at the same or shallower indent.
+///
+/// Scoped to the condition's own lines, deliberately excluding surrounding comments: a comment
+/// explaining why `schedule` is excluded legitimately contains the ENGLISH WORD "schedule", so a
+/// whole-block text search would be fooled by prose alone satisfying it without the actual
+/// GitHub Actions expression changing. Testing the expression, not the prose about it, is the
+/// point of this helper.
+fn if_condition(job_block: &str) -> String {
+    let mut in_if = false;
+    let mut if_indent = 0usize;
+    let mut out: Vec<&str> = Vec::new();
+    for line in job_block.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if !in_if {
+            if trimmed.starts_with("if:") {
+                in_if = true;
+                if_indent = indent;
+                out.push(line);
+            }
+            continue;
+        }
+        if line.trim().is_empty() || indent > if_indent {
+            out.push(line);
+        } else {
+            break;
+        }
+    }
+    out.join("\n")
+}
+
+#[test]
+fn stable_job_is_reachable_only_from_manual_dispatch_never_from_schedule() {
+    // Property under test: the STABLE job's own `if:` condition requires workflow_dispatch and
+    // never accepts the `schedule` trigger as an alternative (CLAUDE.md §3.6-A;
+    // dig_ecosystem#698, dig-relay#33). A stable `vX.Y.Z` is permanent and reaches every
+    // installed host through the signed update feed — cutting one must be a decision a person
+    // makes, never something the midnight cron does unattended.
+    //
+    // The NEAREST WRONG implementation is the pre-fix condition this test was written against:
+    // `(github.event_name == 'schedule' || inputs.channel == 'stable' || inputs.channel ==
+    // 'both')`. That shape still checks `inputs.channel`, so a naive "does it look at the
+    // dispatch inputs" assertion would pass on it too — the discriminator has to be that
+    // `schedule` alone can satisfy the condition. Scoping to the job's own `if:` lines (rather
+    // than the whole file) also matters: `schedule:` correctly appears in the top-level `on:`
+    // trigger block AND in the `nightly-meta` job's condition below, and a whole-file check would
+    // be blind to which job it protects.
+    let wf = nightly_release();
+    let stable_if = if_condition(&job_block(&wf, "stable"));
+
+    assert!(
+        stable_if.contains("workflow_dispatch"),
+        "the stable job's `if:` must require github.event_name == 'workflow_dispatch'. \
+         if: block:\n{stable_if}"
+    );
+    assert!(
+        !stable_if.contains("event_name == 'schedule'"),
+        "the stable job's `if:` must NOT accept the schedule trigger as an alternative to \
+         workflow_dispatch — a merged version bump would otherwise reach a published vX.Y.Z at \
+         the next midnight cron with no human step and no gate beyond ordinary CI. \
+         if: block:\n{stable_if}"
+    );
+
+    // This fix scopes to the stable job ONLY. Guard against a fix that goes too far and also
+    // disables the nightly channel's own (correct, load-bearing) schedule reachability — a
+    // placement error a narrower test could not see.
+    let nightly_meta_if = if_condition(&job_block(&wf, "nightly-meta"));
+    assert!(
+        nightly_meta_if.contains("event_name == 'schedule'"),
+        "the nightly-meta job must still trigger on the schedule cron — nightlies are unaffected \
+         by this fix. if: block:\n{nightly_meta_if}"
+    );
+}
+
 #[test]
 fn tagger_no_longer_triggers_on_push_to_main() {
     let on = triggers_block(&nightly_release());

@@ -742,8 +742,10 @@ The orchestrator triggers ONLY on:
 - `workflow_dispatch` with two inputs: `channel` (`both` | `stable` | `nightly`, default `both`) and
   `force` (boolean, default `false`).
 
-It MUST NOT trigger on `push` to `main`. A schedule run exercises BOTH channels; a dispatch runs the
-selected channel(s).
+It MUST NOT trigger on `push` to `main`. A schedule run exercises the **nightly channel ONLY** — the
+stable channel is reachable EXCLUSIVELY from a manual `workflow_dispatch` selecting `stable` or `both`
+(§11.2); the midnight cron can never cut a stable `vX.Y.Z` release. A dispatch runs whichever
+channel(s) `inputs.channel` selects.
 
 **60-day auto-disable caveat.** GitHub auto-disables a `schedule:` trigger after 60 days with no
 repo activity on a public repo, with no auto-re-enable — and since this cron is the ONLY automatic

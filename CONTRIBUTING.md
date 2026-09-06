@@ -82,12 +82,12 @@ and commit.
   major.
 - `main` is a **protected branch**: PR required, all CI checks green, zero unresolved review
   threads, squash-merge only.
-- **Releases are cut off `main` automatically, not manually.** `nightly-release.yml`'s `stable` job
-  runs on the midnight-UTC cron itself (`if: github.event_name == 'schedule' || inputs.channel ==
-  'stable' || inputs.channel == 'both'`) — so once your PR merges and bumps `Cargo.toml`, the next
-  nightly cron cuts a real `vX.Y.Z` stable tag from `main` HEAD (git-cliff regenerates
-  `CHANGELOG.md`, commits, tags, and pushes with `RELEASE_TOKEN`), which in turn fires
-  `release.yml` (per-OS binary build) and `deploy.yml` (ships the canonical `relay.dig.net`
-  service). There is no separate manual gate between your merge and a stable release beyond that
-  nightly cron — get the version bump and the gate right before merging, not after.
-  `workflow_dispatch(channel: stable|nightly|both)` can also cut on demand.
+- **Releases are cut by manual dispatch only — never automatically.** `nightly-release.yml`'s
+  `stable` job runs ONLY on a manual `workflow_dispatch(channel: stable|both)` (CLAUDE.md §3.6-A) —
+  the midnight-UTC cron drives the nightly channel alone and can never cut a stable `vX.Y.Z` tag,
+  bumped version or not. So merging your PR with a bumped `Cargo.toml` version does nothing on its
+  own: someone dispatches `channel: stable` (or `both`) from Actions → **Nightly + stable release**
+  → Run workflow when it's time to ship (git-cliff regenerates `CHANGELOG.md`, commits, tags, and
+  pushes with `RELEASE_TOKEN`), which in turn fires `release.yml` (per-OS binary build) and
+  `deploy.yml` (ships the canonical `relay.dig.net` service). Get the version bump and the gate
+  right before merging — the dispatch is the deliberate step after.
