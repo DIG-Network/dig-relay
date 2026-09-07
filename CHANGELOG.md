@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.20.3] - 2026-09-07
+
+### Build
+- **deps:** Adopt dig-pex 0.2 (signed payment address on PeerEntry) (#43)
+
+### CI
+- **release:** Gate the stable job to workflow_dispatch only, never schedule (#41)
+
 ## [0.20.1] - 2026-09-05
 
 ### Refactor
