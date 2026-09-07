@@ -325,6 +325,12 @@ a thin I/O adapter.
 - **Scoping.** One `PexEngine` per `network_id`; deltas for network A never reach a network-B link.
 - **Timing.** A ~1 s housekeeping tick drives `PexEngine::tick`; each link's own `pex_delta`s are
   spaced ≥30 s (jittered) by the engine itself.
+- **No payment claim on introducer entries.** Every entry the relay advertises is one it built
+  itself from a registration, not one relayed from the registrant's own node↔node PEX — so it MUST
+  NOT assert a payee on the registrant's behalf; it cannot sign for it. A `PeerEntry`'s optional
+  `payment` claim (a `PaymentClaim` signed by the peer's own TLS key, per `dig-pex`'s `SPEC.md`
+  §3.4) is only ever populated by the peer itself over direct node↔node PEX — a registrant's payout
+  address reaches other peers that way, never via the relay.
 
 ## 5. STUN (RFC 5389)
 
