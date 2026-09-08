@@ -28,6 +28,7 @@
 //! Windows SCM dispatcher.
 
 pub mod config;
+mod continuation_guard;
 pub mod dashboard;
 pub mod dht_view;
 pub mod dial;

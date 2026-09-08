@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "dig-relay"
-version = "0.20.3"
+version = "0.20.4"
 dependencies = [
  "axum",
  "clap",
